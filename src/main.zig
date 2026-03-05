@@ -152,9 +152,10 @@ pub fn main() !void {
 
         var shutdown = std.atomic.Value(bool).init(false);
         defer shutdown.store(true, .release);
+        var scan_already_done = std.atomic.Value(bool).init(true); // sync scan already ran
 
         var queue = watcher.EventQueue{};
-        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root, &prerender, &shutdown });
+        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root, &prerender, &shutdown, &scan_already_done });
         defer watch_thread.join();
 
         const isr_thread = try std.Thread.spawn(.{}, Prerender.isrLoop, .{ &prerender, &explorer, &store, &shutdown });
@@ -176,13 +177,15 @@ pub fn main() !void {
         saveProjectInfo(allocator, data_dir, abs_root) catch {};
 
         var shutdown = std.atomic.Value(bool).init(false);
+        var scan_done = std.atomic.Value(bool).init(false);
 
         var queue = watcher.EventQueue{};
-        const scan_thread = try std.Thread.spawn(.{}, scanBg, .{ &store, &explorer, root, allocator });
+        const scan_thread = try std.Thread.spawn(.{}, scanBg, .{ &store, &explorer, root, allocator, &scan_done });
         scan_thread.detach();
 
-        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root, &prerender, &shutdown });
+        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root, &prerender, &shutdown, &scan_done });
         const isr_thread = try std.Thread.spawn(.{}, Prerender.isrLoop, .{ &prerender, &explorer, &store, &shutdown });
+        const idle_thread = try std.Thread.spawn(.{}, idleWatchdog, .{&shutdown});
 
         std.log.info("codedb2 mcp: root={s} files={d} data={s}", .{ abs_root, store.currentSeq(), data_dir });
         mcp_server.run(allocator, &store, &explorer, &agents, &prerender);
@@ -191,6 +194,7 @@ pub fn main() !void {
         shutdown.store(true, .release);
         watch_thread.join();
         isr_thread.join();
+        idle_thread.join();
     } else {
         print("unknown command: {s}\n", .{cmd});
         std.process.exit(1);
@@ -261,8 +265,26 @@ fn reapLoop(agents: *AgentRegistry, shutdown: *std.atomic.Value(bool)) void {
     }
 }
 
-fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator) void {
+fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.mem.Allocator, scan_done: *std.atomic.Value(bool)) void {
     watcher.initialScan(store, explorer, root, allocator) catch |err| {
         std.log.warn("background scan failed: {}", .{err});
     };
+    scan_done.store(true, .release);
+}
+
+fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
+    const mcp = @import("mcp.zig");
+    while (!shutdown.load(.acquire)) {
+        std.Thread.sleep(30 * std.time.ns_per_s); // check every 30s
+        const last = mcp.last_activity.load(.acquire);
+        if (last == 0) continue; // not started yet
+        const now = std.time.milliTimestamp();
+        if (now - last > mcp.idle_timeout_ms) {
+            std.log.info("idle for {d}s, exiting", .{@divTrunc(now - last, 1000)});
+            // Close stdin to unblock the run() loop, then signal shutdown.
+            std.fs.File.stdin().close();
+            shutdown.store(true, .release);
+            return;
+        }
+    }
 }

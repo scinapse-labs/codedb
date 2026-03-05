@@ -52,6 +52,13 @@ const tools_list =
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
+/// Monotonic timestamp of last MCP request, used by idle-exit watchdog.
+pub var last_activity: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
+
+/// How long (ms) the server may sit idle before auto-exiting.
+/// Claude Code restarts MCP servers on demand, so this is safe.
+pub const idle_timeout_ms: i64 = 5 * 60 * 1000; // 5 minutes
+
 pub fn run(
     alloc: std.mem.Allocator,
     store: *Store,
@@ -61,9 +68,11 @@ pub fn run(
 ) void {
     const stdout = std.fs.File.stdout();
     const stdin = std.fs.File.stdin();
+    last_activity.store(std.time.milliTimestamp(), .release);
 
     while (true) {
         const msg = readFramedMessage(alloc, stdin) orelse break;
+        last_activity.store(std.time.milliTimestamp(), .release);
         defer alloc.free(msg);
         if (msg.len == 0) {
             writeError(alloc, stdout, null, -32700, "Parse error");

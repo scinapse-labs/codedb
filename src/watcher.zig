@@ -243,8 +243,8 @@ pub fn initialScan(store: *Store, explorer: *Explorer, root: []const u8, allocat
     while (try walker.next()) |entry| {
         const stat = dir.statFile(entry.path) catch continue;
         _ = try store.recordSnapshot(entry.path, stat.size, 0);
-        // Index outline + content (skip word/trigram for speed)
-        indexFileOutline(explorer, dir, entry.path, allocator) catch {};
+        // Index outline + content + word/trigram for full search support
+        indexFileContent(explorer, dir, entry.path, allocator) catch {};
     }
 }
 
@@ -265,10 +265,18 @@ fn indexFileOutline(explorer: *Explorer, dir: std.fs.Dir, path: []const u8, allo
 }
 
 /// Background thread: polls for incremental FS changes.
-pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, root: []const u8, prerender: *Prerender, shutdown: *std.atomic.Value(bool)) void {
+pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, root: []const u8, prerender: *Prerender, shutdown: *std.atomic.Value(bool), scan_done: *std.atomic.Value(bool)) void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const backing = gpa.allocator();
+
+    // Wait for initial scan to finish before building our known-file snapshot.
+    // This prevents double-indexing: initialScan does full indexing, then we
+    // only pick up changes that happen after.
+    while (!scan_done.load(.acquire)) {
+        if (shutdown.load(.acquire)) return;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
 
     var known = FileMap.init(backing);
     defer {
