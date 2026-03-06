@@ -327,7 +327,7 @@ fn handleConnection(
 
     // ── Explore: tree ──
     if (mem_starts(request, "GET /explore/tree")) {
-        const tree = explorer.getTree(allocator) catch {
+        const tree = explorer.getTree(allocator, false) catch {
             respondJson(conn, "500 Internal Server Error", "{\"error\":\"tree failed\"}");
             return;
         };

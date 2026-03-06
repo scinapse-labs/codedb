@@ -842,7 +842,7 @@ test "regression #7: tree shows directory nodes" {
     try explorer.indexFile("src/lib.zig", "pub fn init() void {}");
     try explorer.indexFile("build.zig", "pub fn build() void {}");
 
-    const tree = try explorer.getTree(testing.allocator);
+    const tree = try explorer.getTree(testing.allocator, false);
     defer testing.allocator.free(tree);
 
     // Should contain "src/" directory node
@@ -862,7 +862,7 @@ test "regression #7: tree handles nested directories" {
     try explorer.indexFile("src/utils/hash.zig", "pub fn hash() void {}");
     try explorer.indexFile("src/main.zig", "pub fn main() void {}");
 
-    const tree = try explorer.getTree(testing.allocator);
+    const tree = try explorer.getTree(testing.allocator, false);
     defer testing.allocator.free(tree);
 
     // Should have both directory levels
@@ -879,7 +879,7 @@ test "regression #7: tree shows only basenames" {
 
     try explorer.indexFile("pkg/foo/bar.zig", "const x = 1;");
 
-    const tree = try explorer.getTree(testing.allocator);
+    const tree = try explorer.getTree(testing.allocator, false);
     defer testing.allocator.free(tree);
 
     // Full path should NOT appear in tree output

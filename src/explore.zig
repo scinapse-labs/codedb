@@ -306,7 +306,9 @@ fn cloneOutline(src: *const FileOutline, allocator: std.mem.Allocator) !FileOutl
     return dst;
 }
 
-pub fn getTree(self: *Explorer, allocator: std.mem.Allocator) ![]u8 {
+pub fn getTree(self: *Explorer, allocator: std.mem.Allocator, use_color: bool) ![]u8 {
+    const s = @import("style.zig").style(use_color);
+
     self.mu.lockShared();
     defer self.mu.unlockShared();
 
@@ -328,7 +330,6 @@ pub fn getTree(self: *Explorer, allocator: std.mem.Allocator) ![]u8 {
         }
     }.lessThan);
 
-    // Track which directories we've already printed
     var seen_dirs = std.StringHashMap(void).init(allocator);
     defer seen_dirs.deinit();
 
@@ -343,7 +344,8 @@ pub fn getTree(self: *Explorer, allocator: std.mem.Allocator) ![]u8 {
                 try seen_dirs.put(dir, {});
                 const depth = std.mem.count(u8, dir[0..sep], "/");
                 for (0..depth) |_| try writer.writeAll("  ");
-                try writer.print("{s}/\n", .{path[if (depth > 0) std.mem.lastIndexOfScalar(u8, dir[0..sep], '/').? + 1 else 0 .. sep]});
+                const dir_name = path[if (depth > 0) std.mem.lastIndexOfScalar(u8, dir[0..sep], '/').? + 1 else 0 .. sep];
+                try writer.print("{s}{s}/{s}\n", .{ s.bold, dir_name, s.reset });
             }
             prefix_end = sep + 1;
         }
@@ -352,12 +354,11 @@ pub fn getTree(self: *Explorer, allocator: std.mem.Allocator) ![]u8 {
         const depth = std.mem.count(u8, path, "/");
         for (0..depth) |_| try writer.writeAll("  ");
         const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
-
-        try writer.print("{s}  ({s}, {d}L, {d} symbols)\n", .{
+        const lang = @tagName(outline.language);
+        try writer.print("{s}  {s}{s}{s}  {s}{d}L  {d} sym{s}\n", .{
             basename,
-            @tagName(outline.language),
-            outline.line_count,
-            outline.symbols.items.len,
+            s.langColor(lang), lang, s.reset,
+            s.dim, outline.line_count, outline.symbols.items.len, s.reset,
         });
     }
 

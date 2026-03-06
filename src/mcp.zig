@@ -208,7 +208,7 @@ fn dispatch(
 // ── Tool handlers ───────────────────────────────────────────────────────────
 
 fn handleTree(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Explorer) void {
-    const tree = explorer.getTree(alloc) catch {
+    const tree = explorer.getTree(alloc, false) catch {
         out.appendSlice(alloc, "error: failed to get tree") catch {};
         return;
     };

@@ -106,7 +106,7 @@ fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocator) !
     try w.print("\"seq\":{d},", .{store.currentSeq()});
 
     // ── tree ──
-    const tree = try explorer.getTree(alloc);
+    const tree = try explorer.getTree(alloc, false);
     defer alloc.free(tree);
     try w.writeAll("\"tree\":\"");
     try writeJsonEscaped(alloc, &buf, tree);

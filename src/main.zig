@@ -6,13 +6,29 @@ const Prerender = @import("prerender.zig").Prerender;
 const watcher = @import("watcher.zig");
 const server = @import("server.zig");
 const mcp_server = @import("mcp.zig");
+const sty = @import("style.zig");
 
-const print = std.debug.print;
+/// Thin wrapper: format + write to a File via allocator.
+const Out = struct {
+    file: std.fs.File,
+    alloc: std.mem.Allocator,
+
+    fn p(self: Out, comptime fmt: []const u8, args: anytype) void {
+        const str = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
+        defer self.alloc.free(str);
+        self.file.writeAll(str) catch {};
+    }
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    const stdout = std.fs.File.stdout();
+    const use_color = stdout.isTty();
+    const s = sty.style(use_color);
+    const out = Out{ .file = stdout, .alloc = allocator };
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -21,13 +37,12 @@ pub fn main() !void {
     var cmd: []const u8 = undefined;
     var cmd_args_start: usize = undefined;
 
-    // Support --mcp flag as alias for `mcp` subcommand (matches muonry convention)
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--mcp")) {
         root = ".";
         cmd = "mcp";
         cmd_args_start = 2;
     } else if (args.len < 2) {
-        printUsage();
+        printUsage(out, s);
         std.process.exit(1);
     } else if (isCommand(args[1])) {
         root = ".";
@@ -38,13 +53,15 @@ pub fn main() !void {
         cmd = args[2];
         cmd_args_start = 3;
     } else {
-        printUsage();
+        printUsage(out, s);
         std.process.exit(1);
     }
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs_root = resolveRoot(root, &root_buf) catch {
-        print("error: cannot resolve root path: {s}\n", .{root});
+        out.p("{s}\xe2\x9c\x97{s} cannot resolve root: {s}{s}{s}\n", .{
+            s.red, s.reset, s.bold, root, s.reset,
+        });
         std.process.exit(1);
     };
 
@@ -62,85 +79,189 @@ pub fn main() !void {
 
     var explorer = Explorer.init(allocator);
     defer explorer.deinit();
+
     if (!std.mem.eql(u8, cmd, "mcp")) {
+        const t_scan = std.time.nanoTimestamp();
         try watcher.initialScan(&store, &explorer, root, allocator);
+        const scan_elapsed = std.time.nanoTimestamp() - t_scan;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}\xe2\x9c\x93{s} {s}indexed{s}  {s}{s}{s}\n", .{
+            s.green, s.reset,
+            s.dim, s.reset,
+            sty.durationColor(s, scan_elapsed), sty.formatDuration(&dur_buf, scan_elapsed), s.reset,
+        });
     }
 
     if (std.mem.eql(u8, cmd, "tree")) {
-        const tree = try explorer.getTree(allocator);
+        const t0 = std.time.nanoTimestamp();
+        const tree = try explorer.getTree(allocator, use_color);
         defer allocator.free(tree);
-        print("{s}", .{tree});
+        const elapsed = std.time.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}", .{tree});
+        out.p("{s}{s}{s}\n", .{
+            sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
+
     } else if (std.mem.eql(u8, cmd, "outline")) {
         const path = if (args.len > cmd_args_start) args[cmd_args_start] else {
-            print("usage: codedb [root] outline <path>\n", .{});
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] outline {s}<path>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
             std.process.exit(1);
         };
+        const t0 = std.time.nanoTimestamp();
         var outline = explorer.getOutline(path, allocator) catch {
-            print("error: failed to load outline for {s}\n", .{path});
+            out.p("{s}\xe2\x9c\x97{s} {s}{s}{s} \xe2\x80\x94 failed to load outline\n", .{
+                s.red, s.reset, s.bold, path, s.reset,
+            });
             std.process.exit(1);
         } orelse {
-            print("not found: {s}\n", .{path});
+            out.p("{s}\xe2\x9c\x97{s} not indexed: {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, path, s.reset,
+            });
             return;
         };
         defer outline.deinit();
-        print("{s} ({s}, {d} lines)\n", .{
-            outline.path, @tagName(outline.language), outline.line_count,
+        const elapsed = std.time.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        const lang = @tagName(outline.language);
+        out.p("{s}\xe2\x9c\x93{s} {s}{s}{s}  {s}{s}{s}  {s}{d} lines{s}  {s}{s}{s}\n", .{
+            s.green, s.reset,
+            s.bold, path, s.reset,
+            s.langColor(lang), lang, s.reset,
+            s.dim, outline.line_count, s.reset,
+            sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
         });
         for (outline.symbols.items) |sym| {
-            print("  L{d}: {s} {s}", .{ sym.line_start, @tagName(sym.kind), sym.name });
-            if (sym.detail) |d| print("  // {s}", .{d});
-            print("\n", .{});
+            const kind = @tagName(sym.kind);
+            out.p("  {s}L{d:<5}{s}  {s}{s:<14}{s}  {s}{s}{s}", .{
+                s.dim, sym.line_start, s.reset,
+                s.kindColor(kind), kind, s.reset,
+                s.bold, sym.name, s.reset,
+            });
+            if (sym.detail) |d| {
+                out.p("  {s}{s}{s}", .{ s.dim, d, s.reset });
+            }
+            out.p("\n", .{});
         }
+
     } else if (std.mem.eql(u8, cmd, "find")) {
         const name = if (args.len > cmd_args_start) args[cmd_args_start] else {
-            print("usage: codedb [root] find <symbol>\n", .{});
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] find {s}<symbol>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
             std.process.exit(1);
         };
+        const t0 = std.time.nanoTimestamp();
         if (try explorer.findSymbol(name, allocator)) |r| {
-            print("{s}:{d} ({s})\n", .{ r.path, r.symbol.line_start, @tagName(r.symbol.kind) });
-            if (r.symbol.detail) |d| print("  {s}\n", .{d});
+            const elapsed = std.time.nanoTimestamp() - t0;
+            var dur_buf: [64]u8 = undefined;
+            const kind = @tagName(r.symbol.kind);
+            out.p("{s}\xe2\x9c\x93{s} {s}{s}{s} {s}{s}{s}  {s}{s}{s}:{s}{d}{s}  {s}{s}{s}\n", .{
+                s.green, s.reset,
+                s.kindColor(kind), kind, s.reset,
+                s.bold, name, s.reset,
+                s.dim, r.path, s.reset,
+                s.cyan, r.symbol.line_start, s.reset,
+                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
+            });
+            if (r.symbol.detail) |d| {
+                out.p("  {s}{s}{s}\n", .{ s.dim, d, s.reset });
+            }
         } else {
-            print("not found: {s}\n", .{name});
+            out.p("{s}\xe2\x9c\x97{s} not found: {s}{s}{s}\n", .{
+                s.red, s.reset, s.bold, name, s.reset,
+            });
         }
+
     } else if (std.mem.eql(u8, cmd, "search")) {
         const query = if (args.len > cmd_args_start) args[cmd_args_start] else {
-            print("usage: codedb [root] search <query>\n", .{});
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] search {s}<query>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
             std.process.exit(1);
         };
+        const t0 = std.time.nanoTimestamp();
         const results = try explorer.searchContent(query, allocator, 50);
         defer {
             for (results) |r| allocator.free(r.line_text);
             allocator.free(results);
         }
+        const elapsed = std.time.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
         if (results.len == 0) {
-            print("no results for: {s}\n", .{query});
+            out.p("{s}\xe2\x9c\x97{s} no results for {s}\"{s}\"{s}\n", .{
+                s.yellow, s.reset, s.bold, query, s.reset,
+            });
         } else {
+            out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} results for {s}\"{s}\"{s}  {s}{s}{s}\n", .{
+                s.green, s.reset,
+                s.bold, results.len, s.reset,
+                s.bold, query, s.reset,
+                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
+            });
             for (results) |r| {
-                print("{s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text });
+                out.p("  {s}{s}{s}:{s}{d}{s}  {s}\n", .{
+                    s.cyan, r.path, s.reset,
+                    s.dim, r.line_num, s.reset,
+                    r.line_text,
+                });
             }
         }
+
     } else if (std.mem.eql(u8, cmd, "word")) {
         const word = if (args.len > cmd_args_start) args[cmd_args_start] else {
-            print("usage: codedb [root] word <identifier>\n", .{});
+            out.p("{s}\xe2\x9c\x97{s} usage: codedb [root] word {s}<identifier>{s}\n", .{
+                s.red, s.reset, s.cyan, s.reset,
+            });
             std.process.exit(1);
         };
+        const t0 = std.time.nanoTimestamp();
         const hits = try explorer.searchWord(word, allocator);
         defer allocator.free(hits);
+        const elapsed = std.time.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
         if (hits.len == 0) {
-            print("no hits for: {s}\n", .{word});
+            out.p("{s}\xe2\x9c\x97{s} no hits for {s}'{s}'{s}\n", .{
+                s.yellow, s.reset, s.bold, word, s.reset,
+            });
         } else {
-            print("{d} hits for '{s}':\n", .{ hits.len, word });
+            out.p("{s}\xe2\x9c\x93{s} {s}{d}{s} hits for {s}'{s}'{s}  {s}{s}{s}\n", .{
+                s.green, s.reset,
+                s.bold, hits.len, s.reset,
+                s.bold, word, s.reset,
+                sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
+            });
             for (hits) |h| {
-                print("  {s}:{d}\n", .{ h.path, h.line_num });
+                out.p("  {s}{s}{s}:{s}{d}{s}\n", .{
+                    s.cyan, h.path, s.reset,
+                    s.dim, h.line_num, s.reset,
+                });
             }
         }
+
     } else if (std.mem.eql(u8, cmd, "hot")) {
+        const t0 = std.time.nanoTimestamp();
         const hot = try explorer.getHotFiles(&store, allocator, 10);
         defer {
             for (hot) |path| allocator.free(path);
             allocator.free(hot);
         }
-        for (hot) |path| print("{s}\n", .{path});
+        const elapsed = std.time.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}\xe2\x9c\x93{s} {s}recently modified{s}  {s}{s}{s}\n", .{
+            s.green, s.reset,
+            s.bold, s.reset,
+            sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
+        for (hot, 1..) |path, i| {
+            out.p("  {s}{d}{s}  {s}{s}{s}\n", .{
+                s.dim, i, s.reset,
+                s.cyan, path, s.reset,
+            });
+        }
+
     } else if (std.mem.eql(u8, cmd, "serve")) {
         const port: u16 = 7719;
         var agents = AgentRegistry.init(allocator);
@@ -152,7 +273,7 @@ pub fn main() !void {
 
         var shutdown = std.atomic.Value(bool).init(false);
         defer shutdown.store(true, .release);
-        var scan_already_done = std.atomic.Value(bool).init(true); // sync scan already ran
+        var scan_already_done = std.atomic.Value(bool).init(true);
 
         var queue = watcher.EventQueue{};
         const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ &store, &explorer, &queue, root, &prerender, &shutdown, &scan_already_done });
@@ -166,6 +287,7 @@ pub fn main() !void {
 
         std.log.info("codedb: {d} files indexed, listening on :{d}", .{ store.currentSeq(), port });
         try server.serve(allocator, &store, &agents, &explorer, &queue, port, &prerender);
+
     } else if (std.mem.eql(u8, cmd, "mcp")) {
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
@@ -190,13 +312,15 @@ pub fn main() !void {
         std.log.info("codedb2 mcp: root={s} files={d} data={s}", .{ abs_root, store.currentSeq(), data_dir });
         mcp_server.run(allocator, &store, &explorer, &agents, &prerender);
 
-        // run() returned — stdin closed. Signal threads to stop, then join.
         shutdown.store(true, .release);
         watch_thread.join();
         isr_thread.join();
         idle_thread.join();
+
     } else {
-        print("unknown command: {s}\n", .{cmd});
+        out.p("{s}\xe2\x9c\x97{s} unknown command: {s}{s}{s}\n", .{
+            s.red, s.reset, s.bold, cmd, s.reset,
+        });
         std.process.exit(1);
     }
 }
@@ -237,25 +361,41 @@ fn saveProjectInfo(allocator: std.mem.Allocator, data_dir: []const u8, abs_root:
     try file.writeAll(abs_root);
 }
 
-fn printUsage() void {
-    print(
-        \\usage: codedb [root] <command> [args...]
+fn printUsage(out: Out, s: sty.Style) void {
+    out.p(
         \\
-        \\If root is omitted, uses current working directory.
+        \\{s}codedb{s}  code intelligence server
         \\
-        \\commands:
-        \\  tree                        show file tree with symbols
-        \\  outline <path>              show symbols in a file
-        \\  find <name>                 find where a symbol is defined
-        \\  search <query>              full-text search (case-insensitive)
-        \\  word <identifier>           exact word lookup (inverted index)
-        \\  hot                         recently modified files
-        \\  serve                       start HTTP daemon on :7719
-        \\  mcp                         start MCP server (JSON-RPC over stdio)
+        \\  {s}usage:{s} codedb [root] <command> [args...]
         \\
-        \\Data is stored in ~/.codedb/projects/<hash>/ per project.
+        \\  {s}commands:{s}
+        \\    {s}tree{s}                      show file tree with language and symbol counts
+        \\    {s}outline{s} {s}<path>{s}         list all symbols in a file
+        \\    {s}find{s}    {s}<name>{s}         find where a symbol is defined
+        \\    {s}search{s}  {s}<query>{s}        full-text search (trigram, case-insensitive)
+        \\    {s}word{s}    {s}<identifier>{s}   exact word lookup via inverted index
+        \\    {s}hot{s}                       recently modified files
+        \\    {s}serve{s}                     HTTP daemon on :7719
+        \\    {s}mcp{s}                       JSON-RPC/MCP server over stdio
         \\
-    , .{});
+        \\  If root is omitted, uses current working directory.
+        \\  Data stored in {s}~/.codedb/projects/<hash>/{s}
+        \\
+        \\
+    , .{
+        s.bold, s.reset,
+        s.dim,  s.reset,
+        s.dim,  s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset, s.dim, s.reset,
+        s.cyan, s.reset, s.dim, s.reset,
+        s.cyan, s.reset, s.dim, s.reset,
+        s.cyan, s.reset, s.dim, s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset,
+        s.cyan, s.reset,
+        s.dim,  s.reset,
+    });
 }
 
 fn reapLoop(agents: *AgentRegistry, shutdown: *std.atomic.Value(bool)) void {
@@ -275,13 +415,12 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
     while (!shutdown.load(.acquire)) {
-        std.Thread.sleep(30 * std.time.ns_per_s); // check every 30s
+        std.Thread.sleep(30 * std.time.ns_per_s);
         const last = mcp.last_activity.load(.acquire);
-        if (last == 0) continue; // not started yet
+        if (last == 0) continue;
         const now = std.time.milliTimestamp();
         if (now - last > mcp.idle_timeout_ms) {
             std.log.info("idle for {d}s, exiting", .{@divTrunc(now - last, 1000)});
-            // Close stdin to unblock the run() loop, then signal shutdown.
             std.fs.File.stdin().close();
             shutdown.store(true, .release);
             return;
