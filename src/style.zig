@@ -31,9 +31,14 @@ pub const Style = struct {
     /// ANSI color for a SymbolKind @tagName (e.g. "function", "struct_def").
     pub fn kindColor(self: Style, kind: []const u8) []const u8 {
         if (std.mem.eql(u8, kind, "function")) return self.blue;
+        if (std.mem.eql(u8, kind, "method")) return self.blue;
         if (std.mem.eql(u8, kind, "struct_def")) return self.yellow;
         if (std.mem.eql(u8, kind, "enum_def")) return self.yellow;
         if (std.mem.eql(u8, kind, "union_def")) return self.yellow;
+        if (std.mem.eql(u8, kind, "trait_def")) return self.magenta;
+        if (std.mem.eql(u8, kind, "impl_block")) return self.cyan;
+        if (std.mem.eql(u8, kind, "type_alias")) return self.yellow;
+        if (std.mem.eql(u8, kind, "macro_def")) return self.orange;
         if (std.mem.eql(u8, kind, "test_decl")) return self.green;
         if (std.mem.eql(u8, kind, "import")) return self.dim;
         if (std.mem.eql(u8, kind, "comment_block")) return self.dim;

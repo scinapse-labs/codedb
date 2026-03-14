@@ -14,6 +14,11 @@ pub const SymbolKind = enum(u8) {
     import,
     test_decl,
     comment_block,
+    trait_def,
+    impl_block,
+    type_alias,
+    macro_def,
+    method,
 };
 
 pub const Symbol = struct {
@@ -157,6 +162,7 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
     outline.byte_size = content.len;
 
     var line_num: u32 = 0;
+    var prev_line_trimmed: []const u8 = "";
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         line_num += 1;
@@ -168,7 +174,11 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
             try self.parsePythonLine(trimmed, line_num, &outline);
         } else if (outline.language == .typescript or outline.language == .javascript) {
             try self.parseTsLine(trimmed, line_num, &outline);
+        } else if (outline.language == .rust) {
+            try self.parseRustLine(trimmed, line_num, &outline, prev_line_trimmed);
         }
+
+        prev_line_trimmed = trimmed;
     }
     outline.line_count = line_num;
 
@@ -636,7 +646,6 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
             try outline.imports.append(a, import_copy);
         }
     }
-
     fn parseTsLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
         const a = self.allocator;
         if (containsAny(line, &.{ "function ", "const ", "export function ", "export const " })) {
@@ -669,6 +678,213 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                 const import_copy = try a.dupe(u8, path);
                 errdefer a.free(import_copy);
                 try outline.imports.append(a, import_copy);
+            }
+        }
+    }
+
+    fn parseRustLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline, prev_line: []const u8) !void {
+        const a = self.allocator;
+
+        // fn / pub fn / pub(crate) fn / async fn / pub async fn / unsafe fn
+        if (containsAny(line, &.{"fn "})) {
+            const is_decl = startsWith(line, "fn ") or
+                startsWith(line, "pub fn ") or
+                startsWith(line, "pub(crate) fn ") or
+                startsWith(line, "pub(super) fn ") or
+                startsWith(line, "async fn ") or
+                startsWith(line, "pub async fn ") or
+                startsWith(line, "unsafe fn ") or
+                startsWith(line, "pub unsafe fn ") or
+                startsWith(line, "pub(crate) async fn ") or
+                startsWith(line, "pub(crate) unsafe fn ") or
+                startsWith(line, "pub unsafe extern ");
+            if (is_decl) {
+                if (std.mem.indexOf(u8, line, "fn ")) |fn_pos| {
+                    if (extractIdent(line[fn_pos + 3 ..])) |name| {
+                        const is_test = std.mem.eql(u8, prev_line, "#[test]") or
+                            startsWith(prev_line, "#[tokio::test");
+                        const kind: SymbolKind = if (is_test) .test_decl else .function;
+                        const name_copy = try a.dupe(u8, name);
+                        errdefer a.free(name_copy);
+                        const detail_copy = try a.dupe(u8, line);
+                        errdefer a.free(detail_copy);
+                        try outline.symbols.append(a, .{
+                            .name = name_copy,
+                            .kind = kind,
+                            .line_start = line_num,
+                            .line_end = line_num,
+                            .detail = detail_copy,
+                        });
+                    }
+                }
+            }
+        }
+
+        // struct
+        if (startsWith(line, "struct ") or startsWith(line, "pub struct ") or startsWith(line, "pub(crate) struct ")) {
+            if (std.mem.indexOf(u8, line, "struct ")) |pos| {
+                if (extractIdent(line[pos + 7 ..])) |name| {
+                    const name_copy = try a.dupe(u8, name);
+                    errdefer a.free(name_copy);
+                    const detail_copy = try a.dupe(u8, line);
+                    errdefer a.free(detail_copy);
+                    try outline.symbols.append(a, .{
+                        .name = name_copy,
+                        .kind = .struct_def,
+                        .line_start = line_num,
+                        .line_end = line_num,
+                        .detail = detail_copy,
+                    });
+                }
+            }
+        }
+
+        // enum
+        if (startsWith(line, "enum ") or startsWith(line, "pub enum ") or startsWith(line, "pub(crate) enum ")) {
+            if (std.mem.indexOf(u8, line, "enum ")) |pos| {
+                if (extractIdent(line[pos + 5 ..])) |name| {
+                    const name_copy = try a.dupe(u8, name);
+                    errdefer a.free(name_copy);
+                    const detail_copy = try a.dupe(u8, line);
+                    errdefer a.free(detail_copy);
+                    try outline.symbols.append(a, .{
+                        .name = name_copy,
+                        .kind = .enum_def,
+                        .line_start = line_num,
+                        .line_end = line_num,
+                        .detail = detail_copy,
+                    });
+                }
+            }
+        }
+
+        // trait
+        if (startsWith(line, "trait ") or startsWith(line, "pub trait ") or startsWith(line, "pub(crate) trait ") or startsWith(line, "unsafe trait ") or startsWith(line, "pub unsafe trait ")) {
+            if (std.mem.indexOf(u8, line, "trait ")) |pos| {
+                if (extractIdent(line[pos + 6 ..])) |name| {
+                    const name_copy = try a.dupe(u8, name);
+                    errdefer a.free(name_copy);
+                    const detail_copy = try a.dupe(u8, line);
+                    errdefer a.free(detail_copy);
+                    try outline.symbols.append(a, .{
+                        .name = name_copy,
+                        .kind = .trait_def,
+                        .line_start = line_num,
+                        .line_end = line_num,
+                        .detail = detail_copy,
+                    });
+                }
+            }
+        }
+
+        // impl
+        if (startsWith(line, "impl ") or startsWith(line, "impl<") or startsWith(line, "unsafe impl ")) {
+            const impl_start: usize = if (startsWith(line, "unsafe impl ")) 12 else if (startsWith(line, "impl<")) blk: {
+                if (std.mem.indexOf(u8, line, "> ")) |gt| {
+                    break :blk gt + 2;
+                } else break :blk 5;
+            } else 5;
+            if (extractIdent(line[impl_start..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{
+                    .name = name_copy,
+                    .kind = .impl_block,
+                    .line_start = line_num,
+                    .line_end = line_num,
+                    .detail = detail_copy,
+                });
+            }
+        }
+
+        // type alias
+        if (startsWith(line, "type ") or startsWith(line, "pub type ") or startsWith(line, "pub(crate) type ")) {
+            if (std.mem.indexOf(u8, line, "type ")) |pos| {
+                if (extractIdent(line[pos + 5 ..])) |name| {
+                    const name_copy = try a.dupe(u8, name);
+                    errdefer a.free(name_copy);
+                    const detail_copy = try a.dupe(u8, line);
+                    errdefer a.free(detail_copy);
+                    try outline.symbols.append(a, .{
+                        .name = name_copy,
+                        .kind = .type_alias,
+                        .line_start = line_num,
+                        .line_end = line_num,
+                        .detail = detail_copy,
+                    });
+                }
+            }
+        }
+
+        // const / static
+        if (startsWith(line, "const ") or startsWith(line, "pub const ") or startsWith(line, "pub(crate) const ") or
+            startsWith(line, "static ") or startsWith(line, "pub static ") or startsWith(line, "pub(crate) static "))
+        {
+            const keyword = if (std.mem.indexOf(u8, line, "static ")) |_| "static " else "const ";
+            if (std.mem.indexOf(u8, line, keyword)) |pos| {
+                if (extractIdent(line[pos + keyword.len ..])) |name| {
+                    const name_copy = try a.dupe(u8, name);
+                    errdefer a.free(name_copy);
+                    const detail_copy = try a.dupe(u8, line);
+                    errdefer a.free(detail_copy);
+                    try outline.symbols.append(a, .{
+                        .name = name_copy,
+                        .kind = .constant,
+                        .line_start = line_num,
+                        .line_end = line_num,
+                        .detail = detail_copy,
+                    });
+                }
+            }
+        }
+
+        // macro_rules!
+        if (startsWith(line, "macro_rules!")) {
+            if (extractIdent(line[13..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{
+                    .name = name_copy,
+                    .kind = .macro_def,
+                    .line_start = line_num,
+                    .line_end = line_num,
+                    .detail = detail_copy,
+                });
+            }
+        }
+
+        // use / mod
+        if (startsWith(line, "use ") or startsWith(line, "pub use ") or startsWith(line, "pub(crate) use ")) {
+            const symbol_copy = try a.dupe(u8, line);
+            errdefer a.free(symbol_copy);
+            try outline.symbols.append(a, .{
+                .name = symbol_copy,
+                .kind = .import,
+                .line_start = line_num,
+                .line_end = line_num,
+            });
+            const import_copy = try a.dupe(u8, line);
+            errdefer a.free(import_copy);
+            try outline.imports.append(a, import_copy);
+        } else if (startsWith(line, "mod ") or startsWith(line, "pub mod ") or startsWith(line, "pub(crate) mod ")) {
+            if (std.mem.indexOf(u8, line, "mod ")) |pos| {
+                if (extractIdent(line[pos + 4 ..])) |name| {
+                    const name_copy = try a.dupe(u8, name);
+                    errdefer a.free(name_copy);
+                    try outline.symbols.append(a, .{
+                        .name = name_copy,
+                        .kind = .import,
+                        .line_start = line_num,
+                        .line_end = line_num,
+                    });
+                    const import_copy = try a.dupe(u8, name);
+                    errdefer a.free(import_copy);
+                    try outline.imports.append(a, import_copy);
+                }
             }
         }
     }
