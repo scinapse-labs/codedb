@@ -266,6 +266,7 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
         var iter = self.contents.iterator();
         while (iter.next()) |entry| {
             try self.trigram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*);
+            try self.sparse_ngram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 
@@ -1285,8 +1286,48 @@ fn matchHere(haystack: []const u8, pattern: []const u8, pos: usize) bool {
         // Alternation handled at top level in regexMatch
         if (pattern[p] == '|') return false;
 
-        // Grouping with parens — simplified: just skip parens
-        if (pattern[p] == '(' or pattern[p] == ')') {
+        // Grouping with parens — handle alternation inside groups
+        if (pattern[p] == '(') {
+            // Find matching closing paren
+            var depth: usize = 1;
+            var end = p + 1;
+            while (end < pattern.len and depth > 0) {
+                if (pattern[end] == '\\' and end + 1 < pattern.len) {
+                    end += 2;
+                    continue;
+                }
+                if (pattern[end] == '(') depth += 1;
+                if (pattern[end] == ')') depth -= 1;
+                if (depth > 0) end += 1;
+            }
+            // end now points at ')' (or pattern.len if unmatched)
+            const group_end = if (end < pattern.len) end else pattern.len;
+            const group_content = pattern[p + 1 .. group_end];
+            const after_group = if (group_end + 1 <= pattern.len) pattern[group_end + 1 ..] else "";
+
+            // Split group content on top-level | within this group
+            var branch_start: usize = 0;
+            var d: usize = 0;
+            var i: usize = 0;
+            while (i < group_content.len) {
+                if (group_content[i] == '\\' and i + 1 < group_content.len) {
+                    i += 2;
+                    continue;
+                }
+                if (group_content[i] == '(') d += 1;
+                if (group_content[i] == ')') { if (d > 0) d -= 1; }
+                if (group_content[i] == '|' and d == 0) {
+                    // Try this branch
+                    if (matchGroupBranch(haystack, group_content[branch_start..i], after_group, h)) return true;
+                    branch_start = i + 1;
+                }
+                i += 1;
+            }
+            // Try last branch
+            return matchGroupBranch(haystack, group_content[branch_start..], after_group, h);
+        }
+
+        if (pattern[p] == ')') {
             p += 1;
             continue;
         }
@@ -1309,6 +1350,33 @@ fn matchHere(haystack: []const u8, pattern: []const u8, pos: usize) bool {
                 // Try without
                 return matchHere(haystack, pattern[elem_end + 1 ..], h);
             }
+            if (qc == '{') {
+                // Parse {n}, {n,}, {n,m}
+                var qi = elem_end + 1;
+                var min_rep: usize = 0;
+                while (qi < pattern.len and pattern[qi] >= '0' and pattern[qi] <= '9') {
+                    min_rep = min_rep * 10 + (pattern[qi] - '0');
+                    qi += 1;
+                }
+                var max_rep: usize = min_rep; // default {n} = exactly n
+                if (qi < pattern.len and pattern[qi] == ',') {
+                    qi += 1;
+                    if (qi < pattern.len and pattern[qi] >= '0' and pattern[qi] <= '9') {
+                        max_rep = 0;
+                        while (qi < pattern.len and pattern[qi] >= '0' and pattern[qi] <= '9') {
+                            max_rep = max_rep * 10 + (pattern[qi] - '0');
+                            qi += 1;
+                        }
+                    } else {
+                        max_rep = 256; // {n,} = at least n, cap at 256
+                    }
+                }
+                if (qi < pattern.len and pattern[qi] == '}') {
+                    qi += 1; // skip '}'
+                    return matchQuantifiedRange(haystack, pattern, p, elem_end, qi, min_rep, max_rep, h);
+                }
+                // Malformed {…} — treat as literal
+            }
         }
 
         // No quantifier — must match exactly one char
@@ -1321,6 +1389,30 @@ fn matchHere(haystack: []const u8, pattern: []const u8, pos: usize) bool {
     return true; // pattern exhausted — match
 }
 
+/// Try matching a group branch followed by the rest of the pattern.
+fn matchGroupBranch(haystack: []const u8, branch: []const u8, after: []const u8, pos: usize) bool {
+    // Concatenate branch + after conceptually by matching branch first,
+    // then continuing with after at the new position.
+    // matchHere on branch tells us how far it consumes.
+    // We need to try every possible consumption length of the branch.
+    return matchBranchThenRest(haystack, branch, after, pos);
+}
+
+fn matchBranchThenRest(haystack: []const u8, branch: []const u8, rest: []const u8, pos: usize) bool {
+    // If branch is empty, just try matching the rest
+    if (branch.len == 0) return matchHere(haystack, rest, pos);
+
+    // We need to find how many chars the branch consumes, then match rest.
+    // Build a temporary combined pattern: branch + rest
+    // This is safe because both are slices of the same original pattern string,
+    // but they may not be adjacent. Use a simple approach: match branch, track position.
+    var buf: [4096]u8 = undefined;
+    if (branch.len + rest.len > buf.len) return false;
+    @memcpy(buf[0..branch.len], branch);
+    @memcpy(buf[branch.len..branch.len + rest.len], rest);
+    return matchHere(haystack, buf[0..branch.len + rest.len], pos);
+}
+
 /// Match a quantified element (greedy).
 fn matchQuantified(haystack: []const u8, pattern: []const u8, elem_start: usize, elem_end: usize, rest_start: usize, min_count: usize, start_pos: usize) bool {
     // Count max matches
@@ -1330,6 +1422,25 @@ fn matchQuantified(haystack: []const u8, pattern: []const u8, elem_start: usize,
         count += 1;
         h += 1;
     }
+    // Greedy: try from max matches down to min
+    var c: usize = count + 1;
+    while (c > min_count) {
+        c -= 1;
+        if (matchHere(haystack, pattern[rest_start..], start_pos + c)) return true;
+    }
+    return false;
+}
+
+/// Match a {n,m} quantified element (greedy).
+fn matchQuantifiedRange(haystack: []const u8, pattern: []const u8, elem_start: usize, elem_end: usize, rest_start: usize, min_count: usize, max_count: usize, start_pos: usize) bool {
+    // Count max matches up to max_count
+    var count: usize = 0;
+    var h = start_pos;
+    while (h < haystack.len and count < max_count and matchElement(haystack[h], pattern, elem_start, elem_end)) {
+        count += 1;
+        h += 1;
+    }
+    if (count < min_count) return false;
     // Greedy: try from max matches down to min
     var c: usize = count + 1;
     while (c > min_count) {
@@ -1385,9 +1496,14 @@ fn matchElement(c: u8, pattern: []const u8, start: usize, end: usize) bool {
             i += 1;
         }
         var matched = false;
+        // Handle literal ] at start of class (e.g. []] or [^]])
+        if (i < end and pattern[i] == ']') {
+            if (c == ']') matched = true;
+            i += 1;
+        }
         while (i < end and pattern[i] != ']') {
-            if (i + 2 < end and pattern[i + 1] == '-') {
-                // Range
+            // Range: a-z, but only if '-' is not at end of class
+            if (i + 2 < end and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
                 if (c >= pattern[i] and c <= pattern[i + 2]) matched = true;
                 i += 3;
             } else {

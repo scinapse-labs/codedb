@@ -52,6 +52,16 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
+    // ── Adversarial tests ──
+    const adversarial_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/adversarial_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(adversarial_tests).step);
+
     // ── Benchmarks ──
     const bench = b.addExecutable(.{
         .name = "bench",

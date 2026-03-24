@@ -1003,7 +1003,14 @@ fn extractLiteralTrigrams(pattern: []const u8, allocator: std.mem.Allocator) ![]
                 _ = literals.pop();
             }
             try flushLiterals(allocator, &literals, &trigrams_list, &seen);
-            i += 1;
+            // If it's a brace quantifier {n}, {n,m}, {n,}, skip to closing }
+            if (c == '{') {
+                i += 1;
+                while (i < pattern.len and pattern[i] != '}') : (i += 1) {}
+                if (i < pattern.len) i += 1; // skip '}'
+            } else {
+                i += 1;
+            }
             continue;
         }
 
