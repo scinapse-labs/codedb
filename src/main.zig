@@ -10,6 +10,7 @@ const sty = @import("style.zig");
 const git_mod = @import("git.zig");
 const TrigramIndex = @import("index.zig").TrigramIndex;
 const index_mod = @import("index.zig");
+const snapshot_mod = @import("snapshot.zig");
 
 
 /// Thin wrapper: format + write to a File via allocator.
@@ -147,19 +148,10 @@ pub fn main() !void {
         }
 
         // If no freq table was loaded, build one from indexed content and
-        // persist for next run.  The table is stack-allocated so we can't
-        // call setFrequencyTable this run; next startup will load from disk.
+        // persist for next run.  Streams file-by-file — zero extra memory.
         if (freq_table_heap == null) {
-            var content_buf: std.ArrayList(u8) = .{};
-            defer content_buf.deinit(allocator);
-
-            var ct_it = explorer.contents.iterator();
-            while (ct_it.next()) |entry| {
-                content_buf.appendSlice(allocator, entry.value_ptr.*) catch {};
-            }
-
-            if (content_buf.items.len > 0) {
-                const ft = index_mod.buildFrequencyTable(content_buf.items);
+            if (explorer.contents.count() > 0) {
+                const ft = index_mod.buildFrequencyTableFromMap(&explorer.contents);
                 index_mod.writeFrequencyTable(&ft, data_dir) catch |err| {
                     std.log.warn("could not persist frequency table: {}", .{err});
                 };
@@ -351,6 +343,22 @@ pub fn main() !void {
                 s.cyan, path, s.reset,
             });
         }
+    } else if (std.mem.eql(u8, cmd, "snapshot")) {
+        const t0 = std.time.nanoTimestamp();
+        const output = if (args.len > cmd_args_start) args[cmd_args_start] else "codedb.snapshot";
+        snapshot_mod.writeSnapshot(&explorer, abs_root, output, allocator) catch |err| {
+            out.p("{s}\xe2\x9c\x97{s} snapshot failed: {}\n", .{ s.red, s.reset, err });
+            std.process.exit(1);
+        };
+        const elapsed = std.time.nanoTimestamp() - t0;
+        var dur_buf: [64]u8 = undefined;
+        out.p("{s}\xe2\x9c\x93{s} {s}snapshot{s}  {s}{s}{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
+            s.green, s.reset,
+            s.bold, s.reset,
+            s.cyan, output, s.reset,
+            s.dim, explorer.outlines.count(), s.reset,
+            sty.durationColor(s, elapsed), sty.formatDuration(&dur_buf, elapsed), s.reset,
+        });
 
     } else if (std.mem.eql(u8, cmd, "serve")) {
         const port: u16 = 7719;
@@ -416,7 +424,7 @@ pub fn main() !void {
 }
 
 fn isCommand(arg: []const u8) bool {
-    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "hot", "serve", "mcp" };
+    const commands = [_][]const u8{ "tree", "outline", "find", "search", "word", "hot", "snapshot", "serve", "mcp" };
     for (commands) |c| {
         if (std.mem.eql(u8, arg, c)) return true;
     }

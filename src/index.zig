@@ -1133,7 +1133,7 @@ pub const default_pair_freq: [256][256]u16 = blk: {
 
 /// Active frequency table — points to the comptime default or a runtime
 /// per-project table.  Swap only before indexing starts (not thread-safe).
-var active_pair_freq: *const [256][256]u16 = &default_pair_freq;
+pub var active_pair_freq: *const [256][256]u16 = &default_pair_freq;
 
 
 /// Deterministic weight for a character pair, used to place content-defined
@@ -1167,6 +1167,39 @@ pub fn buildFrequencyTable(content: []const u8) [256][256]u16 {
             counts[content[i]][content[i + 1]] += 1;
         }
     }
+    return finishFrequencyTable(&counts);
+}
+
+/// Build a frequency table by streaming over multiple content slices.
+/// Zero extra memory — counts pairs within each slice, skipping cross-slice
+/// boundaries (negligible loss for large corpora).
+pub fn buildFrequencyTableFromSlices(slices: []const []const u8) [256][256]u16 {
+    var counts: [256][256]u64 = .{.{0} ** 256} ** 256;
+    for (slices) |content| {
+        if (content.len < 2) continue;
+        for (0..content.len - 1) |i| {
+            counts[content[i]][content[i + 1]] += 1;
+        }
+    }
+    return finishFrequencyTable(&counts);
+}
+
+/// Build a frequency table by streaming over a StringHashMap of content.
+/// Iterates file-by-file — no concatenation, zero extra memory.
+pub fn buildFrequencyTableFromMap(contents: *const std.StringHashMap([]const u8)) [256][256]u16 {
+    var counts: [256][256]u64 = .{.{0} ** 256} ** 256;
+    var iter = contents.valueIterator();
+    while (iter.next()) |content_ptr| {
+        const content = content_ptr.*;
+        if (content.len < 2) continue;
+        for (0..content.len - 1) |i| {
+            counts[content[i]][content[i + 1]] += 1;
+        }
+    }
+    return finishFrequencyTable(&counts);
+}
+
+fn finishFrequencyTable(counts: *const [256][256]u64) [256][256]u16 {
     var max_count: u64 = 1;
     for (counts) |row| {
         for (row) |c| {
