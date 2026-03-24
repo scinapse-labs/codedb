@@ -3071,6 +3071,41 @@ test "thread-safe: concurrent SparseNgramIndex.candidates() with per-thread allo
     for (threads) |t| t.join();
 }
 
+test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" {
+    // BUG: scanBg (main.zig:559-560) replaces explorer.trigram_index without
+    // holding explorer.mu exclusively. searchContent holds mu.lockShared() while
+    // accessing trigram_index.candidates() — a concurrent deinit is use-after-free.
+    //
+    // This test holds mu.lockShared() (simulating a reader mid-search), then runs
+    // the swap pattern from scanBg without acquiring mu exclusively. Because the
+    // buggy swap never tries to acquire mu, it proceeds immediately → raced=true.
+    // With the fix (mu.lock() before swap), the thread blocks → raced=false → passes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator());
+    try exp.indexFile("a.zig", "pub fn handleAuth(token: []const u8) bool { return token.len > 0; }");
+
+    exp.mu.lockShared();
+
+    const SwapCtx = struct {
+        exp: *Explorer,
+        swapped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        fn run(ctx: *@This()) void {
+            // scanBg pattern WITHOUT exclusive lock (the bug: main.zig:559-560)
+            ctx.exp.trigram_index = TrigramIndex.init(ctx.exp.allocator);
+            ctx.swapped.store(true, .release);
+        }
+    };
+    var sctx = SwapCtx{ .exp = &exp };
+    const t = try std.Thread.spawn(.{}, SwapCtx.run, .{&sctx});
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    const raced = sctx.swapped.load(.acquire);
+    exp.mu.unlockShared();
+    t.join();
+    // FAILS on unfixed code: swap proceeds without waiting for exclusive lock.
+    try testing.expect(!raced);
+}
+
 test "issue-44: snapshot stale after working tree changes cause stale query results" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3183,3 +3218,4 @@ test "issue-45: snapshot written in non-git directory cannot be loaded" {
     // Expect non-null — currently fails (returns null for all-zeros HEAD)
     try testing.expect(snap_head != null);
 }
+
