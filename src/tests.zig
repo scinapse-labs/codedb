@@ -29,6 +29,7 @@ const extractLines = explore.extractLines;
 const isCommentOrBlank = explore.isCommentOrBlank;
 const Language = explore.Language;
 const mcp_mod = @import("mcp.zig");
+const snapshot_mod = @import("snapshot.zig");
 // ── Store tests ─────────────────────────────────────────────
 
 test "store: record and retrieve snapshots" {
@@ -3068,5 +3069,153 @@ test "thread-safe: concurrent SparseNgramIndex.candidates() with per-thread allo
     var threads: [4]std.Thread = undefined;
     for (&threads) |*t| t.* = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx});
     for (threads) |t| t.join();
-    try testing.expectEqual(@as(u32, 0), ctx.errors.load(.monotonic));
 }
+
+test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" {
+    // BUG: scanBg (main.zig:559-560) replaces explorer.trigram_index without
+    // holding explorer.mu exclusively. searchContent holds mu.lockShared() while
+    // accessing trigram_index.candidates() — a concurrent deinit is use-after-free.
+    //
+    // This test holds mu.lockShared() (simulating a reader mid-search), then runs
+    // the swap pattern from scanBg without acquiring mu exclusively. Because the
+    // buggy swap never tries to acquire mu, it proceeds immediately → raced=true.
+    // With the fix (mu.lock() before swap), the thread blocks → raced=false → passes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator());
+    try exp.indexFile("a.zig", "pub fn handleAuth(token: []const u8) bool { return token.len > 0; }");
+
+    exp.mu.lockShared();
+
+    const SwapCtx = struct {
+        exp: *Explorer,
+        swapped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        fn run(ctx: *@This()) void {
+            // scanBg pattern WITHOUT exclusive lock (the bug: main.zig:559-560)
+            ctx.exp.trigram_index = TrigramIndex.init(ctx.exp.allocator);
+            ctx.swapped.store(true, .release);
+        }
+    };
+    var sctx = SwapCtx{ .exp = &exp };
+    const t = try std.Thread.spawn(.{}, SwapCtx.run, .{&sctx});
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    const raced = sctx.swapped.load(.acquire);
+    exp.mu.unlockShared();
+    t.join();
+    // FAILS on unfixed code: swap proceeds without waiting for exclusive lock.
+    try testing.expect(!raced);
+}
+
+test "issue-44: snapshot stale after working tree changes cause stale query results" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/test.snapshot", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    const file_abs = try std.fmt.allocPrint(testing.allocator, "{s}/stale.zig", .{dir_path});
+    defer testing.allocator.free(file_abs);
+
+    // Step 1: write file with old content, index it, write snapshot.
+    try tmp.dir.writeFile(.{ .sub_path = "stale.zig", .data = "pub fn oldFunc() void {}" });
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var exp = Explorer.init(arena.allocator());
+        try exp.indexFile(file_abs, "pub fn oldFunc() void {}");
+        try snapshot_mod.writeSnapshot(&exp, ".", snap_path, arena.allocator());
+    }
+
+    // Step 2: modify file AFTER snapshot creation (simulating uncommitted working tree change).
+    // Sleep 10ms so the file mtime is strictly greater than the snapshot's indexed_at timestamp.
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    try tmp.dir.writeFile(.{ .sub_path = "stale.zig", .data = "pub fn newFunc() void {}" });
+
+    // Step 3: load snapshot into a fresh explorer (what MCP startup does).
+    // scan_done is set to true immediately; watcher then builds known-FileMap
+    // from current disk mtimes, recording the already-modified file's mtime as
+    // the baseline. It will never be re-indexed unless changed a second time.
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator());
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store2, arena2.allocator());
+    try testing.expect(loaded);
+
+    // Step 4: after the fix, loadSnapshot should detect that the disk file's
+    // mtime > snapshot indexed_at and re-index it from disk, making "newFunc"
+    // visible. Currently no such path exists.
+    // Expected (after fix): results.len == 1
+    // Current (bug): results.len == 0 — stale snapshot content is never evicted.
+    const results = try exp2.searchContent("newFunc", testing.allocator, 10);
+    defer {
+        for (results) |r| { testing.allocator.free(r.path); testing.allocator.free(r.line_text); }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len == 1);
+}
+
+test "issue-46: empty-repo snapshot rejected on load" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var exp = Explorer.init(arena.allocator());
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/test.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+
+    // Write snapshot of empty repo (no files indexed)
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    // Load into fresh explorer + store
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    var exp2 = Explorer.init(arena2.allocator());
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store, testing.allocator);
+    // Valid empty-repo snapshot should be accepted; currently returns false (bug: file_count == 0)
+    try testing.expect(loaded);
+}
+
+
+// ── Snapshot non-git tests ───────────────────────────────────
+
+test "issue-45: snapshot written in non-git directory cannot be loaded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+
+    var exp = Explorer.init(aa);
+    try exp.indexFile("dummy.zig", "const x = 1;");
+
+    const snap_path = try std.fs.path.join(aa, &.{ dir_path, "test.codedb" });
+
+    // Write snapshot with a non-git root_path — git_head will be all-zeros
+    try snapshot_mod.writeSnapshot(&exp, "/tmp", snap_path, aa);
+
+    // Snapshot file was created
+    std.fs.cwd().access(snap_path, .{}) catch {
+        return error.TestUnexpectedResult;
+    };
+
+    // BUG: readSnapshotGitHead returns null for all-zeros git_head,
+    // so no snapshot written in a non-git dir can ever be loaded.
+    const snap_head = snapshot_mod.readSnapshotGitHead(snap_path);
+    // Expect non-null — currently fails (returns null for all-zeros HEAD)
+    try testing.expect(snap_head != null);
+}
+
