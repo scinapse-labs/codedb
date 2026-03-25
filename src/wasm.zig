@@ -76,7 +76,7 @@ export fn wasm_index_file(
     const path = path_ptr[0..path_len];
     const content = content_ptr[0..content_len];
     const exp = getExplorer();
-    exp.indexFile(path, content) catch return 0;
+    exp.indexFileOutlineOnly(path, content) catch return 0;
     return 1;
 }
 
