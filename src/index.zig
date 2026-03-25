@@ -555,8 +555,9 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
             });
         }
 
-        // Step 4: Write postings file atomically
-        const postings_tmp = try std.fmt.allocPrint(self.allocator, "{s}/trigram.postings.tmp", .{dir_path});
+        // Step 4: Write postings file atomically (random suffix prevents collisions)
+        const post_rand = std.crypto.random.int(u64);
+        const postings_tmp = try std.fmt.allocPrint(self.allocator, "{s}/trigram.postings.{x}.tmp", .{ dir_path, post_rand });
         defer self.allocator.free(postings_tmp);
         const postings_final = try std.fmt.allocPrint(self.allocator, "{s}/trigram.postings", .{dir_path});
         defer self.allocator.free(postings_final);
@@ -596,8 +597,9 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         }
         try std.fs.cwd().rename(postings_tmp, postings_final);
 
-        // Step 5: Write lookup file atomically
-        const lookup_tmp = try std.fmt.allocPrint(self.allocator, "{s}/trigram.lookup.tmp", .{dir_path});
+        // Step 5: Write lookup file atomically (random suffix prevents collisions)
+        const lk_rand = std.crypto.random.int(u64);
+        const lookup_tmp = try std.fmt.allocPrint(self.allocator, "{s}/trigram.lookup.{x}.tmp", .{ dir_path, lk_rand });
         defer self.allocator.free(lookup_tmp);
         const lookup_final = try std.fmt.allocPrint(self.allocator, "{s}/trigram.lookup", .{dir_path});
         defer self.allocator.free(lookup_final);

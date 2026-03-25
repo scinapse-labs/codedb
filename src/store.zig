@@ -78,6 +78,15 @@ pub const Store = struct {
         var data_len: u32 = 0;
         if (diff) |d| {
             if (self.data_log) |log| {
+                // Advisory lock for cross-process safety
+                const fd = log.handle;
+                _ = std.posix.flock(fd, std.posix.LOCK.EX) catch {};
+                defer _ = std.posix.flock(fd, std.posix.LOCK.UN) catch {};
+
+                // Re-stat to get current end position (another process may have appended)
+                const stat = log.stat() catch return error.Unexpected;
+                self.data_log_pos = stat.size;
+
                 data_offset = self.data_log_pos;
                 data_len = @intCast(d.len);
                 try log.seekTo(self.data_log_pos);

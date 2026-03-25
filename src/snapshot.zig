@@ -310,6 +310,9 @@ pub fn loadSnapshot(
     store: *@import("store.zig").Store,
     allocator: std.mem.Allocator,
 ) bool {
+    // Clean up stale temp files from previous crashed writers
+    cleanupStaleTmpFiles(snapshot_path);
+
     const file = std.fs.cwd().openFile(snapshot_path, .{}) catch return false;
     defer file.close();
 
@@ -471,4 +474,27 @@ fn isSensitivePath(path: []const u8) bool {
 fn endsWith(s: []const u8, suffix: []const u8) bool {
     if (s.len < suffix.len) return false;
     return std.mem.eql(u8, s[s.len - suffix.len ..], suffix);
+}
+
+fn cleanupStaleTmpFiles(output_path: []const u8) void {
+    // Derive parent directory and basename from output_path
+    const sep = std.mem.lastIndexOfScalar(u8, output_path, '/');
+    const dir_path = if (sep) |s| output_path[0..s] else ".";
+    const basename = if (sep) |s| output_path[s + 1 ..] else output_path;
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.name;
+        // Match: starts with basename, ends with .tmp
+        if (name.len > basename.len and
+            std.mem.startsWith(u8, name, basename) and
+            endsWith(name, ".tmp"))
+        {
+            dir.deleteFile(name) catch {};
+        }
+    }
 }
