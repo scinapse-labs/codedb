@@ -62,6 +62,42 @@ curl "localhost:7719/explore/deps?path=store.zig"
 #     src/watcher.zig
 ```
 
+
+## Data Storage & Privacy
+
+codedb2 is **fully local** — no telemetry, no analytics, no network calls. Nothing leaves your machine.
+
+### What gets stored
+
+| Location | Contents | Purpose |
+|----------|----------|---------|
+| `~/.codedb/projects/<hash>/` | Trigram index, frequency table, data log | Persistent index cache (faster restarts) |
+| `~/.codedb/projects/<hash>/project.txt` | Absolute path to your project root | Maps hash back to project |
+| `~/.codedb/projects/<hash>/data.log` | File paths, sizes, content hashes | Version tracking (append-only) |
+| `./codedb.snapshot` (in project root) | File tree, outlines, content, frequency table | Portable snapshot for instant MCP startup |
+
+### What is NOT stored
+
+- **No source code** is sent anywhere — all indexing is local
+- **No network requests** — codedb2 never phones home
+- **No usage analytics or crash reports**
+- **Sensitive files are auto-excluded** from snapshots: `.env*`, `credentials.json`, `secrets.*`, `.pem`, `.key`, SSH keys, AWS configs, and more (see `isSensitivePath` in `src/snapshot.zig`)
+
+### Clearing your data
+
+```bash
+# Remove all cached indexes for all projects
+rm -rf ~/.codedb/
+
+# Remove snapshot from current project
+rm -f codedb.snapshot
+
+# Remove cache for a specific project (find the hash first)
+ls ~/.codedb/projects/
+cat ~/.codedb/projects/<hash>/project.txt  # shows which project
+rm -rf ~/.codedb/projects/<hash>/
+```
+
 ## Architecture
 
 ```
