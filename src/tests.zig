@@ -3219,3 +3219,73 @@ test "issue-45: snapshot written in non-git directory cannot be loaded" {
     try testing.expect(snap_head != null);
 }
 
+// ── Multi-instance contention tests ────────────────────────────
+
+test "issue-47: concurrent snapshot writes from parallel instances corrupt file" {
+    // BUG: Two codedb instances indexing the same repo write codedb.snapshot
+    // concurrently with no file locking. The second writer can overwrite a
+    // partially-written snapshot, producing a corrupt file that loadSnapshot
+    // rejects or — worse — reads garbage section offsets from.
+    //
+    // Simulate: two threads write snapshots to the same path concurrently,
+    // then verify the final file is still loadable.
+    var arena1 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena1.deinit();
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+
+    var exp1 = Explorer.init(arena1.allocator());
+    try exp1.indexFile("a.zig", "pub fn alpha() void {}");
+    var exp2 = Explorer.init(arena2.allocator());
+    try exp2.indexFile("b.zig", "pub fn beta() void {}");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/concurrent.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+
+    const WriterCtx = struct {
+        exp: *Explorer,
+        path: []const u8,
+        dir: []const u8,
+        alloc: std.mem.Allocator,
+        failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(ctx: *@This()) void {
+            for (0..10) |_| {
+                snapshot_mod.writeSnapshot(ctx.exp, ctx.dir, ctx.path, ctx.alloc) catch {
+                    ctx.failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+    };
+
+    var ctx1 = WriterCtx{ .exp = &exp1, .path = snap_path, .dir = dir_path, .alloc = arena1.allocator() };
+    var ctx2 = WriterCtx{ .exp = &exp2, .path = snap_path, .dir = dir_path, .alloc = arena2.allocator() };
+
+    const t1 = try std.Thread.spawn(.{}, WriterCtx.run, .{&ctx1});
+    const t2 = try std.Thread.spawn(.{}, WriterCtx.run, .{&ctx2});
+    t1.join();
+    t2.join();
+
+    // Neither writer should have errored
+    try testing.expect(!ctx1.failed.load(.acquire));
+    try testing.expect(!ctx2.failed.load(.acquire));
+
+    // The final snapshot must be loadable (not corrupt)
+    var arena3 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena3.deinit();
+    var exp3 = Explorer.init(arena3.allocator());
+    var store3 = Store.init(testing.allocator);
+    defer store3.deinit();
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp3, &store3, arena3.allocator());
+
+    // Expected: loaded == true (snapshot is valid, written atomically)
+    // Current (bug): may be false — last writer's rename can land mid-write of
+    // the first writer's tmp file, or both rename the same .tmp path.
+    try testing.expect(loaded);
+}
+

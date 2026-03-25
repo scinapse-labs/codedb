@@ -49,7 +49,8 @@ pub fn writeSnapshot(
     output_path: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{output_path});
+    const rand_suffix = std.crypto.random.int(u64);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ output_path, rand_suffix });
     defer allocator.free(tmp_path);
 
     var file = try std.fs.cwd().createFile(tmp_path, .{});
