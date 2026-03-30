@@ -2,6 +2,7 @@ const std = @import("std");
 const Store = @import("store.zig").Store;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const AgentId = @import("agent.zig").AgentId;
+const Explorer = @import("explore.zig").Explorer;
 const Op = @import("version.zig").Op;
 
 pub const EditRequest = struct {
@@ -23,6 +24,7 @@ pub fn applyEdit(
     allocator: std.mem.Allocator,
     store: *Store,
     agents: *AgentRegistry,
+    explorer: ?*Explorer,
     req: EditRequest,
 ) !EditResult {
     const has_lock = try agents.tryLock(req.agent_id, req.path, 30_000);
@@ -108,6 +110,9 @@ pub fn applyEdit(
     // in the store. This leaves the disk and store inconsistent. Recovery would require
     // re-reading the file and re-recording, or a crash-recovery scan at startup.
     const seq = try store.recordEdit(req.path, req.agent_id, req.op, hash, result.len, req.content);
+    if (explorer) |exp| {
+        try exp.indexFile(req.path, result);
+    }
 
     agents.releaseLock(req.agent_id, req.path);
 

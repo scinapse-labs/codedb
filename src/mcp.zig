@@ -1,18 +1,156 @@
 // codedb2 MCP server — JSON-RPC 2.0 over stdio
 //
 // Exposes codedb2's exploration + edit engine as MCP tools.
-// Register in your MCP config:
-//   "codedb": { "command": "/path/to/codedb-mcp", "args": ["/path/to/project"] }
+// Uses mcp-zig for protocol utilities; adds roots support for workspace awareness.
 
 const std = @import("std");
+const mcp_lib = @import("mcp");
+const mcpj = mcp_lib.json;
+const Root = mcp_lib.mcp.Root;
 const Store = @import("store.zig").Store;
 const explore_mod = @import("explore.zig");
 const Explorer = explore_mod.Explorer;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
-const Prerender = @import("prerender.zig").Prerender;
+const snapshot_json = @import("snapshot_json.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
 const idx = @import("index.zig");
+const snapshot_mod = @import("snapshot.zig");
+// ── Project cache ────────────────────────────────────────────────────────────
+
+const ProjectCtx = struct {
+    explorer: *Explorer,
+    store: *Store,
+};
+
+const ProjectCache = struct {
+    const MAX_CACHED = 5;
+
+    const Entry = struct {
+        path: []u8,
+        explorer: Explorer,
+        store: Store,
+        last_used: i64,
+    };
+
+    mu: std.Thread.RwLock,
+    alloc: std.mem.Allocator,
+    entries: [MAX_CACHED]?*Entry,
+    default_path: []const u8,
+
+    fn init(alloc_: std.mem.Allocator, default_path_: []const u8) ProjectCache {
+        return .{
+            .mu = .{},
+            .alloc = alloc_,
+            .entries = [_]?*Entry{null} ** MAX_CACHED,
+            .default_path = default_path_,
+        };
+    }
+
+    fn deinit(self: *ProjectCache) void {
+        for (&self.entries) |*slot| {
+            if (slot.*) |entry| {
+                entry.explorer.deinit();
+                entry.store.deinit();
+                self.alloc.free(entry.path);
+                self.alloc.destroy(entry);
+                slot.* = null;
+            }
+        }
+    }
+
+    fn get(
+        self: *ProjectCache,
+        path: ?[]const u8,
+        default_exp: *Explorer,
+        default_store: *Store,
+    ) !ProjectCtx {
+        const p = path orelse return ProjectCtx{ .explorer = default_exp, .store = default_store };
+        if (std.mem.eql(u8, p, self.default_path))
+            return ProjectCtx{ .explorer = default_exp, .store = default_store };
+
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const now = std.time.milliTimestamp();
+        for (&self.entries) |*slot| {
+            if (slot.*) |entry| {
+                if (std.mem.eql(u8, entry.path, p)) {
+                    entry.last_used = now;
+                    return ProjectCtx{ .explorer = &entry.explorer, .store = &entry.store };
+                }
+            }
+        }
+
+        // Cache miss — load from snapshot
+        const new_entry = self.alloc.create(Entry) catch return error.OutOfMemory;
+        new_entry.path = self.alloc.dupe(u8, p) catch {
+            self.alloc.destroy(new_entry);
+            return error.OutOfMemory;
+        };
+        new_entry.explorer = Explorer.init(self.alloc);
+        new_entry.store = Store.init(self.alloc);
+        new_entry.last_used = now;
+
+        var snap_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const snap_path = std.fmt.bufPrint(&snap_buf, "{s}/codedb.snapshot", .{p}) catch {
+            new_entry.store.deinit();
+            new_entry.explorer.deinit();
+            self.alloc.free(new_entry.path);
+            self.alloc.destroy(new_entry);
+            return error.PathTooLong;
+        };
+
+        if (!snapshot_mod.loadSnapshot(snap_path, &new_entry.explorer, &new_entry.store, self.alloc)) {
+            // Fallback: try central store at ~/.codedb/projects/{hash}/codedb.snapshot
+            const hash = std.hash.Wyhash.hash(0, p);
+            var central_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const loaded_central = blk: {
+                const home = std.process.getEnvVarOwned(self.alloc, "HOME") catch break :blk false;
+                defer self.alloc.free(home);
+                const central = std.fmt.bufPrint(&central_buf, "{s}/.codedb/projects/{x}/codedb.snapshot", .{ home, hash }) catch break :blk false;
+                break :blk snapshot_mod.loadSnapshot(central, &new_entry.explorer, &new_entry.store, self.alloc);
+            };
+            if (!loaded_central) {
+                new_entry.store.deinit();
+                new_entry.explorer.deinit();
+                self.alloc.free(new_entry.path);
+                self.alloc.destroy(new_entry);
+                return error.SnapshotLoadFailed;
+            }
+        }
+
+        // Find free slot or evict LRU
+        var target_slot: usize = 0;
+        var found_free = false;
+        for (self.entries, 0..) |slot, i| {
+            if (slot == null) {
+                target_slot = i;
+                found_free = true;
+                break;
+            }
+        }
+        if (!found_free) {
+            var oldest_i: usize = 0;
+            var oldest_t: i64 = self.entries[0].?.last_used;
+            for (self.entries[1..], 0..) |slot_opt, j| {
+                if (slot_opt.?.last_used < oldest_t) {
+                    oldest_t = slot_opt.?.last_used;
+                    oldest_i = j + 1;
+                }
+            }
+            const evict = self.entries[oldest_i].?;
+            evict.explorer.deinit();
+            evict.store.deinit();
+            self.alloc.free(evict.path);
+            self.alloc.destroy(evict);
+            target_slot = oldest_i;
+        }
+
+        self.entries[target_slot] = new_entry;
+        return ProjectCtx{ .explorer = &new_entry.explorer, .store = &new_entry.store };
+    }
+};
 
 // ── Tool definitions ────────────────────────────────────────────────────────
 
@@ -31,24 +169,28 @@ pub const Tool = enum {
     codedb_snapshot,
     codedb_bundle,
     codedb_remote,
+    codedb_projects,
+    codedb_index,
 };
 
 const tools_list =
     \\{"tools":[
-    \\{"name":"codedb_tree","description":"Get the full file tree of the indexed codebase with language detection, line counts, and symbol counts per file. Use this first to understand the project structure.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"codedb_outline","description":"Get the structural outline of a file: all functions, structs, enums, imports, constants with line numbers. Like an IDE symbol view.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"}},"required":["path"]}},
-    \\{"name":"codedb_symbol","description":"Find ALL definitions of a symbol name across the entire codebase. Returns every file and line where this symbol is defined. With body=true, includes source code.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Full-text search across all indexed files. Uses trigram index for fast substring matching. Returns matching lines with file paths and line numbers. With scope=true, annotates results with the enclosing function/struct. With regex=true, treats the query as a regex pattern and uses trigram decomposition for acceleration.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"}},"required":["query"]}},
-    \\{"name":"codedb_word","description":"O(1) word lookup using inverted index. Finds all occurrences of an exact word (identifier) across the codebase. Much faster than search for single-word queries.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"}},"required":["word"]}},
-    \\{"name":"codedb_hot","description":"Get the most recently modified files in the codebase, ordered by recency. Useful to see what's been actively worked on.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"}},"required":[]}},
-    \\{"name":"codedb_deps","description":"Get reverse dependencies: which files import/depend on the given file. Useful for impact analysis.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"}},"required":["path"]}},
-    \\{"name":"codedb_read","description":"Read file contents from the indexed codebase. Supports line ranges, content hashing for cache validation, and compact output.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"}},"required":["path"]}},
+    \\{"name":"codedb_tree","description":"Get the full file tree of the indexed codebase with language detection, line counts, and symbol counts per file. Use this first to understand the project structure.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
+    \\{"name":"codedb_outline","description":"Get the structural outline of a file: all functions, structs, enums, imports, constants with line numbers. Like an IDE symbol view.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
+    \\{"name":"codedb_symbol","description":"Find ALL definitions of a symbol name across the entire codebase. Returns every file and line where this symbol is defined. With body=true, includes source code.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
+    \\{"name":"codedb_search","description":"Full-text search across all indexed files. Uses trigram index for fast substring matching. Returns matching lines with file paths and line numbers. With scope=true, annotates results with the enclosing function/struct. With regex=true, treats the query as a regex pattern and uses trigram decomposition for acceleration.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_word","description":"O(1) word lookup using inverted index. Finds all occurrences of an exact word (identifier) across the codebase. Much faster than search for single-word queries.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
+    \\{"name":"codedb_hot","description":"Get the most recently modified files in the codebase, ordered by recency. Useful to see what's been actively worked on.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
+    \\{"name":"codedb_deps","description":"Get reverse dependencies: which files import/depend on the given file. Useful for impact analysis.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
+    \\{"name":"codedb_read","description":"Read file contents from the indexed codebase. Supports line ranges, content hashing for cache validation, and compact output.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_edit","description":"Apply a line-based edit to a file. Supports replace (range), insert (after line), and delete (range) operations.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"op":{"type":"string","enum":["replace","insert","delete"],"description":"Edit operation type"},"content":{"type":"string","description":"New content (for replace/insert)"},"range_start":{"type":"integer","description":"Start line number (for replace/delete, 1-indexed)"},"range_end":{"type":"integer","description":"End line number (for replace/delete, 1-indexed)"},"after":{"type":"integer","description":"Insert after this line number (for insert)"}},"required":["path","op"]}},
     \\{"name":"codedb_changes","description":"Get files that changed since a sequence number. Use with codedb_status to poll for changes.","inputSchema":{"type":"object","properties":{"since":{"type":"integer","description":"Sequence number to get changes since (default: 0)"}},"required":[]}},
-    \\{"name":"codedb_status","description":"Get current codedb status: number of indexed files and current sequence number.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"codedb_snapshot","description":"Get the full pre-rendered snapshot of the codebase as a single JSON blob. Contains tree, all outlines, symbol index, and dependency graph. Ideal for caching or deploying to edge workers.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"codedb_bundle","description":"Execute multiple read-only intelligence queries in a single call. Combines outline, symbol, search, read, deps, and other indexed operations. Saves round-trips. Max 20 ops.","inputSchema":{"type":"object","properties":{"ops":{"type":"array","items":{"type":"object","properties":{"tool":{"type":"string","description":"Tool name (e.g. codedb_outline, codedb_symbol, codedb_read)"},"arguments":{"type":"object","description":"Tool arguments"}},"required":["tool"]},"description":"Array of tool calls to execute"}},"required":["ops"]}},
-    \\{"name":"codedb_remote","description":"Query any GitHub repo via codedb.codegraff.com cloud intelligence. Gets file tree, symbol outlines, or searches code in external repos without cloning. Use when you need to understand a dependency, check an external API, or explore a repo you don't have locally.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. justrach/merjs)"},"action":{"type":"string","enum":["tree","outline","search","meta"],"description":"What to query: tree (file list), outline (symbols), search (text search), meta (repo info)"},"query":{"type":"string","description":"Search query (required when action=search)"}},"required":["repo","action"]}}
+    \\{"name":"codedb_status","description":"Get current codedb status: number of indexed files and current sequence number.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
+    \\{"name":"codedb_snapshot","description":"Get the full pre-rendered snapshot of the codebase as a single JSON blob. Contains tree, all outlines, symbol index, and dependency graph. Ideal for caching or deploying to edge workers.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
+    \\{"name":"codedb_bundle","description":"Execute multiple read-only intelligence queries in a single call. Combines outline, symbol, search, read, deps, and other indexed operations. Saves round-trips. Max 20 ops.","inputSchema":{"type":"object","properties":{"ops":{"type":"array","items":{"type":"object","properties":{"tool":{"type":"string","description":"Tool name (e.g. codedb_outline, codedb_symbol, codedb_read)"},"arguments":{"type":"object","description":"Tool arguments"}},"required":["tool"]},"description":"Array of tool calls to execute"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["ops"]}},
+    \\{"name":"codedb_remote","description":"Query any GitHub repo via codedb.codegraff.com cloud intelligence. Gets file tree, symbol outlines, or searches code in external repos without cloning. Use when you need to understand a dependency, check an external API, or explore a repo you don't have locally.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. justrach/merjs)"},"action":{"type":"string","enum":["tree","outline","search","meta"],"description":"What to query: tree (file list), outline (symbols), search (text search), meta (repo info)"},"query":{"type":"string","description":"Search query (required when action=search)"}},"required":["repo","action"]}},
+    \\{"name":"codedb_projects","description":"List all locally indexed projects on this machine. Shows project paths, data directory hashes, and whether a snapshot exists. Use to discover what codebases are available.","inputSchema":{"type":"object","properties":{},"required":[]}},
+    \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the folder to index (e.g. /Users/you/myproject)"}},"required":["path"]}}
     \\]}
 ;
 
@@ -61,27 +203,60 @@ pub var last_activity: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
 /// Claude Code restarts MCP servers on demand, so this is safe.
 pub const idle_timeout_ms: i64 = 30 * 60 * 1000; // 30 minutes
 
+// ── Session state for MCP protocol ──────────────────────────────────────────
+
+const Session = struct {
+    alloc: std.mem.Allocator,
+    stdout: std.fs.File,
+    next_id: i64 = 100,
+    client_supports_roots: bool = false,
+    client_roots_list_changed: bool = false,
+    pending_roots_id: ?i64 = null,
+    roots: std.ArrayList(Root) = .empty,
+
+    fn freeRoots(self: *Session) void {
+        for (self.roots.items) |r| {
+            self.alloc.free(r.uri);
+            self.alloc.free(r.name);
+        }
+        self.roots.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *Session) void {
+        self.freeRoots();
+        self.roots.deinit(self.alloc);
+    }
+};
+
 pub fn run(
     alloc: std.mem.Allocator,
     store: *Store,
     explorer: *Explorer,
     agents: *AgentRegistry,
-    prerender: *Prerender,
+    default_path: []const u8,
 ) void {
     const stdout = std.fs.File.stdout();
     const stdin = std.fs.File.stdin();
     last_activity.store(std.time.milliTimestamp(), .release);
 
+    var cache = ProjectCache.init(alloc, default_path);
+    defer cache.deinit();
+
+    var session = Session{
+        .alloc = alloc,
+        .stdout = stdout,
+    };
+    defer session.deinit();
+
     while (true) {
-        const msg = readFramedMessage(alloc, stdin) orelse break;
+        const msg = mcpj.readLine(alloc, stdin) orelse break;
         last_activity.store(std.time.milliTimestamp(), .release);
         defer alloc.free(msg);
-        if (msg.len == 0) {
-            writeError(alloc, stdout, null, -32700, "Parse error");
-            continue;
-        }
 
-        const parsed = std.json.parseFromSlice(std.json.Value, alloc, msg, .{}) catch {
+        const input = std.mem.trim(u8, msg, " \t\r");
+        if (input.len == 0) continue;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, input, .{}) catch {
             writeError(alloc, stdout, null, -32700, "Parse error");
             continue;
         };
@@ -93,32 +268,116 @@ pub fn run(
         }
 
         const root = &parsed.value.object;
-        const method = getStr(root, "method") orelse {
-            writeError(alloc, stdout, null, -32600, "Missing method");
-            continue;
-        };
+        const method_opt = mcpj.getStr(root, "method");
         const has_id = root.contains("id");
         const id = root.get("id");
         const is_notification = !has_id;
 
-        if (eql(method, "initialize")) {
-            if (!is_notification) {
-                writeResult(alloc, stdout, id,
-                    \\{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"codedb2","version":"0.1.0"}}
-                );
+        if (method_opt == null) {
+            if (has_id) {
+                handleResponse(&session, root);
             }
-        } else if (eql(method, "notifications/initialized")) {
-            // no response for notifications
-        } else if (eql(method, "tools/list")) {
+            continue;
+        }
+        const method = method_opt.?;
+
+        if (mcpj.eql(method, "initialize")) {
+            handleInitialize(&session, root, id);
+        } else if (mcpj.eql(method, "notifications/initialized")) {
+            if (session.client_supports_roots) {
+                requestRoots(&session);
+            }
+        } else if (mcpj.eql(method, "notifications/roots/list_changed")) {
+            if (session.client_supports_roots) {
+                requestRoots(&session);
+            }
+        } else if (mcpj.eql(method, "tools/list")) {
             if (!is_notification) writeResult(alloc, stdout, id, tools_list);
-        } else if (eql(method, "tools/call")) {
-            handleCall(alloc, root, stdout, id, store, explorer, agents, prerender);
-        } else if (eql(method, "ping")) {
+        } else if (mcpj.eql(method, "tools/call")) {
+            handleCall(alloc, root, stdout, id, store, explorer, agents, &cache);
+        } else if (mcpj.eql(method, "ping")) {
             if (!is_notification) writeResult(alloc, stdout, id, "{}");
         } else {
             if (!is_notification) writeError(alloc, stdout, id, -32601, "Method not found");
         }
     }
+}
+
+fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.Value) void {
+    caps: {
+        const p = root.get("params") orelse break :caps;
+        if (p != .object) break :caps;
+        const c = p.object.get("capabilities") orelse break :caps;
+        if (c != .object) break :caps;
+        const r = c.object.get("roots") orelse break :caps;
+        if (r != .object) break :caps;
+        s.client_supports_roots = true;
+        s.client_roots_list_changed = mcpj.getBool(&r.object, "listChanged");
+    }
+    writeResult(s.alloc, s.stdout, id,
+        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"codedb2","version":"0.2.0"}}
+    );
+}
+
+fn requestRoots(s: *Session) void {
+    const rid = s.next_id;
+    s.next_id += 1;
+    s.pending_roots_id = rid;
+    writeRequest(s.alloc, s.stdout, rid, "roots/list", "{}");
+}
+
+fn handleResponse(s: *Session, root: *const std.json.ObjectMap) void {
+    const resp_id_val = root.get("id") orelse return;
+    const resp_id: i64 = switch (resp_id_val) {
+        .integer => |n| n,
+        else => return,
+    };
+    if (s.pending_roots_id) |pid| {
+        if (resp_id == pid) {
+            s.pending_roots_id = null;
+            if (root.get("error") != null) return;
+            const result_val = root.get("result") orelse return;
+            if (result_val != .object) return;
+            parseRoots(s, &result_val.object);
+        }
+    }
+}
+
+fn parseRoots(s: *Session, result: *const std.json.ObjectMap) void {
+    s.freeRoots();
+    const roots_val = result.get("roots") orelse return;
+    if (roots_val != .array) return;
+    for (roots_val.array.items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+        const uri_raw = mcpj.getStr(&obj, "uri") orelse continue;
+        const name_raw = mcpj.getStr(&obj, "name") orelse "";
+        const uri = s.alloc.dupe(u8, uri_raw) catch continue;
+        const name = s.alloc.dupe(u8, name_raw) catch {
+            s.alloc.free(uri);
+            continue;
+        };
+        s.roots.append(s.alloc, .{ .uri = uri, .name = name }) catch {
+            s.alloc.free(uri);
+            s.alloc.free(name);
+            continue;
+        };
+    }
+}
+
+fn writeRequest(alloc: std.mem.Allocator, stdout: std.fs.File, id: i64, method: []const u8, params: []const u8) void {
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(alloc);
+    buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
+    var tmp: [32]u8 = undefined;
+    const id_str = std.fmt.bufPrint(&tmp, "{d}", .{id}) catch return;
+    buf.appendSlice(alloc, id_str) catch return;
+    buf.appendSlice(alloc, ",\"method\":\"") catch return;
+    buf.appendSlice(alloc, method) catch return;
+    buf.appendSlice(alloc, "\",\"params\":") catch return;
+    buf.appendSlice(alloc, params) catch return;
+    buf.appendSlice(alloc, "}\n") catch return;
+    stdout.writeAll(buf.items) catch {};
 }
 
 fn handleCall(
@@ -129,7 +388,7 @@ fn handleCall(
     store: *Store,
     explorer: *Explorer,
     agents: *AgentRegistry,
-    prerender: *Prerender,
+    cache: *ProjectCache,
 ) void {
     const is_notification = id == null;
 
@@ -163,7 +422,7 @@ fn handleCall(
     defer out.deinit(alloc);
 
     const t0 = std.time.nanoTimestamp();
-    dispatch(alloc, tool, args, &out, store, explorer, agents, prerender);
+    dispatch(alloc, tool, args, &out, store, explorer, agents, cache);
     const elapsed = std.time.nanoTimestamp() - t0;
 
     if (is_notification) return;
@@ -217,26 +476,35 @@ fn dispatch(
     tool: Tool,
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
-    store: *Store,
-    explorer: *Explorer,
+    default_store: *Store,
+    default_explorer: *Explorer,
     agents: *AgentRegistry,
-    prerender: *Prerender,
+    cache: *ProjectCache,
 ) void {
+    const project_path = getStr(args, "project");
+    const ctx = cache.get(project_path, default_explorer, default_store) catch |err| {
+        out.appendSlice(alloc, "error: failed to load project: ") catch {};
+        out.appendSlice(alloc, @errorName(err)) catch {};
+        return;
+    };
+
     switch (tool) {
-        .codedb_tree => handleTree(alloc, out, explorer),
-        .codedb_outline => handleOutline(alloc, args, out, explorer),
-        .codedb_symbol => handleSymbol(alloc, args, out, explorer),
-        .codedb_search => handleSearch(alloc, args, out, explorer),
-        .codedb_word => handleWord(alloc, args, out, explorer),
-        .codedb_hot => handleHot(alloc, args, out, store, explorer),
-        .codedb_deps => handleDeps(alloc, args, out, explorer),
-        .codedb_read => handleRead(alloc, args, out, explorer),
-        .codedb_edit => handleEdit(alloc, args, out, store, agents),
-        .codedb_changes => handleChanges(alloc, args, out, store),
-        .codedb_status => handleStatus(alloc, out, store, explorer),
-        .codedb_snapshot => handleSnapshot(alloc, out, explorer, store, prerender),
-        .codedb_bundle => handleBundle(alloc, args, out, store, explorer, agents, prerender),
+        .codedb_tree => handleTree(alloc, out, ctx.explorer),
+        .codedb_outline => handleOutline(alloc, args, out, ctx.explorer),
+        .codedb_symbol => handleSymbol(alloc, args, out, ctx.explorer),
+        .codedb_search => handleSearch(alloc, args, out, ctx.explorer),
+        .codedb_word => handleWord(alloc, args, out, ctx.explorer),
+        .codedb_hot => handleHot(alloc, args, out, ctx.store, ctx.explorer),
+        .codedb_deps => handleDeps(alloc, args, out, ctx.explorer),
+        .codedb_read => handleRead(alloc, args, out, ctx.explorer),
+        .codedb_edit => handleEdit(alloc, args, out, default_store, default_explorer, agents),
+        .codedb_changes => handleChanges(alloc, args, out, default_store),
+        .codedb_status => handleStatus(alloc, out, ctx.store, ctx.explorer),
+        .codedb_snapshot => handleSnapshot(alloc, out, ctx.explorer, ctx.store),
+        .codedb_bundle => handleBundle(alloc, args, out, ctx.store, ctx.explorer, agents, cache),
         .codedb_remote => handleRemote(alloc, args, out),
+        .codedb_projects => handleProjects(alloc, out),
+        .codedb_index => handleIndex(alloc, args, out),
     }
 }
 
@@ -508,7 +776,7 @@ fn handleRead(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     }
 }
 
-fn handleEdit(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, agents: *AgentRegistry) void {
+fn handleEdit(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer, agents: *AgentRegistry) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path'") catch {};
         return;
@@ -559,7 +827,7 @@ fn handleEdit(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
         req.after = @intCast(a);
     }
 
-    const result = edit_mod.applyEdit(alloc, store, agents, req) catch |err| {
+    const result = edit_mod.applyEdit(alloc, store, agents, explorer, req) catch |err| {
         out.appendSlice(alloc, "error: edit failed: ") catch {};
         out.appendSlice(alloc, @errorName(err)) catch {};
         return;
@@ -596,8 +864,8 @@ fn handleStatus(alloc: std.mem.Allocator, out: *std.ArrayList(u8), store: *Store
     }) catch {};
 }
 
-fn handleSnapshot(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Explorer, store: *Store, prerender: *Prerender) void {
-    const snap = prerender.getSnapshot(explorer, store, alloc) catch {
+fn handleSnapshot(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Explorer, store: *Store) void {
+    const snap = snapshot_json.buildSnapshot(explorer, store, alloc) catch {
         out.appendSlice(alloc, "error: snapshot build failed") catch {};
         return;
     };
@@ -610,10 +878,10 @@ fn handleBundle(
     alloc: std.mem.Allocator,
     args: *const std.json.ObjectMap,
     out: *std.ArrayList(u8),
-    store: *Store,
-    explorer: *Explorer,
+    default_store: *Store,
+    default_explorer: *Explorer,
     agents: *AgentRegistry,
-    prerender: *Prerender,
+    cache: *ProjectCache,
 ) void {
     const ops_val = args.get("ops") orelse {
         out.appendSlice(alloc, "error: missing 'ops' argument") catch {};
@@ -674,7 +942,7 @@ fn handleBundle(
         var sub_out: std.ArrayList(u8) = .{};
         defer sub_out.deinit(alloc);
 
-        dispatch(alloc, tool, sub_args, &sub_out, store, explorer, agents, prerender);
+        dispatch(alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache);
 
         w.print("--- [{d}] {s} ---\n", .{ i, tool_name }) catch {};
         out.appendSlice(alloc, sub_out.items) catch {};
@@ -756,6 +1024,129 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     out.appendSlice(alloc, result.stdout) catch {};
 }
 
+// ── Local project tools ─────────────────────────────────────────────────────
+
+fn handleProjects(alloc: std.mem.Allocator, out: *std.ArrayList(u8)) void {
+    const home = std.process.getEnvVarOwned(alloc, "HOME") catch {
+        out.appendSlice(alloc, "error: cannot read HOME") catch {};
+        return;
+    };
+    defer alloc.free(home);
+
+    const projects_dir = std.fmt.allocPrint(alloc, "{s}/.codedb/projects", .{home}) catch {
+        out.appendSlice(alloc, "error: alloc failed") catch {};
+        return;
+    };
+    defer alloc.free(projects_dir);
+
+    var dir = std.fs.cwd().openDir(projects_dir, .{ .iterate = true }) catch {
+        out.appendSlice(alloc, "no indexed projects found") catch {};
+        return;
+    };
+    defer dir.close();
+
+    var count: u32 = 0;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+
+        // Read project.txt to get the project path
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sub_path = std.fmt.bufPrint(&path_buf, "{s}/project.txt", .{entry.name}) catch continue;
+        const project_file = dir.openFile(sub_path, .{}) catch continue;
+        defer project_file.close();
+        var content_buf: [4096]u8 = undefined;
+        const n = project_file.readAll(&content_buf) catch continue;
+        if (n == 0) continue;
+        const project_path = content_buf[0..n];
+
+        // Check if snapshot exists in the project directory
+        var snap_exists = false;
+        var snap_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const snap_path = std.fmt.bufPrint(&snap_path_buf, "{s}/codedb.snapshot", .{project_path}) catch project_path;
+        if (std.fs.cwd().access(snap_path, .{})) |_| {
+            snap_exists = true;
+        } else |_| {}
+
+        if (count > 0) out.appendSlice(alloc, "\n") catch {};
+        out.appendSlice(alloc, project_path) catch {};
+        if (snap_exists) {
+            out.appendSlice(alloc, "  [snapshot]") catch {};
+        }
+        count += 1;
+    }
+
+    if (count == 0) {
+        out.appendSlice(alloc, "no indexed projects found") catch {};
+    }
+}
+
+fn handleIndex(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+    const path = getStr(args, "path") orelse {
+        out.appendSlice(alloc, "error: missing 'path'") catch {};
+        return;
+    };
+
+    // Resolve to absolute path
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = std.fs.cwd().realpath(path, &abs_buf) catch {
+        out.appendSlice(alloc, "error: cannot resolve path: ") catch {};
+        out.appendSlice(alloc, path) catch {};
+        return;
+    };
+
+    // Verify it's a directory
+    var check_dir = std.fs.cwd().openDir(abs_path, .{}) catch {
+        out.appendSlice(alloc, "error: not a directory: ") catch {};
+        out.appendSlice(alloc, abs_path) catch {};
+        return;
+    };
+    check_dir.close();
+
+    // Get the codedb binary path (argv[0] equivalent — use /proc/self or just "codedb")
+    // We spawn `codedb <path> snapshot` to create the snapshot
+    const exe_path = std.fs.selfExePathAlloc(alloc) catch {
+        out.appendSlice(alloc, "error: cannot find codedb binary") catch {};
+        return;
+    };
+    defer alloc.free(exe_path);
+
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ exe_path, abs_path, "snapshot" },
+        .max_output_bytes = 64 * 1024,
+    }) catch {
+        out.appendSlice(alloc, "error: failed to run indexer") catch {};
+        return;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    if (result.term.Exited != 0) {
+        out.appendSlice(alloc, "error: indexing failed for ") catch {};
+        out.appendSlice(alloc, abs_path) catch {};
+        if (result.stderr.len > 0) {
+            out.appendSlice(alloc, " — ") catch {};
+            out.appendSlice(alloc, result.stderr[0..@min(result.stderr.len, 300)]) catch {};
+        }
+        return;
+    }
+
+    out.appendSlice(alloc, "indexed: ") catch {};
+    out.appendSlice(alloc, abs_path) catch {};
+    if (result.stdout.len > 0) {
+        out.appendSlice(alloc, "\n") catch {};
+        // Strip ANSI color codes from stdout for clean MCP output
+        for (result.stdout) |c| {
+            if (c == 0x1b) {
+                // Skip ESC sequences — handled below
+            } else {
+                out.append(alloc, c) catch {};
+            }
+        }
+    }
+}
+
 pub fn isPathSafe(path: []const u8) bool {
     if (path.len == 0) return false;
     if (path[0] == '/') return false;
@@ -766,42 +1157,6 @@ pub fn isPathSafe(path: []const u8) bool {
     return true;
 }
 
-fn readFramedMessage(alloc: std.mem.Allocator, file: std.fs.File) ?[]u8 {
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(alloc);
-
-    var one: [1]u8 = undefined;
-    while (true) {
-        const n = file.read(&one) catch return null;
-        if (n == 0) {
-            if (buf.items.len == 0) return null;
-            // EOF mid-line: treat as complete message
-            break;
-        }
-        if (one[0] == '\n') {
-            if (buf.items.len == 0) continue; // skip empty lines
-            break;
-        }
-        if (one[0] == '\r') continue; // skip CR
-        if (buf.items.len > 16 * 1024 * 1024) {
-            // Drain rest of line to prevent framing desync on next call.
-            while (true) {
-                const nr = file.read(&one) catch break;
-                if (nr == 0 or one[0] == '\n') break;
-            }
-            return null;
-        }
-        buf.append(alloc, one[0]) catch return null;
-    }
-
-    return alloc.dupe(u8, buf.items) catch null;
-}
-
-fn writeFramedMessage(alloc: std.mem.Allocator, stdout: std.fs.File, payload: []const u8) void {
-    _ = alloc;
-    stdout.writeAll(payload) catch return;
-    stdout.writeAll("\n") catch return;
-}
 
 fn writeResult(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value, result: []const u8) void {
     var buf: std.ArrayList(u8) = .{};
@@ -813,7 +1168,8 @@ fn writeResult(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Valu
         if (c != '\n' and c != '\r') buf.append(alloc, c) catch return;
     }
     buf.appendSlice(alloc, "}") catch return;
-    writeFramedMessage(alloc, stdout, buf.items);
+    stdout.writeAll(buf.items) catch return;
+    stdout.writeAll("\n") catch return;
 }
 
 fn writeError(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value, code: i32, msg: []const u8) void {
@@ -826,35 +1182,17 @@ fn writeError(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value
     const cs = std.fmt.bufPrint(&tmp, "{d}", .{code}) catch return;
     buf.appendSlice(alloc, cs) catch return;
     buf.appendSlice(alloc, ",\"message\":\"") catch return;
-    writeEscaped(alloc, &buf, msg);
+    mcpj.writeEscaped(alloc, &buf, msg);
     buf.appendSlice(alloc, "\"}}") catch return;
-    writeFramedMessage(alloc, stdout, buf.items);
-}
-fn getStr(obj: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    return switch (obj.get(key) orelse return null) {
-        .string => |s| s,
-        else => null,
-    };
+    stdout.writeAll(buf.items) catch return;
+    stdout.writeAll("\n") catch return;
 }
 
-fn getInt(obj: *const std.json.ObjectMap, key: []const u8) ?i64 {
-    return switch (obj.get(key) orelse return null) {
-        .integer => |n| n,
-        else => null,
-    };
-}
-
-pub fn getBool(obj: *const std.json.ObjectMap, key: []const u8) bool {
-    return switch (obj.get(key) orelse return false) {
-        .bool => |b| b,
-        else => false,
-    };
-}
-
-fn eql(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
-
+const getStr = mcpj.getStr;
+const getInt = mcpj.getInt;
+pub const getBool = mcpj.getBool;
+const eql = mcpj.eql;
+const writeEscaped = mcpj.writeEscaped;
 
 fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
     if (id) |v| switch (v) {
@@ -865,31 +1203,12 @@ fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Val
         },
         .string => |s| {
             buf.append(alloc, '"') catch return;
-            writeEscaped(alloc, buf, s);
+            mcpj.writeEscaped(alloc, buf, s);
             buf.append(alloc, '"') catch return;
         },
         else => buf.appendSlice(alloc, "null") catch return,
     } else {
         buf.appendSlice(alloc, "null") catch return;
-    }
-}
-
-fn writeEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) void {
-    for (s) |c| {
-        switch (c) {
-            '"' => out.appendSlice(alloc, "\\\"") catch return,
-            '\\' => out.appendSlice(alloc, "\\\\") catch return,
-            '\n' => out.appendSlice(alloc, "\\n") catch return,
-            '\r' => out.appendSlice(alloc, "\\r") catch return,
-            '\t' => out.appendSlice(alloc, "\\t") catch return,
-            else => if (c < 0x20) {
-                const hex = "0123456789abcdef";
-                const esc = [6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
-                out.appendSlice(alloc, &esc) catch return;
-            } else {
-                out.append(alloc, c) catch return;
-            },
-        }
     }
 }
 

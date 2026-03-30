@@ -2,7 +2,7 @@ const std = @import("std");
 const Store = @import("store.zig").Store;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
 const Explorer = @import("explore.zig").Explorer;
-const Prerender = @import("prerender.zig").Prerender;
+const snapshot_json = @import("snapshot_json.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
 
@@ -13,7 +13,6 @@ pub fn serve(
     explorer: *Explorer,
     queue: *watcher.EventQueue,
     port: u16,
-    prerender: *Prerender,
 ) !void {
     _ = queue;
     const addr = std.net.Address.parseIp("127.0.0.1", port) catch unreachable;
@@ -23,7 +22,7 @@ pub fn serve(
 
     while (true) {
         const conn = try srv.accept();
-        const t = try std.Thread.spawn(.{}, handleConnection, .{ allocator, store, agents, explorer, conn, prerender });
+        const t = try std.Thread.spawn(.{}, handleConnection, .{ allocator, store, agents, explorer, conn });
         t.detach();
     }
 }
@@ -34,7 +33,6 @@ fn handleConnection(
     agents: *AgentRegistry,
     explorer: *Explorer,
     conn: std.net.Server.Connection,
-    prerender: *Prerender,
 ) void {
     defer conn.stream.close();
 
@@ -243,7 +241,7 @@ fn handleConnection(
         }
         if (after) |a| req.after = @intCast(a);
 
-        const result = edit_mod.applyEdit(allocator, store, agents, req) catch |err| {
+        const result = edit_mod.applyEdit(allocator, store, agents, explorer, req) catch |err| {
             var err_buf: [128]u8 = undefined;
             const err_body = std.fmt.bufPrint(&err_buf, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch return;
             const status = switch (err) {
@@ -565,9 +563,9 @@ fn handleConnection(
         return;
     }
 
-    // ── Snapshot (pre-rendered) ──
+    // ── Snapshot ──
     if (mem_starts(request, "GET /snapshot")) {
-        const snap = prerender.getSnapshot(explorer, store, allocator) catch {
+        const snap = snapshot_json.buildSnapshot(explorer, store, allocator) catch {
             respondJson(conn, "500 Internal Server Error", "{\"error\":\"snapshot build failed\"}");
             return;
         };

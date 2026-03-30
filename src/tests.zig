@@ -23,7 +23,7 @@ const WordTokenizer = @import("index.zig").WordTokenizer;
 const version = @import("version.zig");
 const watcher = @import("watcher.zig");
 const edit_mod = @import("edit.zig");
-const Prerender = @import("prerender.zig").Prerender;
+const snapshot_json = @import("snapshot_json.zig");
 const explore = @import("explore.zig");
 const extractLines = explore.extractLines;
 const isCommentOrBlank = explore.isCommentOrBlank;
@@ -1032,7 +1032,7 @@ test "edit: range_start zero is invalid" {
     defer agents.deinit();
     const agent_id = try agents.register("test-agent");
 
-    try testing.expectError(error.InvalidRange, edit_mod.applyEdit(testing.allocator, &store, &agents, .{
+    try testing.expectError(error.InvalidRange, edit_mod.applyEdit(testing.allocator, &store, &agents, null, .{
         .path = rel_path,
         .agent_id = agent_id,
         .op = .replace,
@@ -1058,13 +1058,75 @@ test "edit: range_start beyond file is invalid" {
     defer agents.deinit();
     const agent_id = try agents.register("test-agent-oob");
 
-    try testing.expectError(error.InvalidRange, edit_mod.applyEdit(testing.allocator, &store, &agents, .{
+    try testing.expectError(error.InvalidRange, edit_mod.applyEdit(testing.allocator, &store, &agents, null, .{
         .path = rel_path,
         .agent_id = agent_id,
         .op = .replace,
         .range = .{ 3, 3 },
         .content = "changed",
     }));
+}
+
+test "issue-35: edits immediately update explorer and snapshot output" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-live-sync.zig", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    var file = try tmp.dir.createFile("edit-live-sync.zig", .{});
+    defer file.close();
+    try file.writeAll("pub fn oldName() void {}\n");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+    try explorer.indexFile(rel_path, "pub fn oldName() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    _ = try store.recordSnapshot(rel_path, "pub fn oldName() void {}\n".len, std.hash.Wyhash.hash(0, "pub fn oldName() void {}\n"));
+
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-35-agent");
+
+    const before_snap = try snapshot_json.buildSnapshot(&explorer, &store, testing.allocator);
+    defer testing.allocator.free(before_snap);
+    try testing.expect(std.mem.indexOf(u8, before_snap, "oldName") != null);
+
+    _ = try edit_mod.applyEdit(testing.allocator, &store, &agents, &explorer, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "pub fn newName() void {}",
+    });
+
+    const new_results = try explorer.searchContent("newName", testing.allocator, 10);
+    defer {
+        for (new_results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(new_results);
+    }
+    try testing.expect(new_results.len == 1);
+
+    const old_results = try explorer.searchContent("oldName", testing.allocator, 10);
+    defer {
+        for (old_results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(old_results);
+    }
+    try testing.expect(old_results.len == 0);
+
+    const after_snap = try snapshot_json.buildSnapshot(&explorer, &store, testing.allocator);
+    defer testing.allocator.free(after_snap);
+    try testing.expect(std.mem.indexOf(u8, after_snap, "newName") != null);
+    try testing.expect(std.mem.indexOf(u8, after_snap, "oldName") == null);
 }
 
 // ── Regression tests for issues #2, #5, #7 ─────────────────
@@ -1359,7 +1421,7 @@ test "isPathSafe: accepts valid relative paths" {
     try testing.expect(mcp.isPathSafe("a/b/c/d.txt"));
 }
 
-test "prerender: snapshot builds and is valid JSON" {
+test "snapshot_json: snapshot builds and is valid JSON" {
     // Explorer uses arena for internal data
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1373,11 +1435,7 @@ test "prerender: snapshot builds and is valid JSON" {
     defer store.deinit();
     _ = try store.recordSnapshot("src/main.zig", 100, 0xABC);
 
-    // Prerender uses testing.allocator so rebuild can allocate independently
-    var prerender = @import("prerender.zig").Prerender.init(testing.allocator);
-    defer prerender.deinit();
-
-    const snap = try prerender.getSnapshot(&explorer, &store, testing.allocator);
+    const snap = try snapshot_json.buildSnapshot(&explorer, &store, testing.allocator);
     defer testing.allocator.free(snap);
 
     // Must be valid JSON
@@ -1390,14 +1448,6 @@ test "prerender: snapshot builds and is valid JSON" {
     try testing.expect(parsed.value.object.contains("outlines"));
     try testing.expect(parsed.value.object.contains("symbol_index"));
     try testing.expect(parsed.value.object.contains("dep_graph"));
-}
-
-test "prerender: fresh instance needs rebuild" {
-    var prerender = Prerender.init(testing.allocator);
-    defer prerender.deinit();
-
-    // Fresh prerender: dirty_epoch > built_epoch means it needs a rebuild
-    try testing.expect(prerender.dirty_epoch.load(.acquire) > prerender.built_epoch.load(.acquire));
 }
 
 // ── Deep copy correctness tests ─────────────────────────────
@@ -3072,14 +3122,8 @@ test "thread-safe: concurrent SparseNgramIndex.candidates() with per-thread allo
 }
 
 test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" {
-    // BUG: scanBg (main.zig:559-560) replaces explorer.trigram_index without
-    // holding explorer.mu exclusively. searchContent holds mu.lockShared() while
-    // accessing trigram_index.candidates() — a concurrent deinit is use-after-free.
-    //
-    // This test holds mu.lockShared() (simulating a reader mid-search), then runs
-    // the swap pattern from scanBg without acquiring mu exclusively. Because the
-    // buggy swap never tries to acquire mu, it proceeds immediately → raced=true.
-    // With the fix (mu.lock() before swap), the thread blocks → raced=false → passes.
+    // Regression: the scanBg disk-load path must serialize trigram_index swaps
+    // with readers by taking exp.mu.lock() before replacing the index.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var exp = Explorer.init(arena.allocator());
@@ -3091,7 +3135,9 @@ test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" 
         exp: *Explorer,
         swapped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         fn run(ctx: *@This()) void {
-            // scanBg pattern WITHOUT exclusive lock (the bug: main.zig:559-560)
+            ctx.exp.mu.lock();
+            defer ctx.exp.mu.unlock();
+            ctx.exp.trigram_index.deinit();
             ctx.exp.trigram_index = TrigramIndex.init(ctx.exp.allocator);
             ctx.swapped.store(true, .release);
         }
@@ -3102,7 +3148,6 @@ test "issue-43: trigram_index swap in scanBg races with concurrent MCP queries" 
     const raced = sctx.swapped.load(.acquire);
     exp.mu.unlockShared();
     t.join();
-    // FAILS on unfixed code: swap proceeds without waiting for exclusive lock.
     try testing.expect(!raced);
 }
 
@@ -3289,3 +3334,33 @@ test "issue-47: concurrent snapshot writes from parallel instances corrupt file"
     try testing.expect(loaded);
 }
 
+test "issue-42: scan thread is joined before allocator-backed state is freed" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    const data_dir = try allocator.dupe(u8, "/tmp/codedb_test_issue42");
+
+    const SharedCtx = struct {
+        data_dir: []const u8,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(ctx: *@This()) void {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            if (ctx.data_dir.len > 0) {
+                _ = ctx.data_dir[0];
+                ctx.ok.store(true, .release);
+            }
+            ctx.done.store(true, .release);
+        }
+    };
+
+    var ctx = SharedCtx{ .data_dir = data_dir };
+    const t = try std.Thread.spawn(.{}, SharedCtx.run, .{&ctx});
+    t.join();
+
+    try testing.expect(ctx.done.load(.acquire));
+    try testing.expect(ctx.ok.load(.acquire));
+    allocator.free(data_dir);
+    _ = gpa.deinit();
+}

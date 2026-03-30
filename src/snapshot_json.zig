@@ -1,124 +1,26 @@
-// Pre-render engine — Next.js-style build-time pre-computation for codedb2.
-//
-// At scan time, computes a full JSON snapshot (tree + outlines + symbol index +
-// dep graph) and caches it. Queries hit the cached blob in O(1).
-// On file changes the snapshot is marked stale and rebuilt in the background (ISR).
-
 const std = @import("std");
 const Explorer = @import("explore.zig").Explorer;
 const Store = @import("store.zig").Store;
 
-pub const Prerender = struct {
-    /// The pre-rendered JSON snapshot (owned, null until first build).
-    cached_snapshot: ?[]u8 = null,
-    /// Sequence number at which the snapshot was built.
-    built_at_seq: u64 = 0,
-    /// Monotonic invalidation epoch. Incremented on every change.
-    dirty_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
-    /// Epoch represented by `cached_snapshot`.
-    built_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    allocator: std.mem.Allocator,
-    mu: std.Thread.Mutex = .{},
-    rebuild_mu: std.Thread.Mutex = .{},
-    pub fn init(allocator: std.mem.Allocator) Prerender {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *Prerender) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.cached_snapshot) |snap| self.allocator.free(snap);
-        self.cached_snapshot = null;
-    }
-
-    /// Mark the snapshot as stale (called when files change).
-pub fn invalidate(self: *Prerender) void {
-    _ = self.dirty_epoch.fetchAdd(1, .acq_rel);
-}
-
-    /// Get the pre-rendered snapshot, rebuilding if stale.
-    /// Returns a slice into the cached blob — valid until next rebuild.
-    /// Caller must NOT free the returned slice.
-    /// Get the pre-rendered snapshot, rebuilding if stale.
-    /// Returns an owned copy that the caller must free with `alloc`.
-pub fn getSnapshot(self: *Prerender, explorer: *Explorer, store: *Store, alloc: std.mem.Allocator) ![]u8 {
-    const dirty = self.dirty_epoch.load(.acquire);
-    const built = self.built_epoch.load(.acquire);
-
-    if (built == dirty) {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.cached_snapshot) |snap| return try alloc.dupe(u8, snap);
-    }
-
-    // Rebuild (caches internally), then return a copy.
-    const rebuilt = try self.rebuild(explorer, store);
-    return try alloc.dupe(u8, rebuilt);
-}
-
-pub fn rebuild(self: *Prerender, explorer: *Explorer, store: *Store) ![]const u8 {
-    self.rebuild_mu.lock();
-    defer self.rebuild_mu.unlock();
-
-    const target_epoch = self.dirty_epoch.load(.acquire);
-    if (self.built_epoch.load(.acquire) == target_epoch) {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.cached_snapshot) |snap| return snap;
-    }
-
-    const new_snap = try buildSnapshot(explorer, store, self.allocator);
-    errdefer self.allocator.free(new_snap);
-
-    self.mu.lock();
-    defer self.mu.unlock();
-    if (self.cached_snapshot) |old| self.allocator.free(old);
-    self.cached_snapshot = new_snap;
-    self.built_at_seq = store.currentSeq();
-    self.built_epoch.store(target_epoch, .release);
-    return new_snap;
-}
-
-    /// Background ISR loop: polls for staleness and rebuilds.
-pub fn isrLoop(self: *Prerender, explorer: *Explorer, store: *Store, shutdown: *std.atomic.Value(bool)) void {
-    while (!shutdown.load(.acquire)) {
-        std.Thread.sleep(2 * std.time.ns_per_s);
-        const dirty = self.dirty_epoch.load(.acquire);
-        const built = self.built_epoch.load(.acquire);
-        if (dirty != built) {
-            _ = self.rebuild(explorer, store) catch |err| {
-                std.log.err("prerender: rebuild failed: {}", .{err});
-            };
-        }
-    }
-}
-};
-
-/// Build the full snapshot JSON blob from current explorer state.
-fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocator) ![]u8 {
+pub fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocator) ![]u8 {
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(alloc);
     const w = buf.writer(alloc);
 
     try w.writeAll("{");
-
-    // ── seq ──
     try w.print("\"seq\":{d},", .{store.currentSeq()});
 
-    // ── tree ──
     const tree = try explorer.getTree(alloc, false);
     defer alloc.free(tree);
     try w.writeAll("\"tree\":\"");
     try writeJsonEscaped(alloc, &buf, tree);
     try w.writeAll("\",");
 
-    // ── outlines ──
     try w.writeAll("\"outlines\":{");
     {
         explorer.mu.lockShared();
         defer explorer.mu.unlockShared();
 
-        // Collect sorted paths for deterministic output
         var paths: std.ArrayList([]const u8) = .{};
         defer paths.deinit(alloc);
         var iter = explorer.outlines.iterator();
@@ -167,13 +69,11 @@ fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocator) !
     }
     try w.writeAll("},");
 
-    // ── symbol_index: name → [{path, line, kind}] ──
     try w.writeAll("\"symbol_index\":{");
     {
         explorer.mu.lockShared();
         defer explorer.mu.unlockShared();
 
-        // Build symbol → locations map
         var sym_map = std.StringHashMap(std.ArrayList(SymEntry)).init(alloc);
         defer {
             var si = sym_map.iterator();
@@ -194,7 +94,6 @@ fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocator) !
             }
         }
 
-        // Sort keys for determinism
         var sym_keys: std.ArrayList([]const u8) = .{};
         defer sym_keys.deinit(alloc);
         var ski = sym_map.iterator();
@@ -224,7 +123,6 @@ fn buildSnapshot(explorer: *Explorer, store: *Store, alloc: std.mem.Allocator) !
     }
     try w.writeAll("},");
 
-    // ── dep_graph: path → [imported_files] ──
     try w.writeAll("\"dep_graph\":{");
     {
         explorer.mu.lockShared();

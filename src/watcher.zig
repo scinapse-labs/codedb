@@ -1,7 +1,6 @@
 const std = @import("std");
 const Store = @import("store.zig").Store;
 const Explorer = @import("explore.zig").Explorer;
-const Prerender = @import("prerender.zig").Prerender;
 
 pub const EventKind = enum(u8) {
     created,
@@ -265,7 +264,7 @@ fn indexFileOutline(explorer: *Explorer, dir: std.fs.Dir, path: []const u8, allo
 }
 
 /// Background thread: polls for incremental FS changes.
-pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, root: []const u8, prerender: *Prerender, shutdown: *std.atomic.Value(bool), scan_done: *std.atomic.Value(bool)) void {
+pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, root: []const u8, shutdown: *std.atomic.Value(bool), scan_done: *std.atomic.Value(bool)) void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const backing = gpa.allocator();
@@ -311,7 +310,7 @@ pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, r
         var cycle_arena = std.heap.ArenaAllocator.init(backing);
         defer cycle_arena.deinit();
 
-        incrementalDiff(store, explorer, queue, &known, root, backing, cycle_arena.allocator(), prerender) catch |err| {
+        incrementalDiff(store, explorer, queue, &known, root, backing, cycle_arena.allocator()) catch |err| {
             std.log.err("watcher: diff failed: {}", .{err});
         };
     }
@@ -342,7 +341,7 @@ fn pushEventOrWait(queue: *EventQueue, event: FsEvent) void {
 }
 
 
-fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known: *FileMap, root: []const u8, persistent: std.mem.Allocator, tmp: std.mem.Allocator, prerender: *Prerender) !void {
+fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known: *FileMap, root: []const u8, persistent: std.mem.Allocator, tmp: std.mem.Allocator) !void {
     var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
     defer dir.close();
 
@@ -386,7 +385,6 @@ fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known
             const stable_path = known_entry.key_ptr.*;
             if (FsEvent.init(stable_path, .modified, seq)) |ev| pushEventOrWait(queue, ev);
             indexFileContent(explorer, dir, stable_path, tmp, false) catch {};
-            prerender.invalidate();
         } else {
             // New files always generate an event, so skip the extra full-file hash pass.
             const duped = try persistent.dupe(u8, entry.path);
@@ -395,7 +393,6 @@ fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known
             try known.put(duped, .{ .mtime = mtime, .size = stat.size, .hash = 0, .seen = true });
             if (FsEvent.init(duped, .created, seq)) |ev| pushEventOrWait(queue, ev);
             indexFileContent(explorer, dir, duped, tmp, false) catch {};
-            prerender.invalidate();
         }
     }
 
@@ -416,7 +413,6 @@ fn incrementalDiff(store: *Store, explorer: *Explorer, queue: *EventQueue, known
             if (FsEvent.init(kv.key, .deleted, seq)) |ev| pushEventOrWait(queue, ev);
             persistent.free(kv.key);
         }
-        prerender.invalidate();
     }
 }
 
@@ -461,4 +457,3 @@ fn indexFileContent(explorer: *Explorer, dir: std.fs.Dir, path: []const u8, allo
         try explorer.indexFile(path, content);
     }
 }
-

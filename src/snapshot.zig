@@ -505,3 +505,31 @@ fn cleanupStaleTmpFiles(output_path: []const u8) void {
         }
     }
 }
+
+pub fn writeSnapshotDual(
+    explorer: *Explorer,
+    root_path: []const u8,
+    output_path: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    try writeSnapshot(explorer, root_path, output_path, allocator);
+
+    const hash = std.hash.Wyhash.hash(0, root_path);
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
+    defer allocator.free(home);
+    const secondary = std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}/codedb.snapshot", .{ home, hash }) catch return;
+    defer allocator.free(secondary);
+
+    const dir_path = std.fmt.allocPrint(allocator, "{s}/.codedb/projects/{x}", .{ home, hash }) catch return;
+    defer allocator.free(dir_path);
+    std.fs.cwd().makePath(dir_path) catch {};
+
+    const proj_txt = std.fmt.allocPrint(allocator, "{s}/project.txt", .{dir_path}) catch return;
+    defer allocator.free(proj_txt);
+    if (std.fs.cwd().createFile(proj_txt, .{})) |f| {
+        f.writeAll(root_path) catch {};
+        f.close();
+    } else |_| {}
+
+    writeSnapshot(explorer, root_path, secondary, allocator) catch {};
+}

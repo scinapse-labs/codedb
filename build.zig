@@ -21,7 +21,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+
+    // ── mcp-zig dependency ──
+    const mcp_dep = b.dependency("mcp_zig", .{});
+    exe.root_module.addImport("mcp", mcp_dep.module("mcp"));
     b.installArtifact(exe);
+
+    // ── macOS ad-hoc codesign (prevents SIGKILL on unsigned binaries) ──
+    const codesign = b.addSystemCommand(&.{ "codesign", "-f", "-s", "-" });
+    codesign.addArtifactArg(exe);
+    b.getInstallStep().dependOn(&codesign.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -38,6 +47,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    tests.root_module.addImport("mcp", mcp_dep.module("mcp"));
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);

@@ -9,7 +9,7 @@ codedb2 scans a project directory, builds in-memory indexes (outlines, symbols, 
 - **HTTP server** on `:7719` — REST-style JSON API
 - **MCP server** over stdio — JSON-RPC for tool-calling LLMs
 
-Both interfaces share the same core: `Explorer` (code intelligence), `Store` (version tracking), and `Prerender` (cached snapshots).
+Both interfaces share the same core: `Explorer` (code intelligence) and `Store` (version tracking).
 
 ## Modules
 
@@ -144,14 +144,11 @@ Line-range editing engine. Supports `replace` and `delete` operations on line ra
 
 **Atomic writes:** writes to a `.codedb_tmp` temp file then renames, preventing corruption on crash. Returns `EditResult` with new content, hash, size, and line count.
 
-### `prerender.zig` — Snapshot Cache (ISR)
+### `snapshot_json.zig` — Snapshot Renderer
 
-Next.js-inspired incremental static regeneration. Pre-computes a full JSON snapshot containing tree, all outlines, symbol index, and dependency graph.
+Builds a full JSON snapshot on demand containing tree, all outlines, symbol index, and dependency graph.
 
-- `getSnapshot()` — returns an owned copy of the cached blob (rebuilds if stale)
-- `invalidate()` — atomic flag set on file changes
-- `isrLoop()` — background thread polls every 2s, rebuilds when stale
-- `rebuild()` — builds deterministic JSON (sorted keys) from Explorer state
+- `buildSnapshot()` — builds deterministic JSON (sorted keys) from Explorer state
 
 ### `agent.zig` — Agent Registry
 
@@ -198,10 +195,6 @@ Zig 0.15.x build system. Produces:
     │  (FilteredWalker)   │
     └─────────────────────┘
 
-    ┌─────────────────────┐
-    │   Prerender (ISR)   │ ← background rebuild
-    │  prerender.zig      │
-    └─────────────────────┘
 ```
 
 ## Threading Model
@@ -217,6 +210,6 @@ All threads share a `shutdown: std.atomic.Value(bool)` flag for graceful termina
 ## Data Flow
 
 1. **Startup:** `initialScan` walks the project (via `FilteredWalker`), indexes each file's outline and content into `Explorer`, records snapshots in `Store`
-2. **Steady state:** `incrementalLoop` detects changes, re-indexes modified files, pushes events to `EventQueue`, invalidates `Prerender`
+2. **Steady state:** `incrementalLoop` detects changes, re-indexes modified files, and pushes events to `EventQueue`
 3. **Queries:** HTTP/MCP handlers call `Explorer` methods under its mutex, return JSON responses
 4. **Edits:** `/edit` applies line-range changes atomically, re-indexes the file, records the edit in `Store`
