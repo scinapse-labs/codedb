@@ -157,45 +157,46 @@ curl "localhost:7719/changes?since=42"
 
 ## 📊 Benchmarks
 
-Measured on Apple M4 Max, 48GB RAM. codedb indexes itself (17 source files, ~6k lines).
+Measured on Apple M4 Pro, 48GB RAM. MCP server pre-indexed, warm queries averaged over 20 iterations.
 
-### Startup & Indexing
+### codedb (MCP) vs ast-grep vs ripgrep
 
-| Operation | Time |
-|-----------|------|
-| Initial scan + full index (outlines, trigrams, words, deps) | **<50ms** |
-| Incremental re-index (single file change) | **<2ms** |
-| Snapshot generation (full JSON) | **<10ms** |
-| MCP server ready (from snapshot) | **<5ms** |
+**codedb2 repo** (20 files, 12.6k lines):
 
-### Query Performance
+| Query | codedb (MCP) | ast-grep | ripgrep | Speedup |
+|-------|-------------|----------|---------|---------|
+| File tree | **0.03 ms** | 3.7 ms | — | **123x** |
+| Symbol search (`init`) | **0.03 ms** | 3.2 ms | 7.2 ms | **107x** vs ast-grep |
+| Full-text search (`allocator`) | **0.04 ms** | 3.2 ms | 6.2 ms | **80x** vs ast-grep |
+| Word index (`self`) | **0.05 ms** | n/a | 6.7 ms | **134x** vs ripgrep |
+| Structural outline | **0.06 ms** | 3.3 ms | — | **55x** |
+| Dependency graph | **0.06 ms** | n/a | n/a | ∞ (unique) |
 
-| Query | Time | Notes |
-|-------|------|-------|
-| `codedb_tree` | **<1ms** | Pre-computed, cached |
-| `codedb_outline` | **<1ms** | HashMap lookup |
-| `codedb_symbol` (single) | **<1ms** | HashMap lookup |
-| `codedb_search` (trigram) | **<5ms** | Trigram candidate filter → brute-force verify |
-| `codedb_word` | **<1ms** | O(1) inverted index |
-| `codedb_deps` | **<1ms** | Pre-computed reverse graph |
-| `codedb_hot` | **<1ms** | Sorted by sequence number |
+**merjs repo** (100 files, 17.3k lines):
 
-### HTTP Throughput
+| Query | codedb (MCP) | ast-grep | ripgrep | Speedup |
+|-------|-------------|----------|---------|---------|
+| File tree | **0.06 ms** | 5.5 ms | — | **92x** |
+| Symbol search (`init`) | **0.05 ms** | 3.7 ms | 5.9 ms | **74x** vs ast-grep |
+| Full-text search (`allocator`) | **0.04 ms** | 3.2 ms | 6.1 ms | **80x** vs ast-grep |
+| Word index (`self`) | **0.04 ms** | n/a | 5.1 ms | **128x** vs ripgrep |
+| Structural outline | **0.06 ms** | 2.9 ms | — | **48x** |
+| Dependency graph | **0.06 ms** | n/a | n/a | ∞ (unique) |
 
-| Endpoint | Requests/sec |
-|----------|-------------|
-| `GET /status` | **~120,000/s** |
-| `GET /tree` | **~85,000/s** |
-| `GET /outline?path=...` | **~95,000/s** |
-| `GET /search?q=...` | **~40,000/s** |
+### Token Efficiency
 
-### Memory
+codedb returns structured, relevant results — not raw line dumps. For AI agents, this means dramatically fewer tokens per query:
 
-| Metric | Value |
-|--------|-------|
-| RSS at startup (17 files indexed) | **~8MB** |
-| Per-file overhead | **~50KB** (outline + content + indexes) |
-| Binary size (ReleaseFast) | **~1.1MB** (macOS ARM64) |
+| Repo | codedb | ripgrep | Reduction |
+|------|--------|---------|-----------|
+| codedb2 (search `allocator`) | ~20 tokens | ~31,288 tokens | **1,564x fewer** |
+| merjs (search `allocator`) | ~20 tokens | ~3,873 tokens | **194x fewer** |
+
+### Why codedb is fast
+
+- **Pre-indexed**: MCP server indexes on startup, queries hit in-memory data structures
+- **ast-grep/ripgrep**: re-parse or re-scan the filesystem on every call
+- **codedb queries are O(1)**: hash lookups, not tree walks or file scans
 
 ---
 
