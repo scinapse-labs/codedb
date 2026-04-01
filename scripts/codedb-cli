@@ -10,8 +10,32 @@ BINARY="${CODEDB_BINARY:-codedb}"
 _ping() { curl -sf "$BASE/health" >/dev/null 2>&1; }
 
 _ensure_server() {
-    if _ping; then return 0; fi
     local root="${1:-.}"
+    root="$(cd "$root" 2>/dev/null && pwd || echo "$root")"
+    if _ping; then
+        # Check if the running daemon is serving the requested root.
+        # Find the process listening on our port, then extract its root arg.
+        local daemon_pid running_root
+        daemon_pid=$(ss -tlnp "sport = :$PORT" 2>/dev/null | awk '/LISTEN/{gsub(/.*pid=/,""); gsub(/,.*/,""); print; exit}')
+        if [ -z "$daemon_pid" ]; then
+            # ss not available or no match — try lsof
+            daemon_pid=$(lsof -ti ":$PORT" 2>/dev/null | head -1)
+        fi
+        if [ -n "$daemon_pid" ]; then
+            # Read cmdline: argv is NUL-delimited in /proc. Parse directly to handle paths with spaces.
+            running_root=$(xargs -0 -n1 < "/proc/$daemon_pid/cmdline" 2>/dev/null | grep -B1 "^serve$" | head -1)
+            if [ -n "$running_root" ]; then
+                running_root="$(cd "$running_root" 2>/dev/null && pwd || echo "$running_root")"
+            fi
+        fi
+        if [ -n "$running_root" ] && [ "$running_root" != "$root" ]; then
+            echo "restarting codedb (root changed: $running_root -> $root)" >&2
+            [ -n "$daemon_pid" ] && kill "$daemon_pid" 2>/dev/null || true
+            sleep 0.5
+        else
+            return 0
+        fi
+    fi
     echo "starting codedb $root serve ..." >&2
     nohup "$BINARY" "$root" serve >/dev/null 2>&1 &
     for i in $(seq 1 30); do
@@ -70,6 +94,44 @@ EOF
     exit 1
 fi
 
+
+# Handle flags before commands
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    cat >&2 <<'HELP'
+codedb-cli — fast CLI for codedb daemon
+
+usage: codedb-cli [root] <command> [args...]
+
+commands:
+  tree                          file tree with symbol counts
+  outline <path>                symbols in a file
+  find    <symbol>              find symbol definitions
+  search  <query> [max]         trigram full-text search
+  word    <identifier>          O(1) inverted index lookup
+  hot     [limit]               recently modified files
+  deps    <path>                reverse dependency graph
+  read    <path> [start] [end]  read file content (line range)
+  status                        index status / health
+  start   [root]                start the daemon
+  stop                          stop the daemon
+
+flags:
+  --help, -h                    show this help
+  --version, -v                 show version
+
+env: CODEDB_PORT (default 7719), CODEDB_BINARY (default codedb)
+HELP
+    exit 0
+fi
+
+if [[ "$1" == "--version" || "$1" == "-v" ]]; then
+    if command -v "$BINARY" &>/dev/null; then
+        "$BINARY" --version 2>&1 || echo "codedb-cli (codedb version unknown)"
+    else
+        echo "codedb-cli (codedb binary not found)"
+    fi
+    exit 0
+fi
 cmd="$1"; shift
 
 case "$cmd" in
@@ -118,7 +180,7 @@ case "$cmd" in
     deps)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli deps <path>" >&2; exit 1; }
         _ensure_server "${root:-.}"
-        _get "/explore/deps?path=$(_urlencode "$1")" | jq -r '.dependents[]'
+        _get "/explore/deps?path=$(_urlencode "$1")" | jq -r '.imported_by[]'
         ;;
     read)
         [[ $# -lt 1 ]] && { echo "usage: codedb-cli read <path> [start] [end]" >&2; exit 1; }
