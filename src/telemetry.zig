@@ -40,6 +40,7 @@ pub const Telemetry = struct {
     path_buf: [std.fs.max_path_bytes]u8 = undefined,
     path_len: usize = 0,
     call_count: u32 = 0,
+    write_lock: std.Thread.Mutex = .{},
 
     pub fn init(data_dir: []const u8, allocator: std.mem.Allocator, disabled: bool) Telemetry {
         var self = Telemetry{};
@@ -69,6 +70,8 @@ pub const Telemetry = struct {
 
     pub fn record(self: *Telemetry, kind: Event.Kind) void {
         if (!self.enabled) return;
+
+        self.write_lock.lock();
         const next = self.head.fetchAdd(1, .monotonic);
         const slot = next % RING_SIZE;
         self.ring[slot] = .{
@@ -78,8 +81,8 @@ pub const Telemetry = struct {
         if ((next + 1) -% tail > RING_SIZE) {
             self.tail.store((next + 1) -% RING_SIZE, .monotonic);
         }
+        self.write_lock.unlock();
 
-        // Periodic flush: write to disk every 3 calls, sync to cloud every 10
         self.call_count += 1;
         if (self.call_count % 3 == 0) {
             self.flush();
@@ -134,6 +137,10 @@ pub const Telemetry = struct {
 
     pub fn flush(self: *Telemetry) void {
         const f = self.file orelse return;
+
+        self.write_lock.lock();
+        defer self.write_lock.unlock();
+
         const tail = self.tail.load(.monotonic);
         const head = self.head.load(.monotonic);
         if (tail == head) return;

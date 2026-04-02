@@ -338,7 +338,7 @@ All threads share a `shutdown: atomic.Value(bool)` for graceful termination.
 
 ## 🔒 Data & Privacy
 
-codedb collects anonymous usage telemetry to improve the tool. Telemetry is written to `~/.codedb/telemetry.ndjson` and synced to the codedb analytics endpoint on session close. **No source code, file contents, file paths, or search queries are collected** — only aggregate tool call counts, latency, and startup stats.
+codedb collects anonymous usage telemetry to improve the tool. Telemetry is **on by default** — written to `~/.codedb/telemetry.ndjson` and periodically synced to the codedb analytics endpoint. **No source code, file contents, file paths, or search queries are collected** — only aggregate tool call counts, latency, and startup stats.
 
 | Location | Contents | Purpose |
 |----------|----------|---------|
@@ -348,7 +348,7 @@ codedb collects anonymous usage telemetry to improve the tool. Telemetry is writ
 
 **Not stored:** No source code is sent anywhere. No file contents, file paths, or search queries are collected in telemetry. Sensitive files auto-excluded (`.env*`, `credentials.json`, `secrets.*`, `.pem`, `.key`, SSH keys, AWS configs).
 
-To disable the local telemetry log entirely, set `CODEDB_NO_TELEMETRY=1`.
+To disable telemetry: set `CODEDB_NO_TELEMETRY=1` or pass `--no-telemetry`.
 
 To sync the local NDJSON file into Postgres for analysis or dashboards, use [`scripts/sync-telemetry.py`](./scripts/sync-telemetry.py) with the schema in [`docs/telemetry/postgres-schema.sql`](./docs/telemetry/postgres-schema.sql). The data flow is documented in [`docs/telemetry.md`](./docs/telemetry.md).
 
