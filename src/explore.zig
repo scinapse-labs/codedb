@@ -251,6 +251,10 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
         if (!skip_trigram) {
             try self.trigram_index.indexFile(stable_path, content);
             try self.sparse_ngram_index.indexFile(stable_path, content);
+        } else {
+            // Clean stale trigram/sparse entries if file was previously indexed
+            self.trigram_index.removeFile(stable_path);
+            self.sparse_ngram_index.removeFile(stable_path);
         }
     }
 
@@ -272,8 +276,20 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
         defer self.mu.unlock();
         var iter = self.contents.iterator();
         while (iter.next()) |entry| {
-            try self.trigram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*);
-            try self.sparse_ngram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*);
+            // Skip large files to prevent OOM on large repos
+            if (entry.value_ptr.len > 64 * 1024) continue;
+            self.trigram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    std.log.warn("trigram OOM, skipping remaining files", .{});
+                    return;
+                },
+            };
+            self.sparse_ngram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    std.log.warn("sparse ngram OOM, skipping remaining files", .{});
+                    return;
+                },
+            };
         }
     }
 
@@ -477,6 +493,10 @@ pub fn getTree(self: *Explorer, allocator: std.mem.Allocator, use_color: bool) !
         const candidate_paths = self.trigram_index.candidates(query, allocator);
         defer if (candidate_paths) |cp| allocator.free(cp);
 
+        // Track which files were already searched via index candidates.
+        var searched = std.StringHashMap(void).init(allocator);
+        defer searched.deinit();
+
         if (sparse_paths != null and sparse_paths.?.len > 0) {
             // Sparse has candidates: intersect with trigram to narrow results.
             if (candidate_paths != null and candidate_paths.?.len > 0) {
@@ -486,6 +506,7 @@ pub fn getTree(self: *Explorer, allocator: std.mem.Allocator, use_color: bool) !
                 for (candidate_paths.?) |path| {
                     if (!sparse_set.contains(path)) continue;
                     const content = self.contents.get(path) orelse continue;
+                    try searched.put(path, {});
                     try searchInContent(path, content, query, allocator, max_results, &result_list);
                     if (result_list.items.len >= max_results) break;
                 }
@@ -493,25 +514,39 @@ pub fn getTree(self: *Explorer, allocator: std.mem.Allocator, use_color: bool) !
                 // No trigram candidates; search sparse candidates directly.
                 for (sparse_paths.?) |path| {
                     const content = self.contents.get(path) orelse continue;
+                    try searched.put(path, {});
                     try searchInContent(path, content, query, allocator, max_results, &result_list);
                     if (result_list.items.len >= max_results) break;
                 }
             }
-            return result_list.toOwnedSlice(allocator);
+        } else {
+            // Sparse returned empty — fall through to trigram or brute force.
+            const use_trigram = candidate_paths != null and candidate_paths.?.len > 0;
+            if (use_trigram) {
+                for (candidate_paths.?) |path| {
+                    const content = self.contents.get(path) orelse continue;
+                    try searched.put(path, {});
+                    try searchInContent(path, content, query, allocator, max_results, &result_list);
+                    if (result_list.items.len >= max_results) break;
+                }
+            } else {
+                // Brute force (short query or no index hits) — searches everything.
+                var iter = self.contents.iterator();
+                while (iter.next()) |entry| {
+                    try searchInContent(entry.key_ptr.*, entry.value_ptr.*, query, allocator, max_results, &result_list);
+                    if (result_list.items.len >= max_results) break;
+                }
+                return result_list.toOwnedSlice(allocator);
+            }
         }
 
-        // Sparse returned empty — fall through to trigram or brute force.
-        const use_trigram = candidate_paths != null and candidate_paths.?.len > 0;
-        if (use_trigram) {
-            for (candidate_paths.?) |path| {
-                const content = self.contents.get(path) orelse continue;
-                try searchInContent(path, content, query, allocator, max_results, &result_list);
-                if (result_list.items.len >= max_results) break;
-            }
-        } else {
-            // Brute force (short query or no index hits).
+        // Supplement: scan files NOT in the trigram/sparse index (e.g. files beyond
+        // the 15k cap or >64KB) so they aren't silently excluded from results.
+        if (result_list.items.len < max_results) {
             var iter = self.contents.iterator();
             while (iter.next()) |entry| {
+                if (searched.contains(entry.key_ptr.*)) continue;
+                if (self.trigram_index.file_trigrams.contains(entry.key_ptr.*)) continue;
                 try searchInContent(entry.key_ptr.*, entry.value_ptr.*, query, allocator, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
@@ -557,6 +592,17 @@ pub fn getTree(self: *Explorer, allocator: std.mem.Allocator, use_color: bool) !
             // Brute force — no useful trigrams extracted
             var iter = self.contents.iterator();
             while (iter.next()) |entry| {
+                try searchInContentRegex(entry.key_ptr.*, entry.value_ptr.*, pattern, allocator, max_results, &result_list);
+                if (result_list.items.len >= max_results) break;
+            }
+            return result_list.toOwnedSlice(allocator);
+        }
+
+        // Supplement: scan files NOT in the trigram index so capped files are searchable.
+        if (result_list.items.len < max_results) {
+            var iter = self.contents.iterator();
+            while (iter.next()) |entry| {
+                if (self.trigram_index.file_trigrams.contains(entry.key_ptr.*)) continue;
                 try searchInContentRegex(entry.key_ptr.*, entry.value_ptr.*, pattern, allocator, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
@@ -1293,6 +1339,9 @@ fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !voi
         const candidate_paths = self.trigram_index.candidates(query, allocator);
         defer if (candidate_paths) |cp| allocator.free(cp);
 
+        var searched = std.StringHashMap(void).init(allocator);
+        defer searched.deinit();
+
         if (sparse_paths != null and sparse_paths.?.len > 0) {
             // Sparse has candidates: intersect with trigram to narrow results.
             if (candidate_paths != null and candidate_paths.?.len > 0) {
@@ -1302,6 +1351,7 @@ fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !voi
                 for (candidate_paths.?) |path| {
                     if (!sparse_set.contains(path)) continue;
                     const content = self.contents.get(path) orelse continue;
+                    try searched.put(path, {});
                     try self.searchInContentWithScope(path, content, query, allocator, max_results, &result_list);
                     if (result_list.items.len >= max_results) break;
                 }
@@ -1309,31 +1359,44 @@ fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !voi
                 // No trigram candidates; search sparse candidates directly.
                 for (sparse_paths.?) |path| {
                     const content = self.contents.get(path) orelse continue;
+                    try searched.put(path, {});
                     try self.searchInContentWithScope(path, content, query, allocator, max_results, &result_list);
                     if (result_list.items.len >= max_results) break;
                 }
             }
-            return result_list.toOwnedSlice(allocator);
+        } else {
+            // Sparse returned empty — fall through to trigram or brute force.
+            const use_trigram = candidate_paths != null and candidate_paths.?.len > 0;
+            if (use_trigram) {
+                for (candidate_paths.?) |path| {
+                    const content = self.contents.get(path) orelse continue;
+                    try searched.put(path, {});
+                    try self.searchInContentWithScope(path, content, query, allocator, max_results, &result_list);
+                    if (result_list.items.len >= max_results) break;
+                }
+            } else {
+                // Brute force — searches everything, no supplement needed.
+                var iter = self.contents.iterator();
+                while (iter.next()) |entry| {
+                    try self.searchInContentWithScope(entry.key_ptr.*, entry.value_ptr.*, query, allocator, max_results, &result_list);
+                    if (result_list.items.len >= max_results) break;
+                }
+                return result_list.toOwnedSlice(allocator);
+            }
         }
 
-        // Sparse returned empty — fall through to trigram or brute force.
-        const use_trigram = candidate_paths != null and candidate_paths.?.len > 0;
-        if (use_trigram) {
-            for (candidate_paths.?) |path| {
-                const content = self.contents.get(path) orelse continue;
-                try self.searchInContentWithScope(path, content, query, allocator, max_results, &result_list);
-                if (result_list.items.len >= max_results) break;
-            }
-        } else {
+        // Supplement: scan files NOT in the trigram index so capped files are searchable.
+        if (result_list.items.len < max_results) {
             var iter = self.contents.iterator();
             while (iter.next()) |entry| {
+                if (searched.contains(entry.key_ptr.*)) continue;
+                if (self.trigram_index.file_trigrams.contains(entry.key_ptr.*)) continue;
                 try self.searchInContentWithScope(entry.key_ptr.*, entry.value_ptr.*, query, allocator, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
         }
 
         return result_list.toOwnedSlice(allocator);
-
     }
 
     fn searchInContentWithScope(self: *Explorer, path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_results: usize, result_list: *std.ArrayList(ScopedSearchResult)) !void {

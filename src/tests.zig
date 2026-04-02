@@ -3558,6 +3558,30 @@ test "issue-77: mcp index accepts temporary-directory roots that cause pathologi
     try testing.expect(result.term.Exited != 0);
 }
 
+test "issue-105: large files skip trigram indexing to prevent OOM" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Create content just over 64KB — should be indexed for outline/word but NOT trigram
+    const large_content = try testing.allocator.alloc(u8, 65 * 1024);
+    defer testing.allocator.free(large_content);
+    @memset(large_content, 'a');
+    // Make it valid Zig so outline parsing works
+    @memcpy(large_content[0..21], "pub fn bigFunc() void");
+
+    // indexFileSkipTrigram should succeed without building trigrams
+    try explorer.indexFileSkipTrigram("large.zig", large_content);
+
+    // The file should be in outlines and contents but NOT in the trigram index
+    try testing.expect(explorer.outlines.count() == 1);
+    try testing.expect(explorer.contents.count() == 1);
+    try testing.expect(explorer.trigram_index.fileCount() == 0);
+
+    // A small file should still get trigram-indexed
+    try explorer.indexFile("small.zig", "pub fn tiny() void {}");
+    try testing.expect(explorer.trigram_index.fileCount() == 1);
+}
+
 // ── PHP parser tests ─────────────────────────────────────────────
 
 test "issue-php-1: PHP class definition herkend" {

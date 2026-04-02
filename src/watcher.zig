@@ -240,11 +240,16 @@ pub fn initialScan(store: *Store, explorer: *Explorer, root: []const u8, allocat
     var walker = try FilteredWalker.init(dir, allocator);
     defer walker.deinit();
 
+    const max_trigram_files: usize = 15_000;
+    var file_count: usize = 0;
+
     while (try walker.next()) |entry| {
         const stat = dir.statFile(entry.path) catch continue;
         _ = try store.recordSnapshot(entry.path, stat.size, 0);
-        // Index outline + content + word/trigram for full search support
-        indexFileContent(explorer, dir, entry.path, allocator, skip_trigram) catch {};
+        file_count += 1;
+        // Auto-skip trigram indexing beyond file count cap to prevent OOM
+        const effective_skip = skip_trigram or (file_count > max_trigram_files);
+        indexFileContent(explorer, dir, entry.path, allocator, effective_skip) catch {};
     }
 }
 
@@ -500,7 +505,9 @@ fn indexFileContent(explorer: *Explorer, dir: std.fs.Dir, path: []const u8, allo
     for (content[0..check_len]) |c| {
         if (c == 0) return;
     }
-    if (skip_trigram) {
+    // Skip trigram indexing for files > 64KB to prevent OOM on large repos
+    const effective_skip_trigram = skip_trigram or (content.len > 64 * 1024);
+    if (effective_skip_trigram) {
         try explorer.indexFileSkipTrigram(path, content);
     } else {
         try explorer.indexFile(path, content);
