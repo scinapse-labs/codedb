@@ -798,9 +798,27 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                 .line_start = line_num,
                 .line_end = line_num,
             });
-            const import_copy = try a.dupe(u8, line);
-            errdefer a.free(import_copy);
-            try outline.imports.append(a, import_copy);
+            // Extract module path and convert dots to slashes for dep matching.
+            // "from mypackage.utils.helpers import X" → "mypackage/utils/helpers.py"
+            // "import os.path" → "os/path.py"
+            if (extractPythonModulePath(line)) |mod_path| {
+                var buf: [512]u8 = undefined;
+                var pos: usize = 0;
+                for (mod_path) |c| {
+                    if (pos >= buf.len - 3) break;
+                    buf[pos] = if (c == '.') '/' else c;
+                    pos += 1;
+                }
+                if (pos + 3 <= buf.len) {
+                    buf[pos] = '.';
+                    buf[pos + 1] = 'p';
+                    buf[pos + 2] = 'y';
+                    pos += 3;
+                }
+                const import_copy = try a.dupe(u8, buf[0..pos]);
+                errdefer a.free(import_copy);
+                try outline.imports.append(a, import_copy);
+            }
         }
     }
     fn parseTsLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
@@ -1872,4 +1890,30 @@ fn skipKeywords(s: []const u8) []const u8 {
         }
     }
     return result;
+}
+
+/// Extract the module path from a Python import line.
+/// "from mypackage.utils.helpers import X" → "mypackage.utils.helpers"
+/// "import os.path" → "os.path"
+/// "from . import foo" / "from .rel import bar" → null (relative imports too ambiguous)
+fn extractPythonModulePath(line: []const u8) ?[]const u8 {
+    if (startsWith(line, "from ")) {
+        const rest = std.mem.trimLeft(u8, line[5..], " \t");
+        // Skip relative imports (start with dot)
+        if (rest.len > 0 and rest[0] == '.') return null;
+        // "from module.path import ..." — extract up to " import"
+        if (std.mem.indexOf(u8, rest, " import")) |imp_pos| {
+            const mod = std.mem.trimRight(u8, rest[0..imp_pos], " \t");
+            if (mod.len > 0) return mod;
+        }
+        return null;
+    } else if (startsWith(line, "import ")) {
+        const rest = std.mem.trimLeft(u8, line[7..], " \t");
+        // "import os.path" or "import foo" — take up to comma or space
+        var end: usize = 0;
+        while (end < rest.len and rest[end] != ' ' and rest[end] != ',' and rest[end] != '\t') : (end += 1) {}
+        if (end > 0) return rest[0..end];
+        return null;
+    }
+    return null;
 }

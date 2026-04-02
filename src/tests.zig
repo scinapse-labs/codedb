@@ -4068,3 +4068,21 @@ test "issue-php-18: PHP use-as alias case-insensitive" {
     try testing.expectEqualStrings("app/Services/Cache.php", outline.imports.items[1]);
     try testing.expectEqualStrings("app/Services/Logger.php", outline.imports.items[2]);
 }
+
+test "issue-107: codedb_deps returns results for Python files" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("mypackage/utils/helpers.py", "def helper_func():\n    pass\n");
+    try explorer.indexFile("consumer.py", "from mypackage.utils.helpers import helper_func\n");
+
+    const deps = try explorer.getImportedBy("mypackage/utils/helpers.py", testing.allocator);
+    defer {
+        for (deps) |d| testing.allocator.free(d);
+        testing.allocator.free(deps);
+    }
+
+    try testing.expect(deps.len == 1);
+    try testing.expectEqualStrings("consumer.py", deps[0]);
+}
