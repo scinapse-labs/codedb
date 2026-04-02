@@ -27,7 +27,7 @@ fn page() h.Node {
         h.p(.{}, "Supports macOS (ARM64, x86_64) and Linux (ARM64, x86_64). macOS binaries are codesigned and notarized."),
 
         h.h2(.{}, "2. MCP server (recommended)"),
-        h.p(.{}, "After installing, codedb is automatically registered. Open any project and the 12 MCP tools are available to your AI agent."),
+        h.p(.{}, "After installing, codedb is automatically registered. Open any project and the 16 MCP tools are available to your AI agent."),
         h.pre(.{},
             \\# Manual MCP start (auto-configured by install script)
             \\codedb mcp /path/to/your/project
@@ -79,7 +79,7 @@ fn page() h.Node {
         ),
 
         h.h2(.{}, "MCP tools reference"),
-        h.p(.{}, "12 tools available over the Model Context Protocol:"),
+        h.p(.{}, "16 tools available over the Model Context Protocol:"),
         h.table(.{ .class = "status-table" }, .{
             h.tbody(.{}, .{
                 h.tr(.{}, .{ h.td(.{}, .{ h.code(.{}, "codedb_tree") }), h.td(.{}, "Full file tree with language, line counts, symbol counts") }),
@@ -94,14 +94,18 @@ fn page() h.Node {
                 h.tr(.{}, .{ h.td(.{}, .{ h.code(.{}, "codedb_changes") }), h.td(.{}, "Changed files since a sequence number") }),
                 h.tr(.{}, .{ h.td(.{}, .{ h.code(.{}, "codedb_status") }), h.td(.{}, "Index status (file count, current sequence)") }),
                 h.tr(.{}, .{ h.td(.{}, .{ h.code(.{}, "codedb_snapshot") }), h.td(.{}, "Full pre-rendered JSON snapshot of the codebase") }),
+                h.tr(.{}, .{ h.td(.{}, .{ h.code(.{}, "codedb_bundle") }), h.td(.{}, "Batch multiple queries in one call") }),
+                h.tr(.{}, .{ h.td(.{}, .{ h.code(.{}, "codedb_remote") }), h.td(.{}, "Query any GitHub repo via cloud") }),
+                h.tr(.{}, .{ h.td(.{}, .{ h.code(.{}, "codedb_projects") }), h.td(.{}, "List all indexed local projects") }),
+                h.tr(.{}, .{ h.td(.{}, .{ h.code(.{}, "codedb_index") }), h.td(.{}, "Index a new local folder") }),
             }),
         }),
 
         h.h2(.{}, "Building from source"),
         h.p(.{}, "Requires Zig 0.15+:"),
         h.pre(.{},
-            \\git clone https://github.com/justrach/codedb2.git
-            \\cd codedb2
+            \\git clone https://github.com/justrach/codedb.git
+            \\cd codedb
             \\zig build                              # debug build
             \\zig build -Doptimize=ReleaseFast       # release build
             \\zig build test                         # run tests
@@ -109,7 +113,7 @@ fn page() h.Node {
 
         h.div(.{ .class = "hero-actions" }, .{
             h.a(.{ .href = "/benchmarks", .class = "btn" }, "See benchmarks"),
-            h.a(.{ .href = "https://github.com/justrach/codedb2", .class = "btn btn-outline" }, "GitHub"),
+            h.a(.{ .href = "https://github.com/justrach/codedb", .class = "btn btn-outline" }, "GitHub"),
         }),
     });
 }
