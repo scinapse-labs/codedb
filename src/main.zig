@@ -657,7 +657,10 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
                 snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
-                explorer.releaseContents();
+                const fc = explorer.outlines.count();
+                if (fc > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
+                    explorer.releaseContents();
+                }
                 return;
             }
         }
@@ -682,7 +685,12 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
     snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
         std.log.warn("could not auto-write snapshot: {}", .{err});
     };
-    explorer.releaseContents();
+    // Only release contents for large repos where memory savings matter.
+    // Small repos keep content in RAM for faster search.
+    const file_count = explorer.outlines.count();
+    if (file_count > 1000 or std.process.hasEnvVarConstant("CODEDB_LOW_MEMORY")) {
+        explorer.releaseContents();
+    }
 }
 }
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
