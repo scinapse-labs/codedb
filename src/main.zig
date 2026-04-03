@@ -656,6 +656,7 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
                 snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
                     std.log.warn("could not auto-write snapshot: {}", .{err});
                 };
+                explorer.releaseContents();
                 return;
             }
         }
@@ -674,6 +675,7 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
     snapshot_mod.writeSnapshotDual(explorer, abs_root, "codedb.snapshot", allocator) catch |err| {
         std.log.warn("could not auto-write snapshot: {}", .{err});
     };
+    explorer.releaseContents();
 }
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
