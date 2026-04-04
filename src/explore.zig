@@ -185,10 +185,34 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
     var line_num: u32 = 0;
     var prev_line_trimmed: []const u8 = "";
     var php_state: PhpParseState = .{};
+    var in_py_docstring = false;
+    var in_block_comment = false;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         line_num += 1;
         const trimmed = std.mem.trim(u8, line, " \t");
+
+        // Track Python triple-quote docstrings (#111)
+        if (outline.language == .python) {
+            const triple_count = std.mem.count(u8, trimmed, "\"\"\"") + std.mem.count(u8, trimmed, "'''");
+            if (in_py_docstring) {
+                if (triple_count > 0) in_py_docstring = false;
+                continue;
+            }
+            if (triple_count == 1) { in_py_docstring = true; continue; }
+        }
+
+        // Track JS/TS block comments (#113)
+        if (outline.language == .typescript or outline.language == .javascript) {
+            if (in_block_comment) {
+                if (std.mem.indexOf(u8, trimmed, "*/") != null) in_block_comment = false;
+                continue;
+            }
+            if (std.mem.startsWith(u8, trimmed, "/*")) {
+                if (std.mem.indexOf(u8, trimmed, "*/") == null) in_block_comment = true;
+                continue;
+            }
+        }
 
         if (outline.language == .zig) {
             try self.parseZigLine(trimmed, line_num, &outline);

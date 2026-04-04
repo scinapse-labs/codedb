@@ -4145,3 +4145,79 @@ test "issue-93: isPathSafe blocks traversal" {
     try testing.expect(MCP.isPathSafe("src/main.zig"));
     try testing.expect(MCP.isPathSafe("README.md"));
 }
+
+test "issue-111: Python triple-quote docstrings not parsed as code" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("docstring.py",
+        \\def real_func():
+        \\    """
+        \\    def fake_func():
+        \\        pass
+        \\    """
+        \\    pass
+    );
+
+    var outline = (try explorer.getOutline("docstring.py", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+    var func_count: usize = 0;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .function) func_count += 1;
+    }
+    // Only real_func should be found, not fake_func inside docstring
+    try testing.expect(func_count == 1);
+}
+
+test "issue-112: Python import-as alias stripped from dep path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("utils.py", "def helper(): pass\n");
+    try explorer.indexFile("consumer.py", "import utils as u\n");
+
+    const deps = try explorer.getImportedBy("utils.py", testing.allocator);
+    defer {
+        for (deps) |d| testing.allocator.free(d);
+        testing.allocator.free(deps);
+    }
+    try testing.expect(deps.len == 1);
+}
+
+test "issue-113: TypeScript block comments not parsed as code" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("commented.ts",
+        \\export function realFunc() {}
+        \\/*
+        \\export function fakeFunc() {}
+        \\*/
+    );
+
+    var outline = (try explorer.getOutline("commented.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+    var func_count: usize = 0;
+    for (outline.symbols.items) |sym| {
+        if (sym.kind == .function) func_count += 1;
+    }
+    try testing.expect(func_count == 1);
+}
+
+test "issue-114: TypeScript import-as alias does not affect dep path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("mod.ts", "export function hello() {}\n");
+    try explorer.indexFile("consumer.ts", "import { hello as h } from './mod'\n");
+
+    var outline = (try explorer.getOutline("consumer.ts", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+    // The import dep path should be "./mod", not include the alias
+    try testing.expect(outline.imports.items.len == 1);
+    try testing.expectEqualStrings("./mod", outline.imports.items[0]);
+}

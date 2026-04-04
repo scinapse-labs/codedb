@@ -762,7 +762,7 @@ fn handleWord(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
 }
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {
-    const limit: usize = if (getInt(args, "limit")) |n| @intCast(@max(1, n)) else 10;
+    const limit: usize = if (getInt(args, "limit")) |n| @intCast(@min(@max(1, n), 1000)) else 10;
     const hot = explorer.getHotFiles(store, alloc, limit) catch {
         out.appendSlice(alloc, "error: hot files failed") catch {};
         return;
@@ -862,8 +862,8 @@ fn handleRead(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     w.print("hash:{s}\n", .{hash_str}) catch {};
 
     if (has_range or compact) {
-        const start: u32 = if (line_start_raw) |n| @intCast(@max(1, n)) else 1;
-        const end: u32 = if (line_end_raw) |n| @intCast(@max(1, n)) else std.math.maxInt(u32);
+        const start: u32 = if (line_start_raw) |n| @intCast(@min(@max(1, n), std.math.maxInt(u32))) else 1;
+        const end: u32 = if (line_end_raw) |n| @intCast(@min(@max(1, n), std.math.maxInt(u32))) else std.math.maxInt(u32);
         const lang = explore_mod.detectLanguage(path);
         const extracted = explore_mod.extractLines(content, start, end, true, compact, lang, alloc) catch {
             out.appendSlice(alloc, "error: line extraction failed") catch {};
@@ -942,7 +942,7 @@ fn handleEdit(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
 }
 
 fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store) void {
-    const since: u64 = if (getInt(args, "since")) |n| @intCast(@max(0, n)) else 0;
+    const since: u64 = if (getInt(args, "since")) |n| @intCast(@min(@max(0, n), std.math.maxInt(u64))) else 0;
     const changes = store.changesSinceDetailed(since, alloc) catch {
         out.appendSlice(alloc, "error: changes query failed") catch {};
         return;
