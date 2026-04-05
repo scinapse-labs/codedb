@@ -213,20 +213,29 @@ const FilteredWalker = struct {
 
     fn isIgnored(self: *FilteredWalker, name: []const u8, full_path: []const u8) bool {
         for (self.ignore_patterns.items) |pattern| {
-            // Directory pattern (ends with /)
+            // Root-anchored pattern (starts with /) — only match at project root
+            if (pattern.len > 1 and pattern[0] == '/') {
+                const anchored = pattern[1..];
+                const clean = if (std.mem.endsWith(u8, anchored, "/")) anchored[0 .. anchored.len - 1] else anchored;
+                if (std.mem.eql(u8, full_path, clean) or std.mem.startsWith(u8, full_path, anchored)) return true;
+                continue;
+            }
+            // Directory pattern (ends with /) — match directory names at any depth
             if (std.mem.endsWith(u8, pattern, "/")) {
                 const dir_name = pattern[0 .. pattern.len - 1];
                 if (std.mem.eql(u8, name, dir_name)) return true;
+                continue;
+            }
+            // Glob suffix match (e.g. *.log)
+            if (pattern.len > 1 and pattern[0] == '*') {
+                if (std.mem.endsWith(u8, name, pattern[1..])) return true;
+                continue;
             }
             // Exact name match (matches at any depth)
             if (std.mem.eql(u8, name, pattern)) return true;
             // Path prefix match (must match at / boundary)
             if (std.mem.startsWith(u8, full_path, pattern) and
-                (full_path.len == pattern.len or full_path[pattern.len] == '/')) return true;
-            // Glob suffix match (e.g. *.log)
-            if (pattern.len > 1 and pattern[0] == '*') {
-                if (std.mem.endsWith(u8, name, pattern[1..])) return true;
-            }
+                full_path.len > pattern.len and full_path[pattern.len] == '/') return true;
         }
         return false;
     }

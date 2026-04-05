@@ -1047,15 +1047,15 @@ fn handleBundle(
 
         dispatch(alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache);
 
+        // Check size BEFORE appending to prevent blowout
+        if (out.items.len + sub_out.items.len > 200 * 1024) {
+            w.print("--- [{d}] {s} ---\nTRUNCATED: adding this result would exceed 200KB. Use codedb_outline + targeted reads instead of full file reads.\n", .{ i, tool_name }) catch {};
+            break;
+        }
+
         w.print("--- [{d}] {s} ---\n", .{ i, tool_name }) catch {};
         out.appendSlice(alloc, sub_out.items) catch {};
         w.writeAll("\n") catch {};
-
-        // Cap total response at 200KB to prevent token limit blowouts
-        if (out.items.len > 200 * 1024) {
-            w.print("--- TRUNCATED ---\nBundle response exceeded 200KB ({d} bytes). Use codedb_outline + targeted reads instead of full file reads.\n", .{out.items.len}) catch {};
-            break;
-        }
     }
 }
 
