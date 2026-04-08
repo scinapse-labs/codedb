@@ -717,11 +717,16 @@ fn loadTrigramFromDiskIfPresent(explorer: *Explorer, data_dir: []const u8, alloc
     explorer.mu.unlockShared();
     if (already_loaded) return;
 
-    if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+    if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
         explorer.mu.lock();
         defer explorer.mu.unlock();
         explorer.trigram_index.deinit();
-        explorer.trigram_index = loaded;
+        explorer.trigram_index = .{ .mmap = loaded };
+    } else if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+        explorer.mu.lock();
+        defer explorer.mu.unlock();
+        explorer.trigram_index.deinit();
+        explorer.trigram_index = .{ .heap = loaded };
     }
 }
 

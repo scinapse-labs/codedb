@@ -45,11 +45,16 @@ fn loadProjectTrigramFromDiskIfPresent(explorer: *Explorer, project_path: []cons
     const data_dir = getProjectDataDir(allocator, project_path) orelse return;
     defer allocator.free(data_dir);
 
-    if (idx.TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+    if (idx.MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
         explorer.mu.lock();
         defer explorer.mu.unlock();
         explorer.trigram_index.deinit();
-        explorer.trigram_index = loaded;
+        explorer.trigram_index = .{ .mmap = loaded };
+    } else if (idx.TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
+        explorer.mu.lock();
+        defer explorer.mu.unlock();
+        explorer.trigram_index.deinit();
+        explorer.trigram_index = .{ .heap = loaded };
     }
 }
 

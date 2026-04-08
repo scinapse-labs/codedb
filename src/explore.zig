@@ -241,7 +241,10 @@ pub const Explorer = struct {
                     if (startsWith(line, "=end")) in_py_docstring = false;
                     continue;
                 }
-                if (startsWith(line, "=begin")) { in_py_docstring = true; continue; }
+                if (startsWith(line, "=begin")) {
+                    in_py_docstring = true;
+                    continue;
+                }
             }
 
             // Track block comments for all languages that use /* */
@@ -928,50 +931,81 @@ pub const Explorer = struct {
         };
     }
 
-pub fn getImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
-    self.mu.lockShared();
-    defer self.mu.unlockShared();
-
-    // Extract basename for matching against raw import strings
-    // e.g., "src/store.zig" -> "store.zig"
-    const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
-
-    var result: std.ArrayList([]const u8) = .{};
-    errdefer {
-        for (result.items) |p| allocator.free(p);
-        result.deinit(allocator);
-    }
-
-    var iter = self.dep_graph.iterator();
-    while (iter.next()) |entry| {
-        for (entry.value_ptr.items) |dep| {
-            if (std.mem.eql(u8, dep, path) or std.mem.eql(u8, dep, basename)) {
-                const dep_path = try allocator.dupe(u8, entry.key_ptr.*);
-                try result.append(allocator, dep_path);
-                break;
-            }
-        }
-    }
-    return result.toOwnedSlice(allocator);
-}
-
-pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator, limit: usize) ![]const []const u8 {
-    // Collect stable path copies under explorer lock.
-    var path_list: std.ArrayList([]u8) = .{};
-    errdefer {
-        for (path_list.items) |path| allocator.free(path);
-        path_list.deinit(allocator);
-    }
-    defer path_list.deinit(allocator);
-    {
+    pub fn getImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {
         self.mu.lockShared();
         defer self.mu.unlockShared();
-        var iter = self.outlines.iterator();
-        while (iter.next()) |kv| {
-            const path_copy = try allocator.dupe(u8, kv.key_ptr.*);
-            try path_list.append(allocator, path_copy);
+
+        // Extract basename for matching against raw import strings
+        // e.g., "src/store.zig" -> "store.zig"
+        const basename = if (std.mem.lastIndexOfScalar(u8, path, '/')) |pos| path[pos + 1 ..] else path;
+
+        var result: std.ArrayList([]const u8) = .{};
+        errdefer {
+            for (result.items) |p| allocator.free(p);
+            result.deinit(allocator);
         }
+
+        var iter = self.dep_graph.iterator();
+        while (iter.next()) |entry| {
+            for (entry.value_ptr.items) |dep| {
+                if (std.mem.eql(u8, dep, path) or std.mem.eql(u8, dep, basename)) {
+                    const dep_path = try allocator.dupe(u8, entry.key_ptr.*);
+                    try result.append(allocator, dep_path);
+                    break;
+                }
+            }
+        }
+        return result.toOwnedSlice(allocator);
     }
+
+    pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator, limit: usize) ![]const []const u8 {
+        // Collect stable path copies under explorer lock.
+        var path_list: std.ArrayList([]u8) = .{};
+        errdefer {
+            for (path_list.items) |path| allocator.free(path);
+            path_list.deinit(allocator);
+        }
+        defer path_list.deinit(allocator);
+        {
+            self.mu.lockShared();
+            defer self.mu.unlockShared();
+            var iter = self.outlines.iterator();
+            while (iter.next()) |kv| {
+                const path_copy = try allocator.dupe(u8, kv.key_ptr.*);
+                try path_list.append(allocator, path_copy);
+            }
+        }
+
+        // Query store seqs without holding explorer lock.
+        const Entry = struct { path: []u8, seq: u64 };
+        var entries: std.ArrayList(Entry) = .{};
+        defer entries.deinit(allocator);
+        {
+            store.mu.lock();
+            defer store.mu.unlock();
+            for (path_list.items) |path| {
+                const seq = store.getLatestSeqUnlocked(path);
+                try entries.append(allocator, .{ .path = path, .seq = seq });
+            }
+        }
+
+        std.mem.sort(Entry, entries.items, {}, struct {
+            fn cmp(_: void, a: Entry, b: Entry) bool {
+                return a.seq > b.seq;
+            }
+        }.cmp);
+
+        const count = @min(limit, entries.items.len);
+        const paths = try allocator.alloc([]const u8, count);
+        for (entries.items[0..count], 0..) |e, i| {
+            paths[i] = e.path;
+        }
+        for (entries.items[count..]) |e| {
+            allocator.free(e.path);
+        }
+        return paths;
+    }
+
     // ── Language parsers ──────────────────────────────────────
 
     fn parseZigLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
@@ -2396,14 +2430,15 @@ fn isWordBoundary(path: []const u8, pi: usize) bool {
 
 fn isSpecialEntryPoint(filename: []const u8) bool {
     const specials = [_][]const u8{
-        "main.zig", "lib.zig", "root.zig",
-        "main.rs", "lib.rs", "mod.rs",
-        "main.go", "main.c", "main.cpp",
-        "index.ts", "index.tsx", "index.js", "index.jsx",
-        "index.mjs", "index.cjs", "index.vue",
-        "index.php", "main.rb", "index.rb",
-        "__init__.py", "__main__.py",
-        "Makefile", "build.zig", "Cargo.toml", "package.json",
+        "main.zig",     "lib.zig",     "root.zig",
+        "main.rs",      "lib.rs",      "mod.rs",
+        "main.go",      "main.c",      "main.cpp",
+        "index.ts",     "index.tsx",   "index.js",
+        "index.jsx",    "index.mjs",   "index.cjs",
+        "index.vue",    "index.php",   "main.rb",
+        "index.rb",     "__init__.py", "__main__.py",
+        "Makefile",     "build.zig",   "Cargo.toml",
+        "package.json",
     };
     for (specials) |s| {
         if (std.mem.eql(u8, filename, s)) return true;
