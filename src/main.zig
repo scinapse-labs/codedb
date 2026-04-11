@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const Store = @import("store.zig").Store;
 const AgentRegistry = @import("agent.zig").AgentRegistry;
@@ -29,11 +30,14 @@ const Out = struct {
     }
 };
 
-/// The real entry point.  Zig may merge all command-branch stack frames into
-/// one, producing a ~33 MB frame that overflows the default 16 MB OS stack.
-/// We trampoline through a thread with an explicit 64 MB stack.
+/// The real entry point.  In Debug builds, Zig may merge all command-branch
+/// stack frames into one producing a frame that overflows the default OS stack,
+/// so we trampoline through a thread with an explicit 64 MB stack.
+/// In optimised builds the merged frame is ~190 KB, so 8 MB is ample and
+/// avoids triggering Rosetta 2's 64 MB stack allocation bug on x86_64-macos.
 pub fn main() !void {
-    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, mainInner, .{});
+    const stack_size: usize = if (builtin.mode == .Debug) 64 * 1024 * 1024 else 8 * 1024 * 1024;
+    const thread = try std.Thread.spawn(.{ .stack_size = stack_size }, mainInner, .{});
     thread.join();
 }
 
