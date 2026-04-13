@@ -254,7 +254,17 @@ fn mainImpl() !void {
                 explorer.trigram_index.writeToDisk(data_dir, git_head) catch |err| {
                     std.log.warn("could not persist trigram index: {}", .{err});
                 };
+                // Swap heap→mmap to free posting list allocations
+                if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
+                    explorer.mu.lock();
+                    explorer.trigram_index.deinit();
+                    explorer.trigram_index = .{ .mmap = loaded };
+                    explorer.mu.unlock();
+                }
             }
+            // Release content cache + shrink remaining indexes
+            explorer.releaseContents();
+            explorer.word_index.shrinkAllocations();
 
             // If no freq table was loaded, build one from indexed content and
             // persist for next run.  Streams file-by-file — zero extra memory.
