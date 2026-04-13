@@ -251,34 +251,41 @@ fn mainImpl() !void {
                     };
                 }
             } else {
-                // Cold run: build trigrams file-by-file from disk.
-                // This avoids holding outlines + word_index + trigrams simultaneously,
-                // halving peak RSS compared to building trigrams during initialScan.
+                // Cold run: shrink word index first, then build trigrams in a
+                // page_allocator-backed TrigramIndex. This prevents the trigram
+                // index's peak from stacking on top of word index capacity waste.
+                explorer.releaseContents();
+                explorer.word_index.shrinkAllocations();
                 {
+                    // Build trigrams into a temporary index backed by page_allocator.
+                    // When the arena is freed, ALL trigram pages go back to OS.
+                    var tri_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    var tmp_tri = TrigramIndex.init(tri_arena.allocator());
+
                     var tri_dir = std.fs.cwd().openDir(root, .{}) catch null;
                     defer if (tri_dir) |*d| d.close();
                     if (tri_dir) |dir| {
-                        explorer.mu.lock();
                         var key_iter = explorer.outlines.keyIterator();
                         while (key_iter.next()) |path_ptr| {
                             const p = path_ptr.*;
                             const f = dir.openFile(p, .{}) catch continue;
                             defer f.close();
-                            const c = f.readToEndAlloc(allocator, 512 * 1024) catch continue;
-                            defer allocator.free(c);
+                            var fa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                            defer fa.deinit();
+                            const c = f.readToEndAlloc(fa.allocator(), 512 * 1024) catch continue;
                             if (c.len <= 64 * 1024) {
-                                explorer.trigram_index.indexFile(p, c) catch continue;
-                                explorer.sparse_ngram_index.indexFile(p, c) catch continue;
-                                _ = explorer.skip_trigram_files.remove(p);
+                                tmp_tri.indexFile(p, c) catch continue;
                             }
                         }
-                        explorer.mu.unlock();
                     }
+                    // Write temp trigram index to disk
+                    tmp_tri.writeToDisk(data_dir, git_head) catch |err| {
+                        std.log.warn("could not persist trigram index: {}", .{err});
+                    };
+                    // Free temp trigram — arena.deinit returns all pages to OS
+                    tri_arena.deinit();
                 }
-                // Write to disk + swap to mmap
-                explorer.trigram_index.writeToDisk(data_dir, git_head) catch |err| {
-                    std.log.warn("could not persist trigram index: {}", .{err});
-                };
+                // Load as mmap (zero heap cost)
                 if (MmapTrigramIndex.initFromDisk(data_dir, allocator)) |loaded| {
                     explorer.mu.lock();
                     explorer.trigram_index.deinit();
@@ -286,9 +293,6 @@ fn mainImpl() !void {
                     explorer.mu.unlock();
                 }
             }
-            // Release content cache + shrink remaining indexes
-            explorer.releaseContents();
-            explorer.word_index.shrinkAllocations();
 
             // If no freq table was loaded, build one from indexed content and
             // persist for next run.  Streams file-by-file — zero extra memory.
