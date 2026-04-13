@@ -173,6 +173,16 @@ pub const WordIndex = struct {
         return @intCast(self.file_words.count());
     }
 
+    /// Shrink all hit lists and per-file word sets to release excess capacity.
+    pub fn shrinkAllocations(self: *WordIndex) void {
+        var iter = self.index.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.capacity > entry.value_ptr.items.len) {
+                entry.value_ptr.shrinkAndFree(self.allocator, entry.value_ptr.items.len);
+            }
+        }
+    }
+
     pub const DiskHeader = struct {
         file_count: u32,
         git_head: ?[40]u8,
@@ -527,6 +537,10 @@ pub const TrigramIndex = struct {
     allocator: std.mem.Allocator,
     /// When true, deinit frees the path keys in file_trigrams (set by readFromDisk).
     owns_paths: bool = false,
+
+    /// Maximum entries per posting list — caps memory for common trigrams.
+    /// Trigrams appearing in more files than this are poor discriminators anyway.
+    const MAX_POSTINGS: usize = 512;
 
     pub fn init(allocator: std.mem.Allocator) TrigramIndex {
         return .{
@@ -1172,6 +1186,24 @@ pub const TrigramIndex = struct {
     /// Returns the number of indexed files (for staleness checks).
     pub fn fileCount(self: *const TrigramIndex) u32 {
         return @intCast(self.file_trigrams.count());
+    }
+
+    /// Shrink all posting lists to their actual length, releasing excess capacity.
+    /// Call after bulk indexing to reclaim ArrayList over-allocation (~50% savings).
+    pub fn shrinkPostingLists(self: *TrigramIndex) void {
+        var iter = self.index.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.items.capacity > entry.value_ptr.items.items.len) {
+                entry.value_ptr.items.shrinkAndFree(self.allocator, entry.value_ptr.items.items.len);
+            }
+        }
+        // Also shrink file_trigrams lists
+        var ft_iter = self.file_trigrams.iterator();
+        while (ft_iter.next()) |entry| {
+            if (entry.value_ptr.capacity > entry.value_ptr.items.len) {
+                entry.value_ptr.shrinkAndFree(self.allocator, entry.value_ptr.items.len);
+            }
+        }
     }
 
     /// Header info that can be read without loading the full index.

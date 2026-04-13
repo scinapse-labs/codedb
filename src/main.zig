@@ -789,6 +789,9 @@ fn scanBg(store: *Store, explorer: *Explorer, root: []const u8, allocator: std.m
                     explorer.releaseContents();
                     explorer.releaseSecondaryIndexes();
                 }
+                // Shrink index allocations to reclaim ArrayList over-allocation
+                if (explorer.trigram_index.asHeap()) |heap| heap.shrinkPostingLists();
+                explorer.word_index.shrinkAllocations();
                 return;
             }
             if (TrigramIndex.readFromDisk(data_dir, allocator)) |loaded| {
