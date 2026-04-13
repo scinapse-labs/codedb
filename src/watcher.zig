@@ -507,6 +507,58 @@ fn readWorker(results: *ReadResults, root: []const u8, entries: []const InitialS
     }
 }
 
+const TriExtractEntry = TrigramIndex.BulkEntry;
+const TriExtractResult = struct { path: []const u8, trigrams: []TriExtractEntry };
+const TriExtractResults = struct {
+    arena: std.heap.ArenaAllocator,
+    items: std.ArrayList(TriExtractResult),
+    fn init(backing: std.mem.Allocator) TriExtractResults {
+        return .{ .arena = std.heap.ArenaAllocator.init(backing), .items = .{} };
+    }
+    fn deinit(self: *TriExtractResults, _: std.mem.Allocator) void {
+        self.items.deinit(self.arena.allocator());
+        self.arena.deinit();
+    }
+};
+
+fn trigramExtractWorker(results: *TriExtractResults, root: []const u8, entries: []const InitialScanEntry) void {
+    const alloc = results.arena.allocator();
+    const index_m = @import("index.zig");
+    var local = std.AutoHashMap(index_m.Trigram, index_m.PostingMask).init(std.heap.c_allocator);
+    defer local.deinit();
+    local.ensureTotalCapacity(4096) catch {};
+    for (entries) |entry| {
+        const r = readFileEntry(root, entry, alloc) orelse continue;
+        if (r.content.len > 64 * 1024) continue;
+        local.clearRetainingCapacity();
+        if (r.content.len >= 3) {
+            for (0..r.content.len - 2) |i| {
+                const c0 = r.content[i];
+                const c1 = r.content[i + 1];
+                const c2 = r.content[i + 2];
+                if ((c0 == ' ' or c0 == '\t' or c0 == '\n' or c0 == '\r') and
+                    (c1 == ' ' or c1 == '\t' or c1 == '\n' or c1 == '\r') and
+                    (c2 == ' ' or c2 == '\t' or c2 == '\n' or c2 == '\r')) continue;
+                const tri = index_m.packTrigram(index_m.normalizeChar(c0), index_m.normalizeChar(c1), index_m.normalizeChar(c2));
+                const gop = local.getOrPut(tri) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = index_m.PostingMask{};
+                gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                if (i + 3 < r.content.len) {
+                    gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(index_m.normalizeChar(r.content[i + 3]) % 8);
+                }
+            }
+        }
+        const tri_entries = alloc.alloc(TriExtractEntry, local.count()) catch continue;
+        var ti: usize = 0;
+        var iter = local.iterator();
+        while (iter.next()) |e| {
+            tri_entries[ti] = .{ .tri = e.key_ptr.*, .mask = e.value_ptr.* };
+            ti += 1;
+        }
+        results.items.append(alloc, .{ .path = r.path, .trigrams = tri_entries }) catch {};
+    }
+}
+
 pub fn initialScanWithTrigrams(
     store: *Store,
     explorer: *Explorer,
@@ -554,12 +606,12 @@ pub fn initialScanWithTrigrams(
     }
 
     if (skip_outlines) {
-        // Fast path: just read files + build trigrams, no outline parsing
-        const readers = try allocator.alloc(ReadResults, n_workers);
-        var readers_done: usize = 0;
+        // Fast path: read files + extract trigrams in parallel workers
+        const extractors = try allocator.alloc(TriExtractResults, n_workers);
+        var extractors_done: usize = 0;
         defer {
-            for (readers[readers_done..]) |*r| r.deinit(allocator);
-            allocator.free(readers);
+            for (extractors[extractors_done..]) |*r| r.deinit(allocator);
+            allocator.free(extractors);
         }
         const threads = try allocator.alloc(std.Thread, n_workers);
         defer allocator.free(threads);
@@ -567,29 +619,22 @@ pub fn initialScanWithTrigrams(
         const chunk_size = entries.items.len / n_workers;
         const remainder = entries.items.len % n_workers;
         var offset: usize = 0;
-        for (readers, 0..) |*reader, i| {
-            reader.* = ReadResults.init(std.heap.page_allocator);
+        for (extractors, 0..) |*ext, i| {
+            ext.* = TriExtractResults.init(std.heap.page_allocator);
             const extra: usize = if (i < remainder) 1 else 0;
             const count = chunk_size + extra;
             const chunk = entries.items[offset .. offset + count];
             offset += count;
-            threads[i] = try std.Thread.spawn(.{}, readWorker, .{ reader, root, chunk });
+            threads[i] = try std.Thread.spawn(.{}, trigramExtractWorker, .{ ext, root, chunk });
         }
         for (threads) |thread| thread.join();
 
-        // Reusable local HashMap — avoids alloc/free per file
-        var local_tri = std.AutoHashMap(TrigramIndex.Trigram, @import("index.zig").PostingMask).init(std.heap.c_allocator);
-        defer local_tri.deinit();
-        local_tri.ensureTotalCapacity(4096) catch {};
-
-        for (readers) |*reader| {
-            for (reader.items.items) |r| {
-                if (r.content.len <= 64 * 1024) {
-                    tmp_tri.indexFileReuse(r.path, r.content, &local_tri) catch {};
-                }
+        for (extractors) |*ext| {
+            for (ext.items.items) |r| {
+                tmp_tri.insertBulkNew(r.path, r.trigrams) catch {};
             }
-            reader.deinit(allocator);
-            readers_done += 1;
+            ext.deinit(allocator);
+            extractors_done += 1;
         }
     } else {
         // Full path: parse outlines + build trigrams

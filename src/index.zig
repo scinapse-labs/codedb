@@ -866,6 +866,23 @@ pub const TrigramIndex = struct {
         try self.file_trigrams.put(path, tri_list);
     }
 
+    pub const BulkEntry = struct { tri: Trigram, mask: PostingMask };
+
+    /// Lean bulk insert for cold builds: no removeFile, no file_trigrams tracking.
+    /// Assumes doc_id is always new (strictly increasing), so uses simple append.
+    pub fn insertBulkNew(self: *TrigramIndex, path: []const u8, trigrams: []const BulkEntry) !void {
+        const doc_id = try self.getOrCreateDocId(path);
+        for (trigrams) |te| {
+            const idx_gop = try self.index.getOrPut(te.tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
+            }
+            try idx_gop.value_ptr.items.append(self.allocator, .{
+                .doc_id = doc_id, .next_mask = te.mask.next_mask, .loc_mask = te.mask.loc_mask,
+            });
+        }
+    }
+
     /// Find candidate files that contain ALL trigrams from the query.
     pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.Allocator) ?[]const []const u8 {
         if (query.len < 3) return null;
@@ -1099,11 +1116,20 @@ pub const TrigramIndex = struct {
         var disk_path_to_id = std.StringHashMap(u32).init(self.allocator);
         defer disk_path_to_id.deinit();
 
-        var ft_iter = self.file_trigrams.keyIterator();
-        while (ft_iter.next()) |path_ptr| {
-            const id: u32 = @intCast(file_table.items.len);
-            try file_table.append(self.allocator, path_ptr.*);
-            try disk_path_to_id.put(path_ptr.*, id);
+        if (self.file_trigrams.count() > 0) {
+            var ft_iter = self.file_trigrams.keyIterator();
+            while (ft_iter.next()) |path_ptr| {
+                const id: u32 = @intCast(file_table.items.len);
+                try file_table.append(self.allocator, path_ptr.*);
+                try disk_path_to_id.put(path_ptr.*, id);
+            }
+        } else {
+            for (self.id_to_path.items) |path| {
+                if (path.len == 0) continue;
+                const id: u32 = @intCast(file_table.items.len);
+                try file_table.append(self.allocator, path);
+                try disk_path_to_id.put(path, id);
+            }
         }
 
         const file_count: u32 = @intCast(file_table.items.len);
