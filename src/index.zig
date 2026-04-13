@@ -767,6 +767,58 @@ pub const TrigramIndex = struct {
         try self.file_trigrams.put(path, tri_list);
     }
 
+    /// Like indexFile but reuses a caller-provided local HashMap to avoid alloc/free per file.
+    pub fn indexFileReuse(self: *TrigramIndex, path: []const u8, content: []const u8, local: *std.AutoHashMap(Trigram, PostingMask)) !void {
+        const id_count_before = self.id_to_path.items.len;
+        self.removeFile(path);
+        const doc_id = try self.getOrCreateDocId(path);
+        const is_new_doc = self.id_to_path.items.len > id_count_before;
+
+        // Phase 1: accumulate masks in reusable local map
+        local.clearRetainingCapacity();
+        if (content.len >= 3) {
+            for (0..content.len - 2) |i| {
+                const c0 = content[i];
+                const c1 = content[i + 1];
+                const c2 = content[i + 2];
+                if ((c0 == ' ' or c0 == '\t' or c0 == '\n' or c0 == '\r') and
+                    (c1 == ' ' or c1 == '\t' or c1 == '\n' or c1 == '\r') and
+                    (c2 == ' ' or c2 == '\t' or c2 == '\n' or c2 == '\r')) continue;
+                const tri = packTrigram(normalizeChar(c0), normalizeChar(c1), normalizeChar(c2));
+                const gop = try local.getOrPut(tri);
+                if (!gop.found_existing) gop.value_ptr.* = PostingMask{};
+                gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                if (i + 3 < content.len) {
+                    gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
+                }
+            }
+        }
+
+        // Phase 2: bulk-insert
+        var tri_list: std.ArrayList(Trigram) = .{};
+        errdefer tri_list.deinit(self.allocator);
+        var local_iter = local.iterator();
+        while (local_iter.next()) |entry| {
+            const tri = entry.key_ptr.*;
+            const mask = entry.value_ptr.*;
+            const idx_gop = try self.index.getOrPut(tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
+            }
+            if (is_new_doc) {
+                try idx_gop.value_ptr.items.append(self.allocator, .{
+                    .doc_id = doc_id, .next_mask = mask.next_mask, .loc_mask = mask.loc_mask,
+                });
+            } else {
+                const posting = try idx_gop.value_ptr.getOrAddPosting(self.allocator, doc_id);
+                posting.next_mask = mask.next_mask;
+                posting.loc_mask = mask.loc_mask;
+            }
+            try tri_list.append(self.allocator, tri);
+        }
+        try self.file_trigrams.put(path, tri_list);
+    }
+
     /// Extract trigrams from content — thread-safe, no shared state.
     pub fn extractTrigrams(content: []const u8, alloc: std.mem.Allocator) std.AutoHashMap(Trigram, PostingMask) {
         var local = std.AutoHashMap(Trigram, PostingMask).init(alloc);

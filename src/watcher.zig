@@ -531,6 +531,9 @@ pub fn initialScanWithTrigrams(
     // Single-worker fast path
     var tmp_tri = try trigram_alloc.create(TrigramIndex);
     tmp_tri.* = TrigramIndex.init(trigram_alloc);
+    // Pre-size to avoid resize copies during bulk insert (~99K unique trigrams typical)
+    tmp_tri.index.ensureTotalCapacity(131072) catch {};
+    tmp_tri.path_to_id.ensureTotalCapacity(@intCast(@min(entries.items.len, 65536))) catch {};
 
     if (n_workers == 1) {
         for (entries.items) |entry| {
@@ -574,10 +577,15 @@ pub fn initialScanWithTrigrams(
         }
         for (threads) |thread| thread.join();
 
+        // Reusable local HashMap — avoids alloc/free per file
+        var local_tri = std.AutoHashMap(TrigramIndex.Trigram, @import("index.zig").PostingMask).init(std.heap.c_allocator);
+        defer local_tri.deinit();
+        local_tri.ensureTotalCapacity(4096) catch {};
+
         for (readers) |*reader| {
             for (reader.items.items) |r| {
                 if (r.content.len <= 64 * 1024) {
-                    tmp_tri.indexFile(r.path, r.content) catch {};
+                    tmp_tri.indexFileReuse(r.path, r.content, &local_tri) catch {};
                 }
             }
             reader.deinit(allocator);
