@@ -19,6 +19,7 @@ const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
 const git_mod = @import("git.zig");
 const root_policy = @import("root_policy.zig");
+const release_info = @import("release_info.zig");
 // ── Project cache ────────────────────────────────────────────────────────────
 
 const ProjectCtx = struct {
@@ -198,6 +199,14 @@ const ProjectCache = struct {
         }
 
         loadProjectTrigramFromDiskIfPresent(&new_entry.explorer, p, self.alloc);
+
+        // Release raw file contents retained by the snapshot load — outlines,
+        // trigram index, and word index are sufficient for all query tools.
+        const fc = new_entry.explorer.outlines.count();
+        if (fc > 1000) {
+            new_entry.explorer.releaseContents();
+            new_entry.explorer.releaseSecondaryIndexes();
+        }
 
         // Find free slot or evict LRU
         var target_slot: usize = 0;
@@ -493,9 +502,11 @@ fn handleInitialize(s: *Session, root: *const std.json.ObjectMap, id: ?std.json.
             s.client_name = name;
         }
     }
-    writeResult(s.alloc, s.stdout, id,
-        \\{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"codedb","version":"0.2.56"}}
-    );
+    const init_result = std.fmt.allocPrint(s.alloc,
+        \\{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"codedb","version":"{s}"}}}}
+    , .{release_info.semver}) catch return;
+    defer s.alloc.free(init_result);
+    writeResult(s.alloc, s.stdout, id, init_result);
 }
 
 fn requestRoots(s: *Session) void {
@@ -883,8 +894,10 @@ fn handleWord(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
 
     const w = out.writer(alloc);
     w.print("{d} hits for '{s}':\n", .{ hits.len, word }) catch {};
+    explorer.mu.lockShared();
+    defer explorer.mu.unlockShared();
     for (hits) |h| {
-        w.print("  {s}:{d}\n", .{ h.path, h.line_num }) catch {};
+        w.print("  {s}:{d}\n", .{ explorer.word_index.hitPath(h), h.line_num }) catch {};
     }
 }
 

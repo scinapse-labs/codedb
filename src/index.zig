@@ -5,7 +5,7 @@ const compat = @import("compat.zig");
 // Maps word → list of (path, line) hits. O(1) word lookup.
 
 pub const WordHit = struct {
-    path: []const u8,
+    doc_id: u32,
     line_num: u32,
 };
 
@@ -14,14 +14,33 @@ pub const WordIndex = struct {
     index: std.StringHashMap(std.ArrayList(WordHit)),
     /// path → set of words contributed (for efficient re-index cleanup).
     /// WordIndex owns these path keys.
-    file_words: std.StringHashMap(std.StringHashMap(void)),
+    file_words: std.StringHashMap([]const []const u8),
     allocator: std.mem.Allocator,
+    skip_file_words: bool = false,
+    enabled: bool = true,
+    path_to_id: std.StringHashMap(u32),
+    id_to_path: std.ArrayList([]const u8),
+
+    pub fn hitPath(self: *const WordIndex, hit: WordHit) []const u8 {
+        if (hit.doc_id < self.id_to_path.items.len) return self.id_to_path.items[hit.doc_id];
+        return "";
+    }
+
+    fn getOrCreateDocId(self: *WordIndex, path: []const u8) !u32 {
+        if (self.path_to_id.get(path)) |id| return id;
+        const id: u32 = @intCast(self.id_to_path.items.len);
+        try self.id_to_path.append(self.allocator, path);
+        try self.path_to_id.put(path, id);
+        return id;
+    }
 
     pub fn init(allocator: std.mem.Allocator) WordIndex {
         return .{
             .index = std.StringHashMap(std.ArrayList(WordHit)).init(allocator),
-            .file_words = std.StringHashMap(std.StringHashMap(void)).init(allocator),
+            .file_words = std.StringHashMap([]const []const u8).init(allocator),
             .allocator = allocator,
+            .path_to_id = std.StringHashMap(u32).init(allocator),
+            .id_to_path = .{},
         };
     }
 
@@ -38,30 +57,43 @@ pub const WordIndex = struct {
         var fw_iter = self.file_words.iterator();
         while (fw_iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            self.allocator.free(entry.value_ptr.*);
         }
         self.file_words.deinit();
+
+        self.path_to_id.deinit();
+        self.id_to_path.deinit(self.allocator);
     }
 
     /// Remove all index entries for a file (call before re-indexing).
     pub fn removeFile(self: *WordIndex, path: []const u8) void {
         const removed = self.file_words.fetchRemove(path) orelse return;
         const stable_path = removed.key;
-        var words_set = removed.value;
+        const words_slice = removed.value;
+
+        const doc_id = self.path_to_id.get(stable_path) orelse {
+            self.allocator.free(words_slice);
+            self.allocator.free(stable_path);
+            return;
+        };
+        _ = self.path_to_id.remove(stable_path);
+        if (doc_id < self.id_to_path.items.len) {
+            self.id_to_path.items[doc_id] = "";
+        }
         defer {
-            words_set.deinit();
+            self.allocator.free(words_slice);
             self.allocator.free(stable_path);
         }
 
-        // For each word this file contributed, remove hits with this path.
+        // For each word this file contributed, remove hits with this doc_id.
         // Prune empty buckets so churn does not leak key/list entries.
-        var word_iter = words_set.keyIterator();
-        while (word_iter.next()) |word_ptr| {
+        for (words_slice) |word| {
+            const word_ptr = &word;
             if (self.index.getEntry(word_ptr.*)) |entry| {
                 const hits = entry.value_ptr;
                 var i: usize = 0;
                 while (i < hits.items.len) {
-                    if (std.mem.eql(u8, hits.items[i].path, stable_path)) {
+                    if (hits.items[i].doc_id == doc_id) {
                         _ = hits.swapRemove(i);
                     } else {
                         i += 1;
@@ -79,14 +111,22 @@ pub const WordIndex = struct {
 
     /// Index a file's content — tokenizes into words and records hits.
     pub fn indexFile(self: *WordIndex, path: []const u8, content: []const u8) !void {
+        if (!self.enabled) return;
         // Clean up old entries first
         self.removeFile(path);
 
         const stable_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(stable_path);
 
-        var words_set = std.StringHashMap(void).init(self.allocator);
-        errdefer words_set.deinit();
+        const doc_id = try self.getOrCreateDocId(stable_path);
+
+        // Use page_allocator-backed arena for words_set — pages are returned
+        // to the OS immediately when the arena is deinitialized, instead of
+        // being retained by the GPA (which caused ~1GB of page retention
+        // across 14K files of alloc/free churn).
+        var words_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer words_arena.deinit();
+        var words_set = std.StringHashMap(void).init(words_arena.allocator());
         var line_num: u32 = 0;
         var lines = std.mem.splitScalar(u8, content, '\n');
 
@@ -106,7 +146,7 @@ pub const WordIndex = struct {
 
                 if (gop.value_ptr.items.len > 0) {
                     const last = gop.value_ptr.items[gop.value_ptr.items.len - 1];
-                    if (std.mem.eql(u8, last.path, path) and last.line_num == line_num) {
+                    if (last.doc_id == doc_id and last.line_num == line_num) {
                         // Avoid duplicate hits for repeated words on the same line.
                         const wgop = try words_set.getOrPut(word);
                         if (!wgop.found_existing) wgop.key_ptr.* = gop.key_ptr.*;
@@ -115,7 +155,7 @@ pub const WordIndex = struct {
                 }
 
                 try gop.value_ptr.append(self.allocator, .{
-                    .path = stable_path,
+                    .doc_id = doc_id,
                     .line_num = line_num,
                 });
 
@@ -128,7 +168,17 @@ pub const WordIndex = struct {
             }
         }
 
-        try self.file_words.put(stable_path, words_set);
+        if (!self.skip_file_words) {
+            // Compact the HashMap to a simple slice — saves ~70KB per file
+            const compact = try self.allocator.alloc([]const u8, words_set.count());
+            var ki: usize = 0;
+            var wk_iter = words_set.keyIterator();
+            while (wk_iter.next()) |k| : (ki += 1) {
+                compact[ki] = k.*;
+            }
+            try self.file_words.put(stable_path, compact);
+        }
+        words_set.deinit();
     }
 
     /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
@@ -150,7 +200,7 @@ pub const WordIndex = struct {
             return out;
         }
 
-        const DedupKey = struct { path_ptr: usize, line_num: u32 };
+        const DedupKey = struct { doc_id: u32, line_num: u32 };
         var seen = std.AutoHashMap(DedupKey, void).init(allocator);
         defer seen.deinit();
         try seen.ensureTotalCapacity(@intCast(hits.len));
@@ -160,7 +210,7 @@ pub const WordIndex = struct {
         try result.ensureTotalCapacity(allocator, hits.len);
 
         for (hits) |hit| {
-            const key = DedupKey{ .path_ptr = @intFromPtr(hit.path.ptr), .line_num = hit.line_num };
+            const key = DedupKey{ .doc_id = hit.doc_id, .line_num = hit.line_num };
             const gop = try seen.getOrPut(key);
             if (!gop.found_existing) {
                 result.appendAssumeCapacity(hit);
@@ -171,6 +221,16 @@ pub const WordIndex = struct {
 
     pub fn fileCount(self: *WordIndex) u32 {
         return @intCast(self.file_words.count());
+    }
+
+    /// Shrink all hit lists and per-file word sets to release excess capacity.
+    pub fn shrinkAllocations(self: *WordIndex) void {
+        var iter = self.index.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.capacity > entry.value_ptr.items.len) {
+                entry.value_ptr.shrinkAndFree(self.allocator, entry.value_ptr.items.len);
+            }
+        }
     }
 
     pub const DiskHeader = struct {
@@ -254,7 +314,8 @@ pub const WordIndex = struct {
             std.mem.writeInt(u32, &hc_buf, @intCast(hits.items.len), .little);
             try writer.interface.writeAll(&hc_buf);
             for (hits.items) |hit| {
-                const file_id = disk_path_to_id.get(hit.path) orelse return error.InvalidData;
+                const hit_path = self.id_to_path.items[hit.doc_id];
+                const file_id = disk_path_to_id.get(hit_path) orelse return error.InvalidData;
                 var hit_buf: [8]u8 = undefined;
                 std.mem.writeInt(u32, hit_buf[0..4], file_id, .little);
                 std.mem.writeInt(u32, hit_buf[4..8], hit.line_num, .little);
@@ -313,6 +374,15 @@ pub const WordIndex = struct {
         var result = WordIndex.init(allocator);
         errdefer result.deinit();
 
+        // Temporary HashMap for accumulating file_words during load
+        // (compacted to slices below)
+        var tmp_file_words = std.StringHashMap(std.StringHashMap(void)).init(allocator);
+        defer {
+            var tfw_iter = tmp_file_words.iterator();
+            while (tfw_iter.next()) |entry| entry.value_ptr.deinit();
+            tmp_file_words.deinit();
+        }
+
         for (0..word_count) |_| {
             if (pos + 2 > data.len) return null;
             const word_len = std.mem.readInt(u16, data[pos..][0..2], .little);
@@ -339,16 +409,15 @@ pub const WordIndex = struct {
                 const line_num = std.mem.readInt(u32, data[pos..][0..4], .little);
                 pos += 4;
 
-                const stable_path = file_paths[file_id];
                 hits.appendAssumeCapacity(.{
-                    .path = stable_path,
+                    .doc_id = file_id,
                     .line_num = line_num,
                 });
 
                 if (last_file_id == null or last_file_id.? != file_id) {
-                    const fw_gop = try result.file_words.getOrPut(stable_path);
+                    const fw_gop = try tmp_file_words.getOrPut(file_paths[file_id]);
                     if (!fw_gop.found_existing) {
-                        fw_gop.key_ptr.* = stable_path;
+                        fw_gop.key_ptr.* = file_paths[file_id];
                         fw_gop.value_ptr.* = std.StringHashMap(void).init(allocator);
                         used_paths[file_id] = true;
                     }
@@ -365,6 +434,26 @@ pub const WordIndex = struct {
         }
 
         if (pos != data.len) return null;
+
+        // Populate path_to_id and id_to_path from file_paths
+        try result.id_to_path.ensureTotalCapacity(allocator, file_count);
+        for (0..file_count) |i| {
+            result.id_to_path.appendAssumeCapacity(file_paths[i]);
+            try result.path_to_id.put(file_paths[i], @intCast(i));
+        }
+
+        // Compact tmp_file_words HashMaps into slices for result.file_words
+        var tfw_iter = tmp_file_words.iterator();
+        while (tfw_iter.next()) |entry| {
+            const compact = try allocator.alloc([]const u8, entry.value_ptr.count());
+            var ki2: usize = 0;
+            var wk_iter2 = entry.value_ptr.keyIterator();
+            while (wk_iter2.next()) |k| : (ki2 += 1) {
+                compact[ki2] = k.*;
+            }
+            try result.file_words.put(entry.key_ptr.*, compact);
+        }
+
         return result;
     }
 
@@ -497,12 +586,17 @@ pub const PostingList = struct {
     }
 
     pub fn removeDocId(self: *PostingList, doc_id: u32) void {
-        var i: usize = 0;
-        while (i < self.items.items.len) {
-            if (self.items.items[i].doc_id == doc_id) {
-                _ = self.items.orderedRemove(i);
+        var lo: usize = 0;
+        var hi: usize = self.items.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.items.items[mid].doc_id < doc_id) {
+                lo = mid + 1;
+            } else if (self.items.items[mid].doc_id > doc_id) {
+                hi = mid;
             } else {
-                i += 1;
+                _ = self.items.orderedRemove(mid);
+                return;
             }
         }
     }
@@ -515,11 +609,17 @@ pub const TrigramIndex = struct {
     file_trigrams: std.StringHashMap(std.ArrayList(Trigram)),
     /// path → doc_id mapping
     path_to_id: std.StringHashMap(u32),
-    /// doc_id → path mapping
+    /// doc_id → path mapping (may contain "" sentinels for freed slots)
     id_to_path: std.ArrayList([]const u8),
+    /// freed doc_id slots available for reuse by getOrCreateDocId
+    free_ids: std.ArrayList(u32),
     allocator: std.mem.Allocator,
     /// When true, deinit frees the path keys in file_trigrams (set by readFromDisk).
     owns_paths: bool = false,
+
+    /// Maximum entries per posting list — caps memory for common trigrams.
+    /// Trigrams appearing in more files than this are poor discriminators anyway.
+    const MAX_POSTINGS: usize = 512;
 
     pub fn init(allocator: std.mem.Allocator) TrigramIndex {
         return .{
@@ -527,6 +627,7 @@ pub const TrigramIndex = struct {
             .file_trigrams = std.StringHashMap(std.ArrayList(Trigram)).init(allocator),
             .path_to_id = std.StringHashMap(u32).init(allocator),
             .id_to_path = .{},
+            .free_ids = .{},
             .allocator = allocator,
         };
     }
@@ -547,12 +648,20 @@ pub const TrigramIndex = struct {
 
         self.path_to_id.deinit();
         self.id_to_path.deinit(self.allocator);
+        self.free_ids.deinit(self.allocator);
     }
 
     fn getOrCreateDocId(self: *TrigramIndex, path: []const u8) !u32 {
         if (self.path_to_id.get(path)) |id| return id;
-        const id: u32 = @intCast(self.id_to_path.items.len);
-        try self.id_to_path.append(self.allocator, path);
+        const id: u32 = if (self.free_ids.items.len > 0) blk: {
+            const freed: u32 = self.free_ids.pop() orelse unreachable;
+            self.id_to_path.items[@as(usize, freed)] = path;
+            break :blk freed;
+        } else blk: {
+            const new_id: u32 = @intCast(self.id_to_path.items.len);
+            try self.id_to_path.append(self.allocator, path);
+            break :blk new_id;
+        };
         try self.path_to_id.put(path, id);
         return id;
     }
@@ -564,6 +673,11 @@ pub const TrigramIndex = struct {
             _ = self.file_trigrams.remove(path);
             return;
         };
+        // Always clean path_to_id first, regardless of whether file_trigrams has an entry.
+        _ = self.path_to_id.remove(path);
+        // Free the doc_id slot for reuse on next indexFile call.
+        self.free_ids.append(self.allocator, doc_id) catch {};
+        self.id_to_path.items[doc_id] = "";
         const trigrams = self.file_trigrams.getPtr(path) orelse return;
         for (trigrams.items) |tri| {
             if (self.index.getPtr(tri)) |posting_list| {
@@ -576,13 +690,17 @@ pub const TrigramIndex = struct {
         }
         trigrams.deinit(self.allocator);
         _ = self.file_trigrams.remove(path);
-        _ = self.path_to_id.remove(path);
     }
 
     pub fn indexFile(self: *TrigramIndex, path: []const u8, content: []const u8) !void {
+        const id_count_before = self.id_to_path.items.len;
         self.removeFile(path);
 
         const doc_id = try self.getOrCreateDocId(path);
+        // If id_to_path grew, this is a brand-new file (doc_id == max), so append
+        // maintains sorted PostingList order.  If it did not grow, a freed slot was
+        // reused and we must use sorted insert to preserve the invariant.
+        const is_new_doc = self.id_to_path.items.len > id_count_before;
 
         // Phase 1: accumulate masks locally per trigram (no global index writes)
         var local = std.AutoHashMap(Trigram, PostingMask).init(self.allocator);
@@ -630,16 +748,139 @@ pub const TrigramIndex = struct {
             if (!idx_gop.found_existing) {
                 idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
             }
-            // Single append (not sorted insert) since doc_id is monotonically increasing
-            try idx_gop.value_ptr.items.append(self.allocator, .{
-                .doc_id = doc_id,
-                .next_mask = mask.next_mask,
-                .loc_mask = mask.loc_mask,
-            });
+            if (is_new_doc) {
+                // New doc_id is always max: append maintains sorted PostingList order.
+                try idx_gop.value_ptr.items.append(self.allocator, .{
+                    .doc_id = doc_id,
+                    .next_mask = mask.next_mask,
+                    .loc_mask = mask.loc_mask,
+                });
+            } else {
+                // Reused doc_id: sorted insert to maintain PostingList binary-search invariant.
+                const posting = try idx_gop.value_ptr.getOrAddPosting(self.allocator, doc_id);
+                posting.next_mask = mask.next_mask;
+                posting.loc_mask = mask.loc_mask;
+            }
 
             try tri_list.append(self.allocator, tri);
         }
         try self.file_trigrams.put(path, tri_list);
+    }
+
+    /// Like indexFile but reuses a caller-provided local HashMap to avoid alloc/free per file.
+    pub fn indexFileReuse(self: *TrigramIndex, path: []const u8, content: []const u8, local: *std.AutoHashMap(Trigram, PostingMask)) !void {
+        const id_count_before = self.id_to_path.items.len;
+        self.removeFile(path);
+        const doc_id = try self.getOrCreateDocId(path);
+        const is_new_doc = self.id_to_path.items.len > id_count_before;
+
+        // Phase 1: accumulate masks in reusable local map
+        local.clearRetainingCapacity();
+        if (content.len >= 3) {
+            for (0..content.len - 2) |i| {
+                const c0 = content[i];
+                const c1 = content[i + 1];
+                const c2 = content[i + 2];
+                if ((c0 == ' ' or c0 == '\t' or c0 == '\n' or c0 == '\r') and
+                    (c1 == ' ' or c1 == '\t' or c1 == '\n' or c1 == '\r') and
+                    (c2 == ' ' or c2 == '\t' or c2 == '\n' or c2 == '\r')) continue;
+                const tri = packTrigram(normalizeChar(c0), normalizeChar(c1), normalizeChar(c2));
+                const gop = try local.getOrPut(tri);
+                if (!gop.found_existing) gop.value_ptr.* = PostingMask{};
+                gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                if (i + 3 < content.len) {
+                    gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
+                }
+            }
+        }
+
+        // Phase 2: bulk-insert
+        var tri_list: std.ArrayList(Trigram) = .{};
+        errdefer tri_list.deinit(self.allocator);
+        var local_iter = local.iterator();
+        while (local_iter.next()) |entry| {
+            const tri = entry.key_ptr.*;
+            const mask = entry.value_ptr.*;
+            const idx_gop = try self.index.getOrPut(tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
+            }
+            if (is_new_doc) {
+                try idx_gop.value_ptr.items.append(self.allocator, .{
+                    .doc_id = doc_id, .next_mask = mask.next_mask, .loc_mask = mask.loc_mask,
+                });
+            } else {
+                const posting = try idx_gop.value_ptr.getOrAddPosting(self.allocator, doc_id);
+                posting.next_mask = mask.next_mask;
+                posting.loc_mask = mask.loc_mask;
+            }
+            try tri_list.append(self.allocator, tri);
+        }
+        try self.file_trigrams.put(path, tri_list);
+    }
+
+    /// Extract trigrams from content — thread-safe, no shared state.
+    pub fn extractTrigrams(content: []const u8, alloc: std.mem.Allocator) std.AutoHashMap(Trigram, PostingMask) {
+        var local = std.AutoHashMap(Trigram, PostingMask).init(alloc);
+        const estimated = @max(@as(u32, 64), @as(u32, @intCast(@min(content.len / 4, 65536))));
+        local.ensureTotalCapacity(estimated) catch {};
+        if (content.len >= 3) {
+            for (0..content.len - 2) |i| {
+                const c0 = content[i];
+                const c1 = content[i + 1];
+                const c2 = content[i + 2];
+                if ((c0 == ' ' or c0 == '\t' or c0 == '\n' or c0 == '\r') and
+                    (c1 == ' ' or c1 == '\t' or c1 == '\n' or c1 == '\r') and
+                    (c2 == ' ' or c2 == '\t' or c2 == '\n' or c2 == '\r')) continue;
+                const tri = packTrigram(normalizeChar(c0), normalizeChar(c1), normalizeChar(c2));
+                const gop = local.getOrPut(tri) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = PostingMask{};
+                gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                if (i + 3 < content.len) {
+                    gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
+                }
+            }
+        }
+        return local;
+    }
+
+    /// Insert pre-extracted trigrams. NOT thread-safe.
+    pub fn insertExtracted(self: *TrigramIndex, path: []const u8, local: *std.AutoHashMap(Trigram, PostingMask)) !void {
+        self.removeFile(path);
+        const doc_id = try self.getOrCreateDocId(path);
+        var tri_list: std.ArrayList(Trigram) = .{};
+        errdefer tri_list.deinit(self.allocator);
+        var iter = local.iterator();
+        while (iter.next()) |entry| {
+            const tri = entry.key_ptr.*;
+            const mask = entry.value_ptr.*;
+            const idx_gop = try self.index.getOrPut(tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
+            }
+            try idx_gop.value_ptr.items.append(self.allocator, .{
+                .doc_id = doc_id, .next_mask = mask.next_mask, .loc_mask = mask.loc_mask,
+            });
+            try tri_list.append(self.allocator, tri);
+        }
+        try self.file_trigrams.put(path, tri_list);
+    }
+
+    pub const BulkEntry = struct { tri: Trigram, mask: PostingMask };
+
+    /// Lean bulk insert for cold builds: no removeFile, no file_trigrams tracking.
+    /// Assumes doc_id is always new (strictly increasing), so uses simple append.
+    pub fn insertBulkNew(self: *TrigramIndex, path: []const u8, trigrams: []const BulkEntry) !void {
+        const doc_id = try self.getOrCreateDocId(path);
+        for (trigrams) |te| {
+            const idx_gop = try self.index.getOrPut(te.tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = .{ .path_to_id = &self.path_to_id };
+            }
+            try idx_gop.value_ptr.items.append(self.allocator, .{
+                .doc_id = doc_id, .next_mask = te.mask.next_mask, .loc_mask = te.mask.loc_mask,
+            });
+        }
     }
 
     /// Find candidate files that contain ALL trigrams from the query.
@@ -875,11 +1116,20 @@ pub const TrigramIndex = struct {
         var disk_path_to_id = std.StringHashMap(u32).init(self.allocator);
         defer disk_path_to_id.deinit();
 
-        var ft_iter = self.file_trigrams.keyIterator();
-        while (ft_iter.next()) |path_ptr| {
-            const id: u32 = @intCast(file_table.items.len);
-            try file_table.append(self.allocator, path_ptr.*);
-            try disk_path_to_id.put(path_ptr.*, id);
+        if (self.file_trigrams.count() > 0) {
+            var ft_iter = self.file_trigrams.keyIterator();
+            while (ft_iter.next()) |path_ptr| {
+                const id: u32 = @intCast(file_table.items.len);
+                try file_table.append(self.allocator, path_ptr.*);
+                try disk_path_to_id.put(path_ptr.*, id);
+            }
+        } else {
+            for (self.id_to_path.items) |path| {
+                if (path.len == 0) continue;
+                const id: u32 = @intCast(file_table.items.len);
+                try file_table.append(self.allocator, path);
+                try disk_path_to_id.put(path, id);
+            }
         }
 
         const file_count: u32 = @intCast(file_table.items.len);
@@ -1140,6 +1390,24 @@ pub const TrigramIndex = struct {
     /// Returns the number of indexed files (for staleness checks).
     pub fn fileCount(self: *const TrigramIndex) u32 {
         return @intCast(self.file_trigrams.count());
+    }
+
+    /// Shrink all posting lists to their actual length, releasing excess capacity.
+    /// Call after bulk indexing to reclaim ArrayList over-allocation (~50% savings).
+    pub fn shrinkPostingLists(self: *TrigramIndex) void {
+        var iter = self.index.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.items.capacity > entry.value_ptr.items.items.len) {
+                entry.value_ptr.items.shrinkAndFree(self.allocator, entry.value_ptr.items.items.len);
+            }
+        }
+        // Also shrink file_trigrams lists
+        var ft_iter = self.file_trigrams.iterator();
+        while (ft_iter.next()) |entry| {
+            if (entry.value_ptr.capacity > entry.value_ptr.items.len) {
+                entry.value_ptr.shrinkAndFree(self.allocator, entry.value_ptr.items.len);
+            }
+        }
     }
 
     /// Header info that can be read without loading the full index.
@@ -1649,7 +1917,10 @@ pub const AnyTrigramIndex = union(enum) {
                 result.ensureTotalCapacity(allocator, merged.count()) catch break :blk null;
                 var it = merged.keyIterator();
                 while (it.next()) |k| result.appendAssumeCapacity(k.*);
-                break :blk result.toOwnedSlice(allocator) catch null;
+                break :blk result.toOwnedSlice(allocator) catch {
+                    result.deinit(allocator);
+                    break :blk null;
+                };
             },
         };
     }
@@ -1682,7 +1953,10 @@ pub const AnyTrigramIndex = union(enum) {
                 result.ensureTotalCapacity(allocator, merged.count()) catch break :blk null;
                 var it = merged.keyIterator();
                 while (it.next()) |k| result.appendAssumeCapacity(k.*);
-                break :blk result.toOwnedSlice(allocator) catch null;
+                break :blk result.toOwnedSlice(allocator) catch {
+                    result.deinit(allocator);
+                    break :blk null;
+                };
             },
         };
     }

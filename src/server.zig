@@ -513,10 +513,12 @@ fn handleConnection(
         w.writeAll("{\"query\":\"") catch return;
         writeJsonEscaped(w, word) catch return;
         w.writeAll("\",\"hits\":[") catch return;
+        explorer.mu.lockShared();
+        defer explorer.mu.unlockShared();
         for (hits, 0..) |h, i| {
             if (i > 0) w.writeAll(",") catch return;
             w.writeAll("{\"path\":\"") catch return;
-            writeJsonEscaped(w, h.path) catch return;
+            writeJsonEscaped(w, explorer.word_index.hitPath(h)) catch return;
             w.print("\",\"line\":{d}}}", .{h.line_num}) catch return;
         }
         w.writeAll("]}") catch return;

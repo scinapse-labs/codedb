@@ -32,6 +32,7 @@ const SymbolKind = explore.SymbolKind;
 const mcp_mod = @import("mcp.zig");
 const main_mod = @import("main.zig");
 const nuke_mod = @import("nuke.zig");
+const update_mod = @import("update.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
 // ── Store tests ─────────────────────────────────────────────
@@ -268,7 +269,7 @@ test "word index: index and search" {
 
     const hits = wi.search("hello");
     try testing.expect(hits.len > 0);
-    try testing.expectEqualStrings("src/foo.zig", hits[0].path);
+    try testing.expectEqualStrings("src/foo.zig", wi.hitPath(hits[0]));
     try testing.expect(hits[0].line_num == 1);
 
     // "x" is only 1 char, should be skipped
@@ -831,7 +832,7 @@ test "explorer: searchWord via inverted index" {
     const hits = try explorer.searchWord("add", testing.allocator);
     defer testing.allocator.free(hits);
     try testing.expect(hits.len > 0);
-    try testing.expectEqualStrings("math.zig", hits[0].path);
+    try testing.expectEqualStrings("math.zig", explorer.word_index.hitPath(hits[0]));
 }
 
 test "explorer: removeFile cleans up everything" {
@@ -2947,8 +2948,8 @@ test "disk word index: round-trip write and read preserves hits" {
     var found_main = false;
     var found_store = false;
     for (hits_after) |hit| {
-        if (std.mem.eql(u8, hit.path, "src/main.zig")) found_main = true;
-        if (std.mem.eql(u8, hit.path, "src/store.zig")) found_store = true;
+        if (std.mem.eql(u8, loaded_wi.hitPath(hit), "src/main.zig")) found_main = true;
+        if (std.mem.eql(u8, loaded_wi.hitPath(hit), "src/store.zig")) found_store = true;
     }
     try testing.expect(found_main);
     try testing.expect(found_store);
@@ -3481,12 +3482,12 @@ test "issue-220: partial word index state rebuilds before search" {
     const alpha_hits = try exp2.searchWord("Alpha", testing.allocator);
     defer testing.allocator.free(alpha_hits);
     try testing.expectEqual(@as(usize, 1), alpha_hits.len);
-    try testing.expect(std.mem.eql(u8, alpha_hits[0].path, "src/a.zig"));
+    try testing.expect(std.mem.eql(u8, exp2.word_index.hitPath(alpha_hits[0]), "src/a.zig"));
 
     const gamma_hits = try exp2.searchWord("Gamma", testing.allocator);
     defer testing.allocator.free(gamma_hits);
     try testing.expectEqual(@as(usize, 1), gamma_hits.len);
-    try testing.expect(std.mem.eql(u8, gamma_hits[0].path, "src/b.zig"));
+    try testing.expect(std.mem.eql(u8, exp2.word_index.hitPath(gamma_hits[0]), "src/b.zig"));
     try testing.expect(exp2.wordIndexIsComplete());
     try testing.expect(exp2.wordIndexNeedsPersist());
 }
@@ -4756,6 +4757,10 @@ test "issue-150: --help prints usage" {
     try testing.expect(result.term.Exited == 0);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
         std.mem.indexOf(u8, result.stderr, "usage:") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "update") != null or
+        std.mem.indexOf(u8, result.stderr, "update") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "nuke") != null or
+        std.mem.indexOf(u8, result.stderr, "nuke") != null);
 }
 
 test "issue-150: -h prints usage" {
@@ -4782,6 +4787,50 @@ test "issue-150: -h prints usage" {
     try testing.expect(result.term.Exited == 0);
     try testing.expect(std.mem.indexOf(u8, result.stdout, "usage:") != null or
         std.mem.indexOf(u8, result.stderr, "usage:") != null);
+}
+
+test "update: compareVersions orders semantic versions" {
+    try testing.expect(try update_mod.compareVersions("0.2.55", "0.2.56") == .lt);
+    try testing.expect(try update_mod.compareVersions("0.2.56", "0.2.56") == .eq);
+    try testing.expect(try update_mod.compareVersions("v0.2.57", "0.2.56") == .gt);
+    try testing.expect(try update_mod.compareVersions("0.2.56", "0.2.56.0") == .eq);
+}
+
+test "update: checksumForBinary parses release manifest" {
+    const manifest =
+        \\7be38140d090b2e23723c8cde02be150171c818daa16b18c520b44cc1e078add  codedb-darwin-arm64
+        \\76bc7b81bc9fd211aa2c1ac59d1d26e8c80bc211ab560de2dc998ea9e04ec471  codedb-darwin-x86_64
+        \\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  *codedb-linux-arm64
+    ;
+
+    try testing.expectEqualStrings(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        update_mod.checksumForBinary(manifest, "codedb-linux-arm64") orelse return error.TestUnexpectedResult,
+    );
+    try testing.expect(update_mod.checksumForBinary(manifest, "codedb-linux-x86_64") == null);
+}
+
+test "update: asset names match published release naming" {
+    try testing.expectEqualStrings("codedb-darwin-arm64", update_mod.assetNameForTarget(.macos, .aarch64).?);
+    try testing.expectEqualStrings("codedb-darwin-x86_64", update_mod.assetNameForTarget(.macos, .x86_64).?);
+    try testing.expectEqualStrings("codedb-linux-arm64", update_mod.assetNameForTarget(.linux, .aarch64).?);
+    try testing.expectEqualStrings("codedb-linux-x86_64", update_mod.assetNameForTarget(.linux, .x86_64).?);
+    try testing.expect(update_mod.assetNameForTarget(.windows, .x86_64) == null);
+}
+
+test "nuke: commandTargetsBinary only matches the current install path" {
+    try testing.expect(nuke_mod.commandTargetsBinary(
+        "/tmp/codedb-test/bin/codedb serve",
+        "/tmp/codedb-test/bin/codedb",
+    ));
+    try testing.expect(nuke_mod.commandTargetsBinary(
+        "/var/folders/example/codedb serve",
+        "/private/var/folders/example/codedb",
+    ));
+    try testing.expect(!nuke_mod.commandTargetsBinary(
+        "/Users/rachpradhan/bin/codedb --mcp",
+        "/tmp/codedb-test/bin/codedb",
+    ));
 }
 
 test "nuke: removeJsonMcpServerEntry drops only codedb integration" {
@@ -5610,3 +5659,436 @@ test "issue-179: Python docstring with text does not leak symbols" {
     try testing.expect(found_real);
     try testing.expect(!found_fake);
 }
+
+// ── New bug / perf regression tests ─────────────────────────────────────
+
+test "issue-246: TrigramIndex.removeFile cleans stale path_to_id left by failed indexFile" {
+    // Reproduces the corrupted state an OOM mid-way through indexFile leaves:
+    //   removeFile cleared file_trigrams, getOrCreateDocId wrote to path_to_id,
+    //   then an allocation failure meant file_trigrams.put never completed.
+    // Fix: removeFile must purge path_to_id even when file_trigrams has no entry.
+    var idx = TrigramIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    // Plant the invariant-violating state OOM would leave behind.
+    try idx.path_to_id.put("ghost.zig", 0);
+    try idx.id_to_path.append(testing.allocator, "ghost.zig");
+    // file_trigrams intentionally has NO entry for "ghost.zig".
+
+    idx.removeFile("ghost.zig");
+
+    // Currently FAILS: removeFile returns early at the second file_trigrams.getPtr
+    // check, leaving path_to_id permanently dirty.
+    try testing.expectEqual(@as(usize, 0), idx.path_to_id.count());
+}
+
+test "issue-247: TrigramIndex.id_to_path does not grow on re-index of same file" {
+    // removeFile removes path_to_id[path] but leaves the id_to_path slot intact.
+    // getOrCreateDocId then appends a new slot since path_to_id misses.
+    // After N re-indexes id_to_path.items.len must equal the number of *unique* files.
+    var idx = TrigramIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    const src = "fn alpha() void {} fn beta() void {} const X = 1;";
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try idx.indexFile("f.zig", src);
+    }
+
+    // Currently FAILS: id_to_path.items.len == 5 (grows by 1 per re-index).
+    try testing.expectEqual(@as(usize, 1), idx.id_to_path.items.len);
+}
+
+test "issue-227: TrigramIndex.id_to_path stays bounded across many files re-indexed" {
+    // Broader regression: ensure re-indexing multiple distinct files also doesn't
+    // accumulate dead id_to_path slots.
+    var idx = TrigramIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    const files = [_][]const u8{ "a.zig", "b.zig", "c.zig" };
+    var round: usize = 0;
+    while (round < 4) : (round += 1) {
+        for (files) |f| try idx.indexFile(f, "fn foo() void {}");
+    }
+
+    // 3 unique files × 4 rounds = 12 slots currently; fix should keep it at 3.
+    try testing.expectEqual(@as(usize, files.len), idx.id_to_path.items.len);
+}
+
+test "issue-248: PostingList.removeDocId removes target and preserves sorted order" {
+    // Documents the correctness contract for the O(log n) binary-search replacement.
+    // Currently correct but O(n); fix replaces linear scan with bsearch + single remove.
+    const PostingList = @import("index.zig").PostingList;
+    var list = PostingList{};
+    defer list.items.deinit(testing.allocator);
+
+    var id: u32 = 0;
+    while (id < 100) : (id += 1) {
+        const p = try list.getOrAddPosting(testing.allocator, id * 2); // even doc_ids 0..198
+        p.loc_mask = 0xFF;
+    }
+
+    list.removeDocId(50);
+    try testing.expectEqual(@as(usize, 99), list.items.items.len);
+    try testing.expect(list.getByDocId(48) != null);
+    try testing.expect(list.getByDocId(50) == null);
+    try testing.expect(list.getByDocId(52) != null);
+
+    // Sorted invariant must hold after removal.
+    for (1..list.items.items.len) |k| {
+        try testing.expect(list.items.items[k].doc_id > list.items.items[k - 1].doc_id);
+    }
+}
+
+test "issue-249: nuke.removeJsonMcpServerEntry returns null when key absent" {
+    // Verifies removeJsonMcpServerEntry does not signal a write when key is absent,
+    // which ensures the non-atomic rewriteConfigFile path is never triggered unnecessarily.
+    const result = try nuke_mod.removeJsonMcpServerEntry(testing.allocator, "{\"other\":1}", "codedb");
+    try testing.expect(result == null);
+}
+
+test "issue-250: searchContent finds content in files skipped by trigram index" {
+    // Files indexed with skip_trigram=true (e.g. past the 15k cap) must still be
+    // reachable via the fallback full-scan path in searchContent.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFileSkipTrigram("large.zig", "fn unique_zzz_sentinel() void {}");
+
+    const results = try explorer.searchContent("unique_zzz_sentinel", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expectEqual(@as(usize, 1), results.len);
+}
+
+test "snapshot: symbol detail longer than 4096 bytes survives round-trip" {
+    // Regression for readSectionString rejecting names/details > 4096 bytes.
+    // Before the fix max_len was 4096; any detail longer than that triggered
+    // error.InvalidData and loadSnapshot returned false.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Build a Zig source whose first function line exceeds 4 096 characters.
+    var src: std.ArrayList(u8) = .{};
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "pub fn bigSig(");
+    var param_i: usize = 0;
+    while (src.items.len < 5000) : (param_i += 1) {
+        var pb: [20]u8 = undefined;
+        const ps = std.fmt.bufPrint(&pb, "p{d}: u8, ", .{param_i}) catch break;
+        try src.appendSlice(testing.allocator, ps);
+    }
+    try src.appendSlice(testing.allocator, ") void {}\n");
+    try testing.expect(src.items.len > 4096); // guard: ensure we actually generated a long line
+    var exp = Explorer.init(aa);
+    try exp.indexFile("src/big.zig", src.items);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/big.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator);
+    defer exp2.deinit();
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store2, testing.allocator);
+    try testing.expect(loaded); // must survive long detail
+
+    var sym_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer sym_arena.deinit();
+    const results = try exp2.findAllSymbols("bigSig", sym_arena.allocator());
+    try testing.expect(results.len >= 1);
+}
+
+test "snapshot: corrupted OUTLINE_STATE section falls back to CONTENT load" {
+    // Regression for the codedb 0.2.56 writer u16 overflow bug: when OUTLINE_STATE
+    // contains a detail that overflows u16 the section cursor de-syncs, making
+    // subsequent file records parse as garbage and loadOutlineStateMap throws.
+    // The catch fallback must produce an empty map so loadSnapshotFast falls
+    // through to indexFileOutlineOnly for every file in CONTENT.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa);
+    try exp.indexFile("src/a.zig", "pub fn aFunc() void {}\n");
+    try exp.indexFile("src/b.zig", "pub fn bFunc() void {}\n");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/corrupt.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+    try snapshot_mod.writeSnapshot(&exp, dir_path, snap_path, testing.allocator);
+
+    // Overwrite the first 16 bytes of OUTLINE_STATE data with 0xFF.
+    // This makes the file_count field read as 0xFFFFFFFF — far more records
+    // than the data contains — causing readSectionString to eventually fail
+    // with error.InvalidData (runs off the end of the bytes slice).
+    {
+        var sections = (try snapshot_mod.readSections(snap_path, testing.allocator)).?;
+        defer sections.deinit();
+        const ols = sections.get(@intFromEnum(snapshot_mod.SectionId.outline_state)) orelse return;
+        const f = try std.fs.cwd().openFile(snap_path, .{ .mode = .read_write });
+        defer f.close();
+        try f.seekTo(ols.offset);
+        try f.writeAll(&([_]u8{0xFF} ** 16));
+    }
+
+    var exp2 = Explorer.init(testing.allocator);
+    defer exp2.deinit();
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(snap_path, &exp2, &store2, testing.allocator);
+    try testing.expect(loaded); // must survive OUTLINE_STATE corruption
+
+    // Symbols must still be found — re-indexed from CONTENT
+    var sym_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer sym_arena.deinit();
+    const results = try exp2.findAllSymbols("aFunc", sym_arena.allocator());
+    try testing.expect(results.len >= 1);
+}
+
+test "issue-224: codedb_symbol body=true returns full body — line_end populated" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("t.zig",
+        \\pub fn foo() u32 {
+        \\    const a: u32 = 1;
+        \\    const b: u32 = 2;
+        \\    return a + b;
+        \\}
+    );
+
+    const results = try explorer.findAllSymbols("foo", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+
+    const sym = results[0].symbol;
+    try testing.expectEqual(@as(u32, 1), sym.line_start);
+    try testing.expectEqual(@as(u32, 5), sym.line_end);
+
+    const body = (try explorer.getSymbolBody("t.zig", sym.line_start, sym.line_end, alloc)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, body, "pub fn foo()") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "return a + b;") != null);
+}
+
+test "issue-224: Python def line_end covers full body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("t.py",
+        \\def greet(name):
+        \\    msg = "hello"
+        \\    return msg + name
+    );
+
+    const results = try explorer.findAllSymbols("greet", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+
+    const sym = results[0].symbol;
+    try testing.expectEqual(@as(u32, 1), sym.line_start);
+    try testing.expectEqual(@as(u32, 3), sym.line_end);
+}
+
+test "issue-108: HCL resource block parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\resource "aws_instance" "web" {
+        \\  ami = "abc-123"
+        \\}
+    );
+    const results = try explorer.findAllSymbols("web", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+    try testing.expectEqual(SymbolKind.struct_def, results[0].symbol.kind);
+}
+
+test "issue-108: HCL variable and output parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("vars.tf",
+        \\variable "region" {
+        \\  default = "us-east-1"
+        \\}
+        \\output "ip" {
+        \\  value = aws_instance.web.public_ip
+        \\}
+    );
+    const vars = try explorer.findAllSymbols("region", alloc);
+    defer alloc.free(vars);
+    try testing.expect(vars.len == 1);
+    try testing.expectEqual(SymbolKind.variable, vars[0].symbol.kind);
+    const outs = try explorer.findAllSymbols("ip", alloc);
+    defer alloc.free(outs);
+    try testing.expect(outs.len == 1);
+    try testing.expectEqual(SymbolKind.constant, outs[0].symbol.kind);
+}
+
+test "issue-108: HCL module and provider parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\provider "aws" {
+        \\  region = "us-east-1"
+        \\}
+        \\module "vpc" {
+        \\  source = "./modules/vpc"
+        \\}
+    );
+    const providers = try explorer.findAllSymbols("aws", alloc);
+    defer alloc.free(providers);
+    try testing.expect(providers.len == 1);
+    const mods = try explorer.findAllSymbols("vpc", alloc);
+    defer alloc.free(mods);
+    try testing.expect(mods.len == 1);
+}
+
+test "issue-108: HCL comment lines skipped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\# This is a comment
+        \\// Another comment
+        \\variable "name" {}
+    );
+    const results = try explorer.findAllSymbols("name", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+}
+
+test "issue-108: detectLanguage handles .tf and .tfvars" {
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("main.tf"));
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("prod.tfvars"));
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("config.hcl"));
+}
+
+test "issue-215: R function assignment parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("analysis.R",
+        \\greet <- function(name) {
+        \\  paste("Hello", name)
+        \\}
+    );
+    const results = try explorer.findAllSymbols("greet", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+    try testing.expectEqual(SymbolKind.function, results[0].symbol.kind);
+}
+
+test "issue-215: R library import parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("script.r",
+        \\library(dplyr)
+        \\require(ggplot2)
+    );
+    const outline = try explorer.getOutline("script.r", alloc) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
+}
+
+test "issue-215: R setClass parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("classes.R",
+        \\setClass("Person")
+        \\setRefClass("Animal")
+    );
+    const p = try explorer.findAllSymbols("Person", alloc);
+    defer alloc.free(p);
+    try testing.expect(p.len == 1);
+    try testing.expectEqual(SymbolKind.class_def, p[0].symbol.kind);
+    const a2 = try explorer.findAllSymbols("Animal", alloc);
+    defer alloc.free(a2);
+    try testing.expect(a2.len == 1);
+}
+
+test "issue-215: detectLanguage handles .r and .R" {
+    try testing.expectEqual(Language.r, explore.detectLanguage("script.r"));
+    try testing.expectEqual(Language.r, explore.detectLanguage("analysis.R"));
+}
+
+test "issue-179: Python inline docstring does not leak symbols" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("mod.py",
+        \\def real_func():
+        \\    """This docstring contains def fake(): pass"""
+        \\    return 1
+    );
+
+    const real = try explorer.findAllSymbols("real_func", alloc);
+    defer alloc.free(real);
+    try testing.expect(real.len == 1);
+
+    const fake = try explorer.findAllSymbols("fake", alloc);
+    defer alloc.free(fake);
+    try testing.expectEqual(@as(usize, 0), fake.len);
+}
+
+test "issue-179: Python multi-line docstring with def inside" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("doc.py",
+        \\def outer():
+        \\    """
+        \\    Example:
+        \\        def inner_example():
+        \\            pass
+        \\    """
+        \\    return True
+    );
+
+    const outer = try explorer.findAllSymbols("outer", alloc);
+    defer alloc.free(outer);
+    try testing.expect(outer.len == 1);
+
+    const inner = try explorer.findAllSymbols("inner_example", alloc);
+    defer alloc.free(inner);
+    try testing.expectEqual(@as(usize, 0), inner.len);
+}
+

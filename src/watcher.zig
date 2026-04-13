@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("compat.zig");
 const Store = @import("store.zig").Store;
 const Explorer = @import("explore.zig").Explorer;
+const TrigramIndex = @import("index.zig").TrigramIndex;
 const explore_mod = @import("explore.zig");
 const git_mod = @import("git.zig");
 pub const EventKind = enum(u8) {
@@ -37,20 +38,19 @@ pub const EventQueue = struct {
     const CAPACITY = 4096;
 
     events: [CAPACITY]?FsEvent = [_]?FsEvent{null} ** CAPACITY,
-    head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    head: usize = 0,
+    tail: usize = 0,
     mu: std.Thread.Mutex = .{},
 
     pub fn push(self: *EventQueue, event: FsEvent) bool {
         self.mu.lock();
         defer self.mu.unlock();
 
-        // Mutex provides the memory ordering guarantee; .monotonic is sufficient here.
-        const cur_tail = self.tail.load(.monotonic);
+        const cur_tail = self.tail;
         const next_tail = (cur_tail + 1) % CAPACITY;
-        if (next_tail == self.head.load(.monotonic)) return false;
+        if (next_tail == self.head) return false;
         self.events[cur_tail] = event;
-        self.tail.store(next_tail, .monotonic);
+        self.tail = next_tail;
         return true;
     }
 
@@ -58,11 +58,10 @@ pub const EventQueue = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        // Mutex provides the memory ordering guarantee; .monotonic is sufficient here.
-        const cur_head = self.head.load(.monotonic);
-        if (cur_head == self.tail.load(.monotonic)) return null;
+        const cur_head = self.head;
+        if (cur_head == self.tail) return null;
         const event = self.events[cur_head];
-        self.head.store((cur_head + 1) % CAPACITY, .monotonic);
+        self.head = (cur_head + 1) % CAPACITY;
         return event;
     }
 };
@@ -149,6 +148,7 @@ const skip_dirs = [_][]const u8{
     ".bundle",
     ".swc",
     ".terraform",
+    ".terragrunt-cache",
     ".serverless",
     "elm-stuff",
     ".stack-work",
@@ -420,7 +420,7 @@ pub fn initialScanWithWorkerCount(store: *Store, explorer: *Explorer, root: []co
     if (n_workers == 1) {
         for (entries.items) |entry| {
             {
-                var arena = std.heap.ArenaAllocator.init(allocator);
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 const parsed = try parseInitialScanEntry(root, entry, arena.allocator());
                 if (parsed) |file| {
@@ -432,8 +432,10 @@ pub fn initialScanWithWorkerCount(store: *Store, explorer: *Explorer, root: []co
     }
 
     const workers = try allocator.alloc(WorkerParsedResults, n_workers);
+    var workers_committed: usize = 0;
     defer {
-        for (workers) |*worker| worker.deinit(allocator);
+        // Free any workers not yet committed (on error path)
+        for (workers[workers_committed..]) |*worker| worker.deinit(allocator);
         allocator.free(workers);
     }
     const threads = try allocator.alloc(std.Thread, n_workers);
@@ -443,7 +445,7 @@ pub fn initialScanWithWorkerCount(store: *Store, explorer: *Explorer, root: []co
     const remainder = entries.items.len % n_workers;
     var offset: usize = 0;
     for (workers, 0..) |*worker, i| {
-        worker.* = WorkerParsedResults.init(allocator);
+        worker.* = WorkerParsedResults.init(std.heap.page_allocator);
         const extra: usize = if (i < remainder) 1 else 0;
         const count = chunk_size + extra;
         const chunk = entries.items[offset .. offset + count];
@@ -456,7 +458,220 @@ pub fn initialScanWithWorkerCount(store: *Store, explorer: *Explorer, root: []co
         for (worker.items.items) |file| {
             try explorer.commitParsedFileOwnedOutline(file.path, file.content, file.outline, true, file.skip_trigram);
         }
+        // Free this worker's arena immediately — releases pages to OS,
+        // prevents holding all workers' content simultaneously.
+        worker.deinit(allocator);
+        workers_committed += 1;
     }
+}
+
+/// Fast scan: walk + parse outlines + build trigrams in one pass.
+/// Avoids re-reading files for trigram build. Returns a TrigramIndex
+/// allocated with the given trigram_alloc (caller owns).
+fn readFileEntry(root: []const u8, entry: InitialScanEntry, arena_alloc: std.mem.Allocator) ?struct { path: []const u8, content: []const u8 } {
+    if (shouldSkipFile(entry.path)) return null;
+    var dir = std.fs.cwd().openDir(root, .{}) catch return null;
+    defer dir.close();
+    const file = dir.openFile(entry.path, .{}) catch return null;
+    defer file.close();
+    const stat = compat.fileStat(file) catch return null;
+    if (stat.size > 512 * 1024) return null;
+    const c = file.readToEndAlloc(arena_alloc, 512 * 1024) catch return null;
+    const check_len = @min(c.len, 512);
+    for (c[0..check_len]) |ch| {
+        if (ch == 0) return null;
+    }
+    return .{ .path = entry.path, .content = c };
+}
+
+const ReadResult = struct { path: []const u8, content: []const u8 };
+const ReadResults = struct {
+    arena: std.heap.ArenaAllocator,
+    items: std.ArrayList(ReadResult),
+
+    fn init(backing: std.mem.Allocator) ReadResults {
+        return .{ .arena = std.heap.ArenaAllocator.init(backing), .items = .{} };
+    }
+    fn deinit(self: *ReadResults, _: std.mem.Allocator) void {
+        self.items.deinit(self.arena.allocator());
+        self.arena.deinit();
+    }
+};
+
+fn readWorker(results: *ReadResults, root: []const u8, entries: []const InitialScanEntry) void {
+    const alloc = results.arena.allocator();
+    for (entries) |entry| {
+        if (readFileEntry(root, entry, alloc)) |r| {
+            results.items.append(alloc, r) catch {};
+        }
+    }
+}
+
+const TriExtractEntry = TrigramIndex.BulkEntry;
+const TriExtractResult = struct { path: []const u8, trigrams: []TriExtractEntry };
+const TriExtractResults = struct {
+    arena: std.heap.ArenaAllocator,
+    items: std.ArrayList(TriExtractResult),
+    fn init(backing: std.mem.Allocator) TriExtractResults {
+        return .{ .arena = std.heap.ArenaAllocator.init(backing), .items = .{} };
+    }
+    fn deinit(self: *TriExtractResults, _: std.mem.Allocator) void {
+        self.items.deinit(self.arena.allocator());
+        self.arena.deinit();
+    }
+};
+
+fn trigramExtractWorker(results: *TriExtractResults, root: []const u8, entries: []const InitialScanEntry) void {
+    const alloc = results.arena.allocator();
+    const index_m = @import("index.zig");
+    var local = std.AutoHashMap(index_m.Trigram, index_m.PostingMask).init(std.heap.c_allocator);
+    defer local.deinit();
+    local.ensureTotalCapacity(4096) catch {};
+    for (entries) |entry| {
+        const r = readFileEntry(root, entry, alloc) orelse continue;
+        if (r.content.len > 64 * 1024) continue;
+        local.clearRetainingCapacity();
+        if (r.content.len >= 3) {
+            for (0..r.content.len - 2) |i| {
+                const c0 = r.content[i];
+                const c1 = r.content[i + 1];
+                const c2 = r.content[i + 2];
+                if ((c0 == ' ' or c0 == '\t' or c0 == '\n' or c0 == '\r') and
+                    (c1 == ' ' or c1 == '\t' or c1 == '\n' or c1 == '\r') and
+                    (c2 == ' ' or c2 == '\t' or c2 == '\n' or c2 == '\r')) continue;
+                const tri = index_m.packTrigram(index_m.normalizeChar(c0), index_m.normalizeChar(c1), index_m.normalizeChar(c2));
+                const gop = local.getOrPut(tri) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = index_m.PostingMask{};
+                gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                if (i + 3 < r.content.len) {
+                    gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(index_m.normalizeChar(r.content[i + 3]) % 8);
+                }
+            }
+        }
+        const tri_entries = alloc.alloc(TriExtractEntry, local.count()) catch continue;
+        var ti: usize = 0;
+        var iter = local.iterator();
+        while (iter.next()) |e| {
+            tri_entries[ti] = .{ .tri = e.key_ptr.*, .mask = e.value_ptr.* };
+            ti += 1;
+        }
+        results.items.append(alloc, .{ .path = r.path, .trigrams = tri_entries }) catch {};
+    }
+}
+
+pub fn initialScanWithTrigrams(
+    store: *Store,
+    explorer: *Explorer,
+    root: []const u8,
+    allocator: std.mem.Allocator,
+    trigram_alloc: std.mem.Allocator,
+    skip_outlines: bool,
+) !?*TrigramIndex {
+    var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
+    defer dir.close();
+
+    var entries = try collectInitialScanEntries(store, dir, allocator, true);
+    defer {
+        for (entries.items) |entry| allocator.free(entry.path);
+        entries.deinit(allocator);
+    }
+    if (entries.items.len == 0) return null;
+
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const n_workers = @max(@as(usize, 1), @min(@as(usize, @intCast(cpu_count)), @min(entries.items.len, 8)));
+
+    // Single-worker fast path
+    var tmp_tri = try trigram_alloc.create(TrigramIndex);
+    tmp_tri.* = TrigramIndex.init(trigram_alloc);
+    // Pre-size to avoid resize copies during bulk insert (~99K unique trigrams typical)
+    tmp_tri.index.ensureTotalCapacity(131072) catch {};
+    tmp_tri.path_to_id.ensureTotalCapacity(@intCast(@min(entries.items.len, 65536))) catch {};
+
+    if (n_workers == 1) {
+        for (entries.items) |entry| {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const parsed = parseInitialScanEntry(root, entry, arena.allocator()) catch null;
+            if (parsed) |file| {
+                if (!skip_outlines) {
+                    explorer.commitParsedFileOwnedOutline(file.path, file.content, file.outline, true, true) catch continue;
+                }
+                // Build trigrams from same content — no re-read needed
+                if (file.content.len <= 64 * 1024) {
+                    tmp_tri.indexFile(file.path, file.content) catch {};
+                }
+            }
+        }
+        return tmp_tri;
+    }
+
+    if (skip_outlines) {
+        // Fast path: read files + extract trigrams in parallel workers
+        const extractors = try allocator.alloc(TriExtractResults, n_workers);
+        var extractors_done: usize = 0;
+        defer {
+            for (extractors[extractors_done..]) |*r| r.deinit(allocator);
+            allocator.free(extractors);
+        }
+        const threads = try allocator.alloc(std.Thread, n_workers);
+        defer allocator.free(threads);
+
+        const chunk_size = entries.items.len / n_workers;
+        const remainder = entries.items.len % n_workers;
+        var offset: usize = 0;
+        for (extractors, 0..) |*ext, i| {
+            ext.* = TriExtractResults.init(std.heap.page_allocator);
+            const extra: usize = if (i < remainder) 1 else 0;
+            const count = chunk_size + extra;
+            const chunk = entries.items[offset .. offset + count];
+            offset += count;
+            threads[i] = try std.Thread.spawn(.{}, trigramExtractWorker, .{ ext, root, chunk });
+        }
+        for (threads) |thread| thread.join();
+
+        for (extractors) |*ext| {
+            for (ext.items.items) |r| {
+                tmp_tri.insertBulkNew(r.path, r.trigrams) catch {};
+            }
+            ext.deinit(allocator);
+            extractors_done += 1;
+        }
+    } else {
+        // Full path: parse outlines + build trigrams
+        const workers = try allocator.alloc(WorkerParsedResults, n_workers);
+        var workers_committed: usize = 0;
+        defer {
+            for (workers[workers_committed..]) |*worker| worker.deinit(allocator);
+            allocator.free(workers);
+        }
+        const threads = try allocator.alloc(std.Thread, n_workers);
+        defer allocator.free(threads);
+
+        const chunk_size = entries.items.len / n_workers;
+        const remainder = entries.items.len % n_workers;
+        var offset: usize = 0;
+        for (workers, 0..) |*worker, i| {
+            worker.* = WorkerParsedResults.init(std.heap.page_allocator);
+            const extra: usize = if (i < remainder) 1 else 0;
+            const count = chunk_size + extra;
+            const chunk = entries.items[offset .. offset + count];
+            offset += count;
+            threads[i] = try std.Thread.spawn(.{}, initialScanWorker, .{ worker, root, chunk });
+        }
+        for (threads) |thread| thread.join();
+
+        for (workers) |*worker| {
+            for (worker.items.items) |file| {
+                explorer.commitParsedFileOwnedOutline(file.path, file.content, file.outline, true, true) catch continue;
+                if (file.content.len <= 64 * 1024) {
+                    tmp_tri.indexFile(file.path, file.content) catch {};
+                }
+            }
+            worker.deinit(allocator);
+            workers_committed += 1;
+        }
+    }
+    return tmp_tri;
 }
 
 /// Called from main thread to do the initial scan before listening.
@@ -468,7 +683,7 @@ pub fn initialScan(store: *Store, explorer: *Explorer, root: []const u8, allocat
             if (parsed > 0) break :blk parsed;
         } else |_| {}
         const cpu_count = std.Thread.getCpuCount() catch 1;
-        break :blk @min(@as(usize, @intCast(cpu_count)), 4);
+        break :blk @min(@as(usize, @intCast(cpu_count)), 8);
     };
     try initialScanWithWorkerCount(store, explorer, root, allocator, skip_trigram, worker_count);
 }
@@ -531,6 +746,14 @@ pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, r
     // Track current git HEAD to detect branch switches (#116)
     var last_git_head: ?[40]u8 = git_mod.getGitHead(root, backing) catch null;
 
+    // Cache .git/HEAD mtime so we only fork git rev-parse when the file changes (#254)
+    var git_head_mtime: i128 = blk: {
+        var root_dir = std.fs.cwd().openDir(root, .{}) catch break :blk -1;
+        defer root_dir.close();
+        const st = compat.dirStatFile(root_dir, ".git/HEAD") catch break :blk -1;
+        break :blk st.mtime;
+    };
+
     while (!shutdown.load(.acquire)) {
         // Check for muonry edit notifications (instant re-index, no 2s delay)
         drainNotifyFile(store, explorer, queue, &known, root, backing);
@@ -538,13 +761,22 @@ pub fn incrementalLoop(store: *Store, explorer: *Explorer, queue: *EventQueue, r
         // Poll every 2s — gentle on CPU, fast enough to catch saves
         std.Thread.sleep(2 * std.time.ns_per_s);
 
-        // Check if git HEAD changed (branch switch, checkout, rebase)
-        const current_head = git_mod.getGitHead(root, backing) catch null;
+        // Check if git HEAD changed — stat .git/HEAD mtime first to skip fork+exec (#254)
+        var current_head: ?[40]u8 = last_git_head;
         const head_changed = blk: {
+            {
+                var root_dir = std.fs.cwd().openDir(root, .{}) catch break :blk false;
+                defer root_dir.close();
+                const st = compat.dirStatFile(root_dir, ".git/HEAD") catch break :blk false;
+                if (st.mtime == git_head_mtime) break :blk false;
+                git_head_mtime = st.mtime;
+            }
+            current_head = git_mod.getGitHead(root, backing) catch null;
             if (last_git_head == null and current_head == null) break :blk false;
             if (last_git_head == null or current_head == null) break :blk true;
             break :blk !std.mem.eql(u8, &last_git_head.?, &current_head.?);
         };
+
 
         if (head_changed) {
             std.log.info("git HEAD changed — re-scanning", .{});
@@ -766,14 +998,18 @@ pub fn isSensitivePath(path: []const u8) bool {
 }
 
 fn indexFileContent(explorer: *Explorer, dir: std.fs.Dir, path: []const u8, allocator: std.mem.Allocator, skip_trigram: bool) !void {
+    _ = allocator;
     if (shouldSkipFile(path)) return;
     const file = try dir.openFile(path, .{});
     defer file.close();
     const stat = try compat.fileStat(file);
     // Skip files over 512KB (likely minified bundles or generated)
     if (stat.size > 512 * 1024) return;
-    const content = try file.readToEndAlloc(allocator, 512 * 1024);
-    defer allocator.free(content);
+    // Use page_allocator arena for content — pages returned to OS immediately
+    // via munmap on deinit, eliminating GPA page retention from content churn.
+    var content_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer content_arena.deinit();
+    const content = try file.readToEndAlloc(content_arena.allocator(), 512 * 1024);
     // Skip binary content (check first 512 bytes for null bytes)
     const check_len = @min(content.len, 512);
     for (content[0..check_len]) |c| {
@@ -823,11 +1059,16 @@ fn drainNotifyFile(store: *Store, explorer: *Explorer, queue: *EventQueue, known
         else
             path;
 
+        // Skip re-indexing if file hasn't changed since last known state (#228)
+        const stat = compat.dirStatFile(dir, rel) catch continue;
+        const mtime: i64 = @intCast(@divTrunc(stat.mtime, std.time.ns_per_ms));
+        if (known.getPtr(rel)) |existing| {
+            if (existing.mtime == mtime and existing.size == stat.size) continue;
+        }
+
         indexFileContent(explorer, dir, rel, alloc, false) catch continue;
 
         // Update known-file state so incrementalDiff doesn't double-process
-        const stat = compat.dirStatFile(dir, rel) catch continue;
-        const mtime: i64 = @intCast(@divTrunc(stat.mtime, std.time.ns_per_ms));
         const hash = hashFile(dir, rel, stat.size) catch continue;
         if (known.getPtr(rel)) |existing| {
             existing.mtime = mtime;

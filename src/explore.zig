@@ -92,6 +92,8 @@ pub const Language = enum(u8) {
     go_lang,
     php,
     ruby,
+    hcl,
+    r,
     markdown,
     json,
     yaml,
@@ -109,6 +111,8 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".go")) return .go_lang;
     if (std.mem.endsWith(u8, path, ".php")) return .php;
     if (std.mem.endsWith(u8, path, ".rb") or std.mem.endsWith(u8, path, ".rake")) return .ruby;
+    if (std.mem.endsWith(u8, path, ".tf") or std.mem.endsWith(u8, path, ".tfvars") or std.mem.endsWith(u8, path, ".hcl")) return .hcl;
+    if (std.mem.endsWith(u8, path, ".r") or std.mem.endsWith(u8, path, ".R")) return .r;
     if (std.mem.endsWith(u8, path, ".md")) return .markdown;
     if (std.mem.endsWith(u8, path, ".json")) return .json;
     if (std.mem.endsWith(u8, path, ".yaml") or std.mem.endsWith(u8, path, ".yml")) return .yaml;
@@ -133,6 +137,9 @@ pub const Explorer = struct {
     word_index: WordIndex,
     trigram_index: AnyTrigramIndex,
     sparse_ngram_index: SparseNgramIndex,
+    /// Paths indexed with skip_trigram=true (past 15k cap or excluded).
+    /// Used to restrict the searchContent fallback to only these files.
+    skip_trigram_files: std.StringHashMap(void),
     allocator: std.mem.Allocator,
     word_index_complete: bool = true,
     word_index_can_load_from_disk: bool = false,
@@ -152,6 +159,7 @@ pub const Explorer = struct {
             .word_index = WordIndex.init(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
             .sparse_ngram_index = SparseNgramIndex.init(allocator),
+            .skip_trigram_files = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
         };
     }
@@ -179,9 +187,25 @@ pub const Explorer = struct {
         self.word_index.deinit();
         self.trigram_index.deinit();
         self.sparse_ngram_index.deinit();
+        self.skip_trigram_files.deinit();
         if (self.root_dir) |*d| d.close();
     }
 
+    /// Number of slots in the heap trigram index id_to_path array (benchmark helper).
+    pub fn trigramIdToPathLen(self: *Explorer) usize {
+        return switch (self.trigram_index) {
+            .heap => |*h| h.id_to_path.items.len,
+            else => 0,
+        };
+    }
+
+    /// Number of reusable free_ids slots in the heap trigram index (benchmark helper).
+    pub fn trigramFreeIdsLen(self: *Explorer) usize {
+        return switch (self.trigram_index) {
+            .heap => |*h| h.free_ids.items.len,
+            else => 0,
+        };
+    }
     pub fn releaseContents(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -247,47 +271,261 @@ pub const Explorer = struct {
 
         persistent_outline.path = stable_path;
 
-        const duped_content = try self.allocator.dupe(u8, content);
-        errdefer self.allocator.free(duped_content);
-        const content_gop = try self.contents.getOrPut(stable_path);
+        // Only cache file content when under the threshold — caps peak RSS.
+        // Beyond this, readContentForSearch falls back to disk reads.
+        // Indexes (word, trigram) use the `content` parameter directly, not the cache.
+        const content_cache_limit: u32 = 1000;
+        const should_cache = self.outlines.count() <= content_cache_limit;
         var prior_content: ?[]const u8 = null;
-        if (content_gop.found_existing) {
-            prior_content = content_gop.value_ptr.*;
-        } else {
-            content_gop.key_ptr.* = stable_path;
-        }
-        content_gop.value_ptr.* = duped_content;
-        errdefer {
+        if (should_cache) {
+            const duped_content = try self.allocator.dupe(u8, content);
+            errdefer self.allocator.free(duped_content);
+            const content_gop = try self.contents.getOrPut(stable_path);
             if (content_gop.found_existing) {
-                content_gop.value_ptr.* = prior_content.?;
+                prior_content = content_gop.value_ptr.*;
+            } else {
+                content_gop.key_ptr.* = stable_path;
+            }
+            content_gop.value_ptr.* = duped_content;
+        } else {
+            // Even above the limit, check if this file was previously cached
+            // (re-index of a file that was indexed early)
+            prior_content = self.contents.get(stable_path);
+        }
+        errdefer if (should_cache) {
+            if (prior_content != null) {
+                if (self.contents.getPtr(stable_path)) |ptr| {
+                    ptr.* = prior_content.?;
+                }
             } else {
                 _ = self.contents.remove(stable_path);
             }
-        }
+        };
 
         if (full_index) {
             if (!self.word_index_complete) {
                 self.word_index_can_load_from_disk = false;
             }
             try self.word_index.indexFile(stable_path, content);
+            // If trigram indexing fails below, restore word_index to its previous state
+            // to prevent word_index and trigram_index from diverging.
+            errdefer if (prior_content) |old| {
+                self.word_index.indexFile(stable_path, old) catch {};
+            } else {
+                self.word_index.removeFile(stable_path);
+            };
             if (self.word_index_complete) {
                 self.word_index_generation +%= 1;
             }
             if (!skip_trigram) {
                 try self.trigram_index.indexFile(stable_path, content);
                 try self.sparse_ngram_index.indexFile(stable_path, content);
+                _ = self.skip_trigram_files.remove(stable_path);
             } else {
                 self.trigram_index.removeFile(stable_path);
                 self.sparse_ngram_index.removeFile(stable_path);
+                try self.skip_trigram_files.put(stable_path, {});
             }
         }
 
         try self.rebuildDepsFor(stable_path, &persistent_outline);
 
         outline_gop.value_ptr.* = persistent_outline;
-        if (prior_content) |old_content| self.allocator.free(old_content);
+        if (should_cache) {
+            if (prior_content) |old_content| self.allocator.free(old_content);
+        }
         if (prior_outline) |*old_outline| old_outline.deinit();
     }
+
+fn computeSymbolEnds(content: []const u8, outline: *FileOutline) void {
+    if (outline.symbols.items.len == 0) return;
+
+    // Build a line offset table for O(1) line lookups
+    var line_offsets: std.ArrayList(usize) = .{};
+    defer line_offsets.deinit(outline.allocator);
+    line_offsets.append(outline.allocator, 0) catch return; // line 1 starts at offset 0
+    for (content, 0..) |c, i| {
+        if (c == '\n' and i + 1 <= content.len) {
+            line_offsets.append(outline.allocator, i + 1) catch return;
+        }
+    }
+    const total_lines: u32 = @intCast(line_offsets.items.len);
+
+    const is_brace_lang = outline.language == .zig or outline.language == .c or
+        outline.language == .cpp or outline.language == .typescript or
+        outline.language == .javascript or outline.language == .rust or
+        outline.language == .go_lang or outline.language == .php;
+
+    for (outline.symbols.items) |*sym| {
+        // Skip single-line kinds
+        switch (sym.kind) {
+            .import, .variable, .constant, .comment_block, .type_alias, .macro_def => continue,
+            else => {},
+        }
+
+        if (sym.line_start == 0 or sym.line_start > total_lines) continue;
+
+        if (is_brace_lang) {
+            sym.line_end = findBraceEnd(content, line_offsets.items, sym.line_start, total_lines);
+        } else if (outline.language == .python) {
+            sym.line_end = findPythonEnd(content, line_offsets.items, sym.line_start, total_lines);
+        } else if (outline.language == .ruby) {
+            sym.line_end = findRubyEnd(content, line_offsets.items, sym.line_start, total_lines);
+        }
+    }
+}
+
+fn findBraceEnd(content: []const u8, line_offsets: []const usize, line_start: u32, total_lines: u32) u32 {
+    const start_idx = line_offsets[line_start - 1];
+    var depth: i32 = 0;
+    var found_open = false;
+    var in_string: u8 = 0; // 0=none, '"', '\''
+    var in_line_comment = false;
+    var in_block_comment = false;
+    var i = start_idx;
+    var current_line = line_start;
+
+    while (i < content.len) : (i += 1) {
+        const c = content[i];
+
+        if (c == '\n') {
+            current_line += 1;
+            in_line_comment = false;
+            // Bail out if no opening brace found within 10 lines
+            if (!found_open and current_line > line_start + 10) return line_start;
+            continue;
+        }
+
+        if (in_line_comment) continue;
+
+        if (in_block_comment) {
+            if (c == '*' and i + 1 < content.len and content[i + 1] == '/') {
+                in_block_comment = false;
+                i += 1;
+            }
+            continue;
+        }
+
+        if (in_string != 0) {
+            if (c == '\\') {
+                i += 1; // skip escaped char
+            } else if (c == in_string) {
+                in_string = 0;
+            }
+            continue;
+        }
+
+        // Check for comments
+        if (c == '/' and i + 1 < content.len) {
+            if (content[i + 1] == '/') {
+                in_line_comment = true;
+                continue;
+            } else if (content[i + 1] == '*') {
+                in_block_comment = true;
+                i += 1;
+                continue;
+            }
+        }
+
+        // Check for strings
+        if (c == '"' or c == '\'') {
+            in_string = c;
+            continue;
+        }
+
+        if (c == '{') {
+            depth += 1;
+            found_open = true;
+        } else if (c == '}') {
+            depth -= 1;
+            if (found_open and depth == 0) {
+                return @min(current_line, total_lines);
+            }
+        }
+    }
+
+    return if (found_open) total_lines else line_start;
+}
+
+fn findPythonEnd(content: []const u8, line_offsets: []const usize, line_start: u32, total_lines: u32) u32 {
+    if (line_start >= total_lines) return line_start;
+
+    // Get the indent of the signature line
+    const sig_offset = line_offsets[line_start - 1];
+    const sig_indent = countIndent(content, sig_offset);
+
+    // Find the colon-terminated signature (may span multiple lines)
+    var body_start = line_start + 1;
+    // Check if signature line itself has the colon
+    {
+        const line_end_offset = if (line_start < total_lines) line_offsets[line_start] else content.len;
+        const sig_line = content[sig_offset..line_end_offset];
+        if (std.mem.indexOf(u8, sig_line, ":") == null) {
+            // Multi-line signature — skip ahead to find the colon
+            var ln = line_start + 1;
+            while (ln <= total_lines) : (ln += 1) {
+                const lo = line_offsets[ln - 1];
+                const le = if (ln < total_lines) line_offsets[ln] else content.len;
+                const line = content[lo..le];
+                if (std.mem.indexOf(u8, line, ":") != null) {
+                    body_start = ln + 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    var last_body_line = line_start;
+    var ln = body_start;
+    while (ln <= total_lines) : (ln += 1) {
+        const lo = line_offsets[ln - 1];
+        const le = if (ln < total_lines) line_offsets[ln] else content.len;
+        const line = content[lo..le];
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+
+        // Blank lines and comments don't end the body
+        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "#")) {
+            continue;
+        }
+
+        const indent = countIndent(content, lo);
+        if (indent <= sig_indent) break;
+        last_body_line = ln;
+    }
+
+    return if (last_body_line > line_start) last_body_line else line_start;
+}
+
+fn findRubyEnd(content: []const u8, line_offsets: []const usize, line_start: u32, total_lines: u32) u32 {
+    if (line_start >= total_lines) return line_start;
+
+    const sig_offset = line_offsets[line_start - 1];
+    const sig_indent = countIndent(content, sig_offset);
+
+    var ln = line_start + 1;
+    while (ln <= total_lines) : (ln += 1) {
+        const lo = line_offsets[ln - 1];
+        const le = if (ln < total_lines) line_offsets[ln] else content.len;
+        const line = content[lo..le];
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+
+        if (std.mem.eql(u8, trimmed, "end")) {
+            const indent = countIndent(content, lo);
+            if (indent <= sig_indent) return ln;
+        }
+    }
+
+    return line_start;
+}
+
+fn countIndent(content: []const u8, offset: usize) usize {
+    var count: usize = 0;
+    var i = offset;
+    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {
+        count += if (content[i] == '\t') 4 else 1;
+    }
+    return count;
+}
 
 fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []const u8) !FileOutline {
     var outline = FileOutline.init(parser.allocator, path);
@@ -306,13 +544,21 @@ fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []const 
         var trimmed = std.mem.trim(u8, line, " \t");
 
         if (outline.language == .python) {
-            const triple_count = std.mem.count(u8, trimmed, "\"\"\"") + std.mem.count(u8, trimmed, "'''");
+            const has_dq = std.mem.indexOf(u8, trimmed, "\"\"\"");
+            const has_sq = std.mem.indexOf(u8, trimmed, "'''");
+            const has_triple = has_dq != null or has_sq != null;
             if (in_py_docstring) {
-                if (triple_count > 0) in_py_docstring = false;
+                if (has_triple) in_py_docstring = false;
                 continue;
             }
-            if (triple_count >= 2) continue;
-            if (triple_count == 1) {
+            if (has_triple) {
+                // Check if triple quote appears twice (single-line docstring like """text""")
+                const marker = if (has_dq != null) "\"\"\"" else "'''";
+                const first_pos = if (has_dq) |p| p else has_sq.?;
+                if (std.mem.indexOf(u8, trimmed[first_pos + 3 ..], marker) != null) {
+                    // Opens and closes on same line — skip as a single-line docstring
+                    continue;
+                }
                 in_py_docstring = true;
                 continue;
             }
@@ -332,7 +578,7 @@ fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []const 
         if (outline.language == .typescript or outline.language == .javascript or
             outline.language == .go_lang or outline.language == .c or
             outline.language == .cpp or outline.language == .rust or
-            outline.language == .zig)
+            outline.language == .zig or outline.language == .hcl)
         {
             if (in_block_comment) {
                 if (std.mem.indexOf(u8, trimmed, "*/")) |close_pos| {
@@ -388,11 +634,16 @@ fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []const 
             }
         } else if (outline.language == .ruby) {
             try parser.parseRubyLine(trimmed, line_num, &outline);
+        } else if (outline.language == .hcl) {
+            try parser.parseHclLine(trimmed, line_num, &outline);
+        } else if (outline.language == .r) {
+            try parser.parseRLine(trimmed, line_num, &outline);
         }
 
         prev_line_trimmed = trimmed;
     }
     outline.line_count = line_num;
+    computeSymbolEnds(content, &outline);
     return outline;
 }
 
@@ -780,22 +1031,36 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
                     if (result_list.items.len >= max_results) break;
                 }
             } else {
-                var iter = self.outlines.keyIterator();
-                while (iter.next()) |key_ptr| {
-                    const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
+                // No trigram/sparse candidates — use word_index to narrow (#250)
+                const word_hits = self.word_index.search(query);
+                if (word_hits.len > 0) {
+                    var word_paths = std.StringHashMap(void).init(allocator);
+                    defer word_paths.deinit();
+                    for (word_hits) |hit| word_paths.put(self.word_index.hitPath(hit), {}) catch {};
+                    var wp_iter = word_paths.keyIterator();
+                    while (wp_iter.next()) |key_ptr| {
+                        const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
+                        defer ref.deinit();
+                        try searched.put(key_ptr.*, {});
+                        try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
+                        if (result_list.items.len >= max_results) break;
+                    }
+                } else {
+                    var iter = self.outlines.keyIterator();
+                    while (iter.next()) |key_ptr| {
+                        const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
+                        defer ref.deinit();
+                        try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
+                        if (result_list.items.len >= max_results) break;
+                    }
                 }
-                return result_list.toOwnedSlice(allocator);
             }
         }
 
         if (result_list.items.len < max_results) {
-            var iter = self.outlines.keyIterator();
+            var iter = self.skip_trigram_files.keyIterator();
             while (iter.next()) |key_ptr| {
                 if (searched.contains(key_ptr.*)) continue;
-                if (self.trigram_index.containsFile(key_ptr.*)) continue;
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
                 try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
@@ -1735,6 +2000,110 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         }
     }
 
+    fn parseHclLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
+        const a = self.allocator;
+
+        // resource "type" "name" {
+        if (startsWith(line, "resource ")) {
+            if (extractHclBlockName(line[9..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+        } else if (startsWith(line, "data ")) {
+            if (extractHclBlockName(line[5..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+        } else if (startsWith(line, "module ")) {
+            if (extractHclQuotedName(line[7..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+            }
+        } else if (startsWith(line, "variable ")) {
+            if (extractHclQuotedName(line[9..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .variable, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+        } else if (startsWith(line, "output ")) {
+            if (extractHclQuotedName(line[7..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .constant, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+        } else if (startsWith(line, "provider ")) {
+            if (extractHclQuotedName(line[9..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+            }
+        } else if (startsWith(line, "locals ") or startsWith(line, "locals{") or std.mem.eql(u8, line, "locals")) {
+            const name_copy = try a.dupe(u8, "locals");
+            errdefer a.free(name_copy);
+            try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num });
+        } else if (startsWith(line, "terraform ") or startsWith(line, "terraform{") or std.mem.eql(u8, line, "terraform")) {
+            const name_copy = try a.dupe(u8, "terraform");
+            errdefer a.free(name_copy);
+            try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num });
+        }
+    }
+
+    fn parseRLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
+        const a = self.allocator;
+
+        // library(pkg) or require(pkg)
+        if (startsWith(line, "library(") or startsWith(line, "require(")) {
+            const open = std.mem.indexOfScalar(u8, line, '(') orelse return;
+            const close = std.mem.indexOfScalar(u8, line[open..], ')') orelse return;
+            const pkg = std.mem.trim(u8, line[open + 1 .. open + close], " \t\"'");
+            if (pkg.len == 0) return;
+            const import_copy = try a.dupe(u8, pkg);
+            errdefer a.free(import_copy);
+            try outline.imports.append(a, import_copy);
+            const symbol_copy = try a.dupe(u8, line);
+            errdefer a.free(symbol_copy);
+            try outline.symbols.append(a, .{ .name = symbol_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+            return;
+        }
+
+        // setClass("ClassName") or setRefClass("ClassName")
+        if (startsWith(line, "setClass(") or startsWith(line, "setRefClass(")) {
+            const open = std.mem.indexOfScalar(u8, line, '(') orelse return;
+            if (extractHclQuotedName(line[open + 1 ..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .class_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+            return;
+        }
+
+        // name <- function( or name = function(
+        if (std.mem.indexOf(u8, line, "<- function(") != null or std.mem.indexOf(u8, line, "= function(") != null) {
+            const assign_pos = std.mem.indexOf(u8, line, "<-") orelse std.mem.indexOf(u8, line, "=") orelse return;
+            const name = std.mem.trim(u8, line[0..assign_pos], " \t");
+            if (name.len == 0) return;
+            if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_' and name[0] != '.') return;
+            const name_copy = try a.dupe(u8, name);
+            errdefer a.free(name_copy);
+            const detail_copy = try a.dupe(u8, line);
+            errdefer a.free(detail_copy);
+            try outline.symbols.append(a, .{ .name = name_copy, .kind = .function, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+        }
+    }
+
     fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !void {
         var deps: std.ArrayList([]const u8) = .{};
         errdefer deps.deinit(self.allocator);
@@ -1972,7 +2341,8 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
     if (trimmed.len == 0) return true;
     return switch (language) {
         .zig, .rust, .go_lang => std.mem.startsWith(u8, trimmed, "//"),
-        .python, .ruby => std.mem.startsWith(u8, trimmed, "#"),
+        .python, .ruby, .r => std.mem.startsWith(u8, trimmed, "#"),
+        .hcl => std.mem.startsWith(u8, trimmed, "#") or std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         .javascript, .typescript, .c, .cpp => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         else => false,
     };
@@ -2374,6 +2744,34 @@ fn extractRubyMethodName(s: []const u8) ?[]const u8 {
         if (suffix == '?' or suffix == '!' or suffix == '=') end += 1;
     }
     return if (end > 0) s[0..end] else null;
+}
+
+fn extractHclQuotedName(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimLeft(u8, text, " \t");
+    if (trimmed.len < 2 or trimmed[0] != '"') return null;
+    if (std.mem.indexOfScalar(u8, trimmed[1..], '"')) |end| {
+        if (end == 0) return null;
+        return trimmed[1 .. end + 1];
+    }
+    return null;
+}
+
+fn extractHclBlockName(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimLeft(u8, text, " \t");
+    if (trimmed.len < 2 or trimmed[0] != '"') return null;
+    // Skip first quoted string
+    if (std.mem.indexOfScalar(u8, trimmed[1..], '"')) |end1| {
+        const after_first = trimmed[end1 + 2 ..];
+        const rest = std.mem.trimLeft(u8, after_first, " \t");
+        // Extract second quoted string (the name)
+        if (rest.len >= 2 and rest[0] == '"') {
+            if (std.mem.indexOfScalar(u8, rest[1..], '"')) |end2| {
+                if (end2 == 0) return null;
+                return rest[1 .. end2 + 1];
+            }
+        }
+    }
+    return null;
 }
 
 fn extractStringLiteral(s: []const u8) ?[]const u8 {

@@ -119,10 +119,11 @@ pub fn writeSnapshot(
             if (!first) try writer.writeByte(',');
             first = false;
             const outline = entry.value_ptr;
+            try writer.writeAll("{\"path\":\"");
+            try writeJsonEscaped(writer, entry.key_ptr.*);
             try writer.print(
-                \\{{"path":"{s}","language":"{s}","line_count":{d},"byte_size":{d},"symbol_count":{d}}}
+                \\","language":"{s}","line_count":{d},"byte_size":{d},"symbol_count":{d}}}
             , .{
-                entry.key_ptr.*,
                 @tagName(outline.language),
                 outline.line_count,
                 outline.byte_size,
@@ -298,10 +299,7 @@ pub fn writeSnapshot(
 }
 
 /// Read section table from a `.codedb` file.
-pub fn readSections(path: []const u8, allocator: std.mem.Allocator) !?std.AutoHashMap(u32, SectionEntry) {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
-
+fn readSectionsFromFile(file: std.fs.File, allocator: std.mem.Allocator) !?std.AutoHashMap(u32, SectionEntry) {
     var magic_buf: [4]u8 = undefined;
     const n = file.readAll(&magic_buf) catch return null;
     if (n != 4 or !std.mem.eql(u8, &magic_buf, &MAGIC)) return null;
@@ -332,15 +330,22 @@ pub fn readSections(path: []const u8, allocator: std.mem.Allocator) !?std.AutoHa
     return result;
 }
 
+pub fn readSections(path: []const u8, allocator: std.mem.Allocator) !?std.AutoHashMap(u32, SectionEntry) {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+    return readSectionsFromFile(file, allocator);
+}
+
 /// Read a section's raw bytes from a `.codedb` file.
 pub fn readSectionBytes(path: []const u8, section_id: SectionId, allocator: std.mem.Allocator) !?[]u8 {
-    var sections = try readSections(path, allocator) orelse return null;
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+
+    var sections = try readSectionsFromFile(file, allocator) orelse return null;
     defer sections.deinit();
 
     const entry = sections.get(@intFromEnum(section_id)) orelse return null;
     if (entry.length > 256 * 1024 * 1024) return null; // sanity cap: 256MB
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
 
     // Validate section fits within file
     const stat = try compat.fileStat(file);
@@ -349,8 +354,8 @@ pub fn readSectionBytes(path: []const u8, section_id: SectionId, allocator: std.
     try file.seekTo(entry.offset);
     const buf = try allocator.alloc(u8, @intCast(entry.length));
     errdefer allocator.free(buf);
-    const n = try file.readAll(buf);
-    if (n != buf.len) {
+    const nr = try file.readAll(buf);
+    if (nr != buf.len) {
         allocator.free(buf);
         return null;
     }
@@ -409,32 +414,27 @@ pub fn loadSnapshotValidated(
     const file = std.fs.cwd().openFile(snapshot_path, .{}) catch return false;
     defer file.close();
 
-    // Validate magic
-    var magic_buf: [4]u8 = undefined;
-    const lmn = file.readAll(&magic_buf) catch return false;
-    if (lmn != 4) return false;
-    if (!std.mem.eql(u8, &magic_buf, &MAGIC)) return false;
-
-    // Read section table
-    const sections_opt = readSections(snapshot_path, allocator) catch return false;
-    var sections = sections_opt orelse return false;
+    // Read section table (validates magic internally) — reuse already-open file (#253)
+    file.seekTo(0) catch return false;
+    var sections = (readSectionsFromFile(file, allocator) catch return false) orelse return false;
     defer sections.deinit();
 
     // Parse META section to get expected file_count and root_hash
     var expected_file_count: ?u32 = null;
     var meta_root_hash: ?u64 = null;
     if (sections.get(@intFromEnum(SectionId.meta))) |meta_entry| {
-        const meta_bytes = readSectionBytes(snapshot_path, .meta, allocator) catch null;
-        if (meta_bytes) |mb| {
+        if (meta_entry.length <= 256 * 1024 * 1024) blk: {
+            file.seekTo(meta_entry.offset) catch break :blk;
+            const mb = allocator.alloc(u8, @intCast(meta_entry.length)) catch break :blk;
             defer allocator.free(mb);
-            // Simple integer extraction from JSON: "file_count":NNN
+            const nr = file.readAll(mb) catch break :blk;
+            if (nr != mb.len) break :blk;
             if (parseJsonU32(mb, "file_count")) |fc| {
                 expected_file_count = fc;
             }
             if (parseJsonU64(mb, "root_hash")) |rh| {
                 meta_root_hash = rh;
             }
-            _ = meta_entry;
         }
     }
 
@@ -456,15 +456,12 @@ pub fn loadSnapshotValidated(
     // Load CONTENT section — this is the core data
     const content_entry = sections.get(@intFromEnum(SectionId.content)) orelse return false;
 
-    const content_file = std.fs.cwd().openFile(snapshot_path, .{}) catch return false;
-    defer content_file.close();
-
     // Validate content section fits within actual file size (issue-40: truncation detection)
-    const file_stat = compat.fileStat(content_file) catch return false;
+    const file_stat = compat.fileStat(file) catch return false;
     const file_size = file_stat.size;
     if (content_entry.offset + content_entry.length > file_size) return false;
 
-    content_file.seekTo(content_entry.offset) catch return false;
+    file.seekTo(content_entry.offset) catch return false;
 
     const snap_mtime: i128 = file_stat.mtime;
     var bytes_read: u64 = 0;
@@ -472,7 +469,7 @@ pub fn loadSnapshotValidated(
     while (bytes_read < content_entry.length) {
         // Read path_len(u16)
         var pl_buf: [2]u8 = undefined;
-        const pln = content_file.readAll(&pl_buf) catch return false;
+        const pln = file.readAll(&pl_buf) catch return false;
         if (pln != 2) break;
         const path_len = std.mem.readInt(u16, &pl_buf, .little);
         if (path_len == 0 or path_len > 4096) break; // sanity cap
@@ -481,13 +478,13 @@ pub fn loadSnapshotValidated(
         // Read path
         const path_buf = allocator.alloc(u8, path_len) catch return false;
         defer allocator.free(path_buf);
-        const prn = content_file.readAll(path_buf) catch return false;
+        const prn = file.readAll(path_buf) catch return false;
         if (prn != path_len) break;
         bytes_read += path_len;
 
         // Read content_len(u32)
         var cl_buf: [4]u8 = undefined;
-        const cln = content_file.readAll(&cl_buf) catch return false;
+        const cln = file.readAll(&cl_buf) catch return false;
         if (cln != 4) break;
         const content_len = std.mem.readInt(u32, &cl_buf, .little);
         if (content_len > 64 * 1024 * 1024) break; // sanity cap: 64MB per file
@@ -496,7 +493,7 @@ pub fn loadSnapshotValidated(
         // Read content
         const content = allocator.alloc(u8, content_len) catch return false;
         defer allocator.free(content);
-        const crn = content_file.readAll(content) catch return false;
+        const crn = file.readAll(content) catch return false;
         if (crn != content_len) break;
         bytes_read += content_len;
 
@@ -535,15 +532,13 @@ pub fn loadSnapshotValidated(
         if (freq_entry.length == 256 * 256 * 2) {
             const index_mod = @import("index.zig");
             const ft = allocator.create([256][256]u16) catch return file_count > 0;
-            const freq_file = std.fs.cwd().openFile(snapshot_path, .{}) catch return file_count > 0;
-            defer freq_file.close();
-            freq_file.seekTo(freq_entry.offset) catch {
+            file.seekTo(freq_entry.offset) catch {
                 allocator.destroy(ft);
                 return file_count > 0;
             };
             var row_buf: [256 * 2]u8 = undefined;
             for (0..256) |a| {
-                if (freq_file.readAll(&row_buf) catch {
+                if (file.readAll(&row_buf) catch {
                     allocator.destroy(ft);
                     return file_count > 0;
                 } != 512) {
@@ -626,7 +621,7 @@ fn loadOutlineStateMap(snapshot_path: []const u8, allocator: std.mem.Allocator) 
 
         const symbol_count = try readSectionInt(u32, bytes, &cursor);
         for (0..symbol_count) |_| {
-            const name = try readSectionString(bytes, &cursor, allocator, 4096);
+            const name = try readSectionString(bytes, &cursor, allocator, std.math.maxInt(u16));
             if (name.len == 0) return error.InvalidData;
             errdefer allocator.free(name);
 
@@ -637,7 +632,7 @@ fn loadOutlineStateMap(snapshot_path: []const u8, allocator: std.mem.Allocator) 
             const has_detail = try readSectionByte(bytes, &cursor);
             const detail = switch (has_detail) {
                 0 => null,
-                1 => try readSectionString(bytes, &cursor, allocator, 4096),
+                1 => try readSectionString(bytes, &cursor, allocator, std.math.maxInt(u16)),
                 else => return error.InvalidData,
             };
             errdefer if (detail) |d| allocator.free(d);
@@ -700,7 +695,7 @@ fn loadSnapshotFast(
     store: *Store,
     allocator: std.mem.Allocator,
 ) !bool {
-    var outline_states = try loadOutlineStateMap(snapshot_path, allocator);
+    var outline_states = loadOutlineStateMap(snapshot_path, allocator) catch std.StringHashMap(FileOutline).init(allocator);
     defer deinitOutlineStateMap(&outline_states, allocator);
 
     var sections = (try readSections(snapshot_path, allocator)) orelse return false;
@@ -979,4 +974,23 @@ pub fn writeSnapshotDual(
     } else |_| {}
 
     writeSnapshot(explorer, root_path, secondary, allocator) catch {};
+}
+
+fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => if (c < 0x20) {
+                const hex = "0123456789abcdef";
+                const esc = [6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                try writer.writeAll(&esc);
+            } else {
+                try writer.writeByte(c);
+            },
+        }
+    }
 }
