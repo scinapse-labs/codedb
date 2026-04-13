@@ -5913,3 +5913,135 @@ test "issue-224: Python def line_end covers full body" {
     try testing.expectEqual(@as(u32, 3), sym.line_end);
 }
 
+test "issue-108: HCL resource block parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\resource "aws_instance" "web" {
+        \\  ami = "abc-123"
+        \\}
+    );
+    const results = try explorer.findAllSymbols("web", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+    try testing.expectEqual(SymbolKind.struct_def, results[0].symbol.kind);
+}
+
+test "issue-108: HCL variable and output parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("vars.tf",
+        \\variable "region" {
+        \\  default = "us-east-1"
+        \\}
+        \\output "ip" {
+        \\  value = aws_instance.web.public_ip
+        \\}
+    );
+    const vars = try explorer.findAllSymbols("region", alloc);
+    defer alloc.free(vars);
+    try testing.expect(vars.len == 1);
+    try testing.expectEqual(SymbolKind.variable, vars[0].symbol.kind);
+    const outs = try explorer.findAllSymbols("ip", alloc);
+    defer alloc.free(outs);
+    try testing.expect(outs.len == 1);
+    try testing.expectEqual(SymbolKind.constant, outs[0].symbol.kind);
+}
+
+test "issue-108: HCL module and provider parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\provider "aws" {
+        \\  region = "us-east-1"
+        \\}
+        \\module "vpc" {
+        \\  source = "./modules/vpc"
+        \\}
+    );
+    const providers = try explorer.findAllSymbols("aws", alloc);
+    defer alloc.free(providers);
+    try testing.expect(providers.len == 1);
+    const mods = try explorer.findAllSymbols("vpc", alloc);
+    defer alloc.free(mods);
+    try testing.expect(mods.len == 1);
+}
+
+test "issue-108: HCL comment lines skipped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("main.tf",
+        \\# This is a comment
+        \\// Another comment
+        \\variable "name" {}
+    );
+    const results = try explorer.findAllSymbols("name", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+}
+
+test "issue-108: detectLanguage handles .tf and .tfvars" {
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("main.tf"));
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("prod.tfvars"));
+    try testing.expectEqual(Language.hcl, explore.detectLanguage("config.hcl"));
+}
+
+test "issue-215: R function assignment parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("analysis.R",
+        \\greet <- function(name) {
+        \\  paste("Hello", name)
+        \\}
+    );
+    const results = try explorer.findAllSymbols("greet", alloc);
+    defer alloc.free(results);
+    try testing.expect(results.len == 1);
+    try testing.expectEqual(SymbolKind.function, results[0].symbol.kind);
+}
+
+test "issue-215: R library import parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("script.r",
+        \\library(dplyr)
+        \\require(ggplot2)
+    );
+    const outline = try explorer.getOutline("script.r", alloc) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), outline.imports.items.len);
+}
+
+test "issue-215: R setClass parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+    try explorer.indexFile("classes.R",
+        \\setClass("Person")
+        \\setRefClass("Animal")
+    );
+    const p = try explorer.findAllSymbols("Person", alloc);
+    defer alloc.free(p);
+    try testing.expect(p.len == 1);
+    try testing.expectEqual(SymbolKind.class_def, p[0].symbol.kind);
+    const a2 = try explorer.findAllSymbols("Animal", alloc);
+    defer alloc.free(a2);
+    try testing.expect(a2.len == 1);
+}
+
+test "issue-215: detectLanguage handles .r and .R" {
+    try testing.expectEqual(Language.r, explore.detectLanguage("script.r"));
+    try testing.expectEqual(Language.r, explore.detectLanguage("analysis.R"));
+}

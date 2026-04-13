@@ -147,6 +147,7 @@ const skip_dirs = [_][]const u8{
     ".bundle",
     ".swc",
     ".terraform",
+    ".terragrunt-cache",
     ".serverless",
     "elm-stuff",
     ".stack-work",

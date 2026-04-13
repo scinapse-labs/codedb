@@ -92,6 +92,8 @@ pub const Language = enum(u8) {
     go_lang,
     php,
     ruby,
+    hcl,
+    r,
     markdown,
     json,
     yaml,
@@ -109,6 +111,8 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".go")) return .go_lang;
     if (std.mem.endsWith(u8, path, ".php")) return .php;
     if (std.mem.endsWith(u8, path, ".rb") or std.mem.endsWith(u8, path, ".rake")) return .ruby;
+    if (std.mem.endsWith(u8, path, ".tf") or std.mem.endsWith(u8, path, ".tfvars") or std.mem.endsWith(u8, path, ".hcl")) return .hcl;
+    if (std.mem.endsWith(u8, path, ".r") or std.mem.endsWith(u8, path, ".R")) return .r;
     if (std.mem.endsWith(u8, path, ".md")) return .markdown;
     if (std.mem.endsWith(u8, path, ".json")) return .json;
     if (std.mem.endsWith(u8, path, ".yaml") or std.mem.endsWith(u8, path, ".yml")) return .yaml;
@@ -551,7 +555,7 @@ fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []const 
         if (outline.language == .typescript or outline.language == .javascript or
             outline.language == .go_lang or outline.language == .c or
             outline.language == .cpp or outline.language == .rust or
-            outline.language == .zig)
+            outline.language == .zig or outline.language == .hcl)
         {
             if (in_block_comment) {
                 if (std.mem.indexOf(u8, trimmed, "*/")) |close_pos| {
@@ -607,6 +611,10 @@ fn parseOutlineWithParser(parser: *Explorer, path: []const u8, content: []const 
             }
         } else if (outline.language == .ruby) {
             try parser.parseRubyLine(trimmed, line_num, &outline);
+        } else if (outline.language == .hcl) {
+            try parser.parseHclLine(trimmed, line_num, &outline);
+        } else if (outline.language == .r) {
+            try parser.parseRLine(trimmed, line_num, &outline);
         }
 
         prev_line_trimmed = trimmed;
@@ -1969,6 +1977,110 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         }
     }
 
+    fn parseHclLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
+        const a = self.allocator;
+
+        // resource "type" "name" {
+        if (startsWith(line, "resource ")) {
+            if (extractHclBlockName(line[9..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+        } else if (startsWith(line, "data ")) {
+            if (extractHclBlockName(line[5..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+        } else if (startsWith(line, "module ")) {
+            if (extractHclQuotedName(line[7..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+            }
+        } else if (startsWith(line, "variable ")) {
+            if (extractHclQuotedName(line[9..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .variable, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+        } else if (startsWith(line, "output ")) {
+            if (extractHclQuotedName(line[7..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .constant, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+        } else if (startsWith(line, "provider ")) {
+            if (extractHclQuotedName(line[9..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+            }
+        } else if (startsWith(line, "locals ") or startsWith(line, "locals{") or std.mem.eql(u8, line, "locals")) {
+            const name_copy = try a.dupe(u8, "locals");
+            errdefer a.free(name_copy);
+            try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num });
+        } else if (startsWith(line, "terraform ") or startsWith(line, "terraform{") or std.mem.eql(u8, line, "terraform")) {
+            const name_copy = try a.dupe(u8, "terraform");
+            errdefer a.free(name_copy);
+            try outline.symbols.append(a, .{ .name = name_copy, .kind = .struct_def, .line_start = line_num, .line_end = line_num });
+        }
+    }
+
+    fn parseRLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
+        const a = self.allocator;
+
+        // library(pkg) or require(pkg)
+        if (startsWith(line, "library(") or startsWith(line, "require(")) {
+            const open = std.mem.indexOfScalar(u8, line, '(') orelse return;
+            const close = std.mem.indexOfScalar(u8, line[open..], ')') orelse return;
+            const pkg = std.mem.trim(u8, line[open + 1 .. open + close], " \t\"'");
+            if (pkg.len == 0) return;
+            const import_copy = try a.dupe(u8, pkg);
+            errdefer a.free(import_copy);
+            try outline.imports.append(a, import_copy);
+            const symbol_copy = try a.dupe(u8, line);
+            errdefer a.free(symbol_copy);
+            try outline.symbols.append(a, .{ .name = symbol_copy, .kind = .import, .line_start = line_num, .line_end = line_num });
+            return;
+        }
+
+        // setClass("ClassName") or setRefClass("ClassName")
+        if (startsWith(line, "setClass(") or startsWith(line, "setRefClass(")) {
+            const open = std.mem.indexOfScalar(u8, line, '(') orelse return;
+            if (extractHclQuotedName(line[open + 1 ..])) |name| {
+                const name_copy = try a.dupe(u8, name);
+                errdefer a.free(name_copy);
+                const detail_copy = try a.dupe(u8, line);
+                errdefer a.free(detail_copy);
+                try outline.symbols.append(a, .{ .name = name_copy, .kind = .class_def, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+            }
+            return;
+        }
+
+        // name <- function( or name = function(
+        if (std.mem.indexOf(u8, line, "<- function(") != null or std.mem.indexOf(u8, line, "= function(") != null) {
+            const assign_pos = std.mem.indexOf(u8, line, "<-") orelse std.mem.indexOf(u8, line, "=") orelse return;
+            const name = std.mem.trim(u8, line[0..assign_pos], " \t");
+            if (name.len == 0) return;
+            if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_' and name[0] != '.') return;
+            const name_copy = try a.dupe(u8, name);
+            errdefer a.free(name_copy);
+            const detail_copy = try a.dupe(u8, line);
+            errdefer a.free(detail_copy);
+            try outline.symbols.append(a, .{ .name = name_copy, .kind = .function, .line_start = line_num, .line_end = line_num, .detail = detail_copy });
+        }
+    }
+
     fn rebuildDepsFor(self: *Explorer, path: []const u8, outline: *FileOutline) !void {
         var deps: std.ArrayList([]const u8) = .{};
         errdefer deps.deinit(self.allocator);
@@ -2206,7 +2318,8 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
     if (trimmed.len == 0) return true;
     return switch (language) {
         .zig, .rust, .go_lang => std.mem.startsWith(u8, trimmed, "//"),
-        .python, .ruby => std.mem.startsWith(u8, trimmed, "#"),
+        .python, .ruby, .r => std.mem.startsWith(u8, trimmed, "#"),
+        .hcl => std.mem.startsWith(u8, trimmed, "#") or std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         .javascript, .typescript, .c, .cpp => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
         else => false,
     };
@@ -2608,6 +2721,34 @@ fn extractRubyMethodName(s: []const u8) ?[]const u8 {
         if (suffix == '?' or suffix == '!' or suffix == '=') end += 1;
     }
     return if (end > 0) s[0..end] else null;
+}
+
+fn extractHclQuotedName(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimLeft(u8, text, " \t");
+    if (trimmed.len < 2 or trimmed[0] != '"') return null;
+    if (std.mem.indexOfScalar(u8, trimmed[1..], '"')) |end| {
+        if (end == 0) return null;
+        return trimmed[1 .. end + 1];
+    }
+    return null;
+}
+
+fn extractHclBlockName(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimLeft(u8, text, " \t");
+    if (trimmed.len < 2 or trimmed[0] != '"') return null;
+    // Skip first quoted string
+    if (std.mem.indexOfScalar(u8, trimmed[1..], '"')) |end1| {
+        const after_first = trimmed[end1 + 2 ..];
+        const rest = std.mem.trimLeft(u8, after_first, " \t");
+        // Extract second quoted string (the name)
+        if (rest.len >= 2 and rest[0] == '"') {
+            if (std.mem.indexOfScalar(u8, rest[1..], '"')) |end2| {
+                if (end2 == 0) return null;
+                return rest[1 .. end2 + 1];
+            }
+        }
+    }
+    return null;
 }
 
 fn extractStringLiteral(s: []const u8) ?[]const u8 {
