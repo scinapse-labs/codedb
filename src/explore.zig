@@ -271,23 +271,36 @@ pub const Explorer = struct {
 
         persistent_outline.path = stable_path;
 
-        const duped_content = try self.allocator.dupe(u8, content);
-        errdefer self.allocator.free(duped_content);
-        const content_gop = try self.contents.getOrPut(stable_path);
+        // Only cache file content when under the threshold — caps peak RSS.
+        // Beyond this, readContentForSearch falls back to disk reads.
+        // Indexes (word, trigram) use the `content` parameter directly, not the cache.
+        const content_cache_limit: u32 = 1000;
+        const should_cache = self.outlines.count() <= content_cache_limit;
         var prior_content: ?[]const u8 = null;
-        if (content_gop.found_existing) {
-            prior_content = content_gop.value_ptr.*;
-        } else {
-            content_gop.key_ptr.* = stable_path;
-        }
-        content_gop.value_ptr.* = duped_content;
-        errdefer {
+        if (should_cache) {
+            const duped_content = try self.allocator.dupe(u8, content);
+            errdefer self.allocator.free(duped_content);
+            const content_gop = try self.contents.getOrPut(stable_path);
             if (content_gop.found_existing) {
-                content_gop.value_ptr.* = prior_content.?;
+                prior_content = content_gop.value_ptr.*;
+            } else {
+                content_gop.key_ptr.* = stable_path;
+            }
+            content_gop.value_ptr.* = duped_content;
+        } else {
+            // Even above the limit, check if this file was previously cached
+            // (re-index of a file that was indexed early)
+            prior_content = self.contents.get(stable_path);
+        }
+        errdefer if (should_cache) {
+            if (prior_content != null) {
+                if (self.contents.getPtr(stable_path)) |ptr| {
+                    ptr.* = prior_content.?;
+                }
             } else {
                 _ = self.contents.remove(stable_path);
             }
-        }
+        };
 
         if (full_index) {
             if (!self.word_index_complete) {
@@ -318,7 +331,9 @@ pub const Explorer = struct {
         try self.rebuildDepsFor(stable_path, &persistent_outline);
 
         outline_gop.value_ptr.* = persistent_outline;
-        if (prior_content) |old_content| self.allocator.free(old_content);
+        if (should_cache) {
+            if (prior_content) |old_content| self.allocator.free(old_content);
+        }
         if (prior_outline) |*old_outline| old_outline.deinit();
     }
 
