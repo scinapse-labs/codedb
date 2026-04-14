@@ -1324,9 +1324,20 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         var searched = std.StringHashMap(void).init(allocator);
         defer searched.deinit();
 
-        // Tier 1: trigram candidates (most precise — requires ALL trigrams present).
+        // Tier 1: trigram candidates — sorted by cached content size (smallest first).
+        // Smaller files scan faster and are more likely to be focused source files.
         if (candidate_paths) |cp| {
             if (cp.len > 0) {
+                const SortCtx = struct {
+                    contents: *const std.StringHashMap([]const u8),
+                    pub fn lessThan(ctx: @This(), a: []const u8, b: []const u8) bool {
+                        const a_len = if (ctx.contents.get(a)) |c| c.len else std.math.maxInt(usize);
+                        const b_len = if (ctx.contents.get(b)) |c| c.len else std.math.maxInt(usize);
+                        return a_len < b_len;
+                    }
+                };
+                std.mem.sort([]const u8, @constCast(cp), SortCtx{ .contents = &self.contents }, SortCtx.lessThan);
+
                 const estimated_total = cp.len + self.skip_trigram_files.count();
                 const max_per_file = @max(@as(usize, 1), max_results / @max(@as(usize, 1), estimated_total));
                 for (cp) |path| {
