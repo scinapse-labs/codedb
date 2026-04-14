@@ -8,8 +8,10 @@ const app_install = @import("app/install");
 const app_improvements = @import("app/improvements");
 const app_update = @import("app/update");
 const app_v0257 = @import("app/v0257");
+const app_v02572 = @import("app/v02572");
 pub const routes: []const Route = &.{
     .{ .path = "/v0.2.57", .render = app_v0257.render, .render_stream = if (@hasDecl(app_v0257, "renderStream")) app_v0257.renderStream else null, .meta = if (@hasDecl(app_v0257, "meta")) app_v0257.meta else .{}, .prerender = if (@hasDecl(app_v0257, "prerender")) app_v0257.prerender else false },
+    .{ .path = "/v0.2.572", .render = app_v02572.render, .render_stream = if (@hasDecl(app_v02572, "renderStream")) app_v02572.renderStream else null, .meta = if (@hasDecl(app_v02572, "meta")) app_v02572.meta else .{}, .prerender = if (@hasDecl(app_v02572, "prerender")) app_v02572.prerender else false },
     .{ .path = "/benchmarks", .render = app_benchmarks.render, .render_stream = if (@hasDecl(app_benchmarks, "renderStream")) app_benchmarks.renderStream else null, .meta = if (@hasDecl(app_benchmarks, "meta")) app_benchmarks.meta else .{}, .prerender = if (@hasDecl(app_benchmarks, "prerender")) app_benchmarks.prerender else false },
     .{ .path = "/", .render = app_index.render, .render_stream = if (@hasDecl(app_index, "renderStream")) app_index.renderStream else null, .meta = if (@hasDecl(app_index, "meta")) app_index.meta else .{}, .prerender = if (@hasDecl(app_index, "prerender")) app_index.prerender else false },
     .{ .path = "/privacy", .render = app_privacy.render, .render_stream = if (@hasDecl(app_privacy, "renderStream")) app_privacy.renderStream else null, .meta = if (@hasDecl(app_privacy, "meta")) app_privacy.meta else .{}, .prerender = if (@hasDecl(app_privacy, "prerender")) app_privacy.prerender else false },
