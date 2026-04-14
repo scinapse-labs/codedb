@@ -15,17 +15,14 @@ codedb v0.2.572 just dropped.
 
 ---
 
-Tweet 2 (The numbers)
+Tweet 2 (v0.2.56 → v0.2.572)
 
-Real benchmarks on openclaw (6,315 files), query "fn" — linear scale:
+v0.2.572 vs v0.2.56:
 
-codedb:  220µs  (0.00022s) — warm trigram, 12 files (22% recall)
-fff-mcp: 510µs  (0.00051s) — bigram + frecency, 2 files (4% recall)
-ripgrep: ~500ms (0.5s)     — cold disk scan, ~48,000 lines
-grep:    ~1,500ms (1.5s)   — cold disk scan, ~48,200 lines
-
-2.3x faster than fff-mcp. 6x better recall. 2,272x faster than ripgrep.
-
+10x faster cold indexing: 3.6s → 346ms.
+83% less cold RSS: 3.5GB → 580MB.
+92% less warm RSS: 1.9GB → 150MB.
+220µs search vs cold disk scans.
 ---
 
 Tweet 3 (Recall)
@@ -58,15 +55,16 @@ Every round-trip down.
 
 ---
 
-Tweet 6 (Memory + indexing)
+Tweet 6 (vs the competition)
 
-Same v0.2.57 gains still in:
+Real benchmarks on openclaw (6,315 files), query "fn":
 
-10x faster cold indexing: 3.6s → 346ms.
-83% less cold RSS: 3.5GB → 580MB.
-92% less warm RSS: 1.9GB → 150MB.
+codedb:  220µs  — 12 files (22% recall)
+fff-mcp: 510µs  — 2 files (4% recall)
+ripgrep: ~500ms — ~48,000 lines
+grep:    ~1,500ms — ~48,200 lines
 
-v0.2.572 is a hotfix on top. All improvements carry over.
+2.3x faster than fff-mcp. 6x better recall. 2,272x faster than ripgrep.
 
 ---
 
