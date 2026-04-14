@@ -289,6 +289,7 @@ pub const BenchContext = struct {
 
         var summary: std.ArrayList(u8) = .{};
         defer summary.deinit(alloc);
+        summary.ensureTotalCapacity(alloc, 256) catch {};
         summary.appendSlice(alloc, if (is_error) MCP_RED ++ MCP_CROSS ++ " " ++ MCP_RESET else MCP_GREEN ++ MCP_CHECK ++ " " ++ MCP_RESET) catch {};
         summary.appendSlice(alloc, mcpToolIcon(name)) catch {};
         mcpGenerateSummary(alloc, name, args, out.items, is_error, &summary);
@@ -301,6 +302,7 @@ pub const BenchContext = struct {
 
         var result: std.ArrayList(u8) = .{};
         defer result.deinit(alloc);
+        result.ensureTotalCapacity(alloc, out.items.len + summary.items.len + guidance.items.len + 256) catch {};
         result.appendSlice(alloc, "{\"content\":[") catch return 0;
 
         if (summary.items.len > 0) {
@@ -642,6 +644,7 @@ fn handleCall(
     // Block 1: Human-readable colored summary (ANSI — preview pane always renders it)
     var summary: std.ArrayList(u8) = .{};
     defer summary.deinit(alloc);
+    summary.ensureTotalCapacity(alloc, 256) catch {};
     summary.appendSlice(alloc, if (is_error) MCP_RED ++ MCP_CROSS ++ " " ++ MCP_RESET else MCP_GREEN ++ MCP_CHECK ++ " " ++ MCP_RESET) catch {};
     summary.appendSlice(alloc, mcpToolIcon(name)) catch {};
     mcpGenerateSummary(alloc, name, args, out.items, is_error, &summary);
@@ -656,6 +659,7 @@ fn handleCall(
     // Assemble 3-block MCP content envelope
     var result: std.ArrayList(u8) = .{};
     defer result.deinit(alloc);
+    result.ensureTotalCapacity(alloc, out.items.len + summary.items.len + guidance.items.len + 256) catch {};
     result.appendSlice(alloc, "{\"content\":[") catch return;
 
     // Block 1 (summary)
@@ -1904,15 +1908,20 @@ pub fn isPathSafe(path: []const u8) bool {
 fn writeResult(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value, result: []const u8) void {
     var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(alloc);
+    buf.ensureTotalCapacity(alloc, result.len + 64) catch {};
     buf.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"id\":") catch return;
     appendId(alloc, &buf, id);
     buf.appendSlice(alloc, ",\"result\":") catch return;
-    for (result) |c| {
-        if (c != '\n' and c != '\r') buf.append(alloc, c) catch return;
+    // Batch-copy non-newline runs instead of per-byte append.
+    var i: usize = 0;
+    while (i < result.len) {
+        const start = i;
+        while (i < result.len and result[i] != '\n' and result[i] != '\r') : (i += 1) {}
+        if (i > start) buf.appendSlice(alloc, result[start..i]) catch return;
+        if (i < result.len) i += 1;
     }
-    buf.appendSlice(alloc, "}") catch return;
+    buf.appendSlice(alloc, "}\n") catch return;
     stdout.writeAll(buf.items) catch return;
-    stdout.writeAll("\n") catch return;
 }
 
 fn writeError(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value, code: i32, msg: []const u8) void {
@@ -1930,12 +1939,39 @@ fn writeError(alloc: std.mem.Allocator, stdout: std.fs.File, id: ?std.json.Value
     stdout.writeAll(buf.items) catch return;
     stdout.writeAll("\n") catch return;
 }
-
+/// Fast JSON string escaper: batch-copies runs of safe characters via
+/// appendSlice instead of the per-byte append in mcpj.writeEscaped.
+fn writeEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const start = i;
+        while (i < s.len) : (i += 1) {
+            const c = s[i];
+            if (c < 0x20 or c == '"' or c == '\\') break;
+        }
+        if (i > start) out.appendSlice(alloc, s[start..i]) catch return;
+        if (i >= s.len) break;
+        const c = s[i];
+        switch (c) {
+            '"' => out.appendSlice(alloc, "\\\"") catch return,
+            '\\' => out.appendSlice(alloc, "\\\\") catch return,
+            '\n' => out.appendSlice(alloc, "\\n") catch return,
+            '\r' => out.appendSlice(alloc, "\\r") catch return,
+            '\t' => out.appendSlice(alloc, "\\t") catch return,
+            else => {
+                const hex = "0123456789abcdef";
+                const esc = [6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                out.appendSlice(alloc, &esc) catch return;
+            },
+        }
+        i += 1;
+    }
+}
 const getStr = mcpj.getStr;
 const getInt = mcpj.getInt;
 pub const getBool = mcpj.getBool;
 const eql = mcpj.eql;
-const writeEscaped = mcpj.writeEscaped;
+
 
 fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
     if (id) |v| switch (v) {
