@@ -995,37 +995,55 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         const candidate_paths = self.trigram_index.candidates(query, allocator);
         defer if (candidate_paths) |cp| allocator.free(cp);
 
-        // Build unified candidate set: UNION of all index sources (#265).
-        // Previously sparse+trigram were intersected, dropping files that
-        // only appeared in one index.  Content verification in searchInContent
-        // already does exact matching, so false positives are harmless.
-        var all_candidates = std.StringHashMap(void).init(allocator);
-        defer all_candidates.deinit();
+        var searched = std.StringHashMap(void).init(allocator);
+        defer searched.deinit();
 
-        if (candidate_paths) |cp| for (cp) |p| all_candidates.put(p, {}) catch {};
-        if (sparse_paths) |sp| for (sp) |p| all_candidates.put(p, {}) catch {};
-
-        // Interleave skip_trigram_files instead of tail-block (#266).
-        {
-            var skip_iter = self.skip_trigram_files.keyIterator();
-            while (skip_iter.next()) |key_ptr| all_candidates.put(key_ptr.*, {}) catch {};
+        // Tier 1: trigram candidates (most precise — requires ALL trigrams present).
+        if (candidate_paths) |cp| {
+            if (cp.len > 0) {
+                const estimated_total = cp.len + self.skip_trigram_files.count();
+                const max_per_file = @max(@as(usize, 1), max_results / @max(@as(usize, 1), estimated_total));
+                for (cp) |path| {
+                    const ref = self.readContentForSearch(path, allocator) orelse continue;
+                    defer ref.deinit();
+                    searched.put(path, {}) catch {};
+                    try searchInContent(path, ref.data, query, allocator, max_per_file, max_results, &result_list);
+                    if (result_list.items.len >= max_results) break;
+                }
+            }
         }
 
-        const num_candidates = all_candidates.count();
+        // Tier 2: sparse candidates not already searched.
+        // Only when Tier 1 found nothing — sparse union can be very large
+        // and scanning thousands of false-positive files costs 100ms+.
+        if (result_list.items.len == 0) {
+            if (sparse_paths) |sp| {
+                for (sp) |path| {
+                    if (searched.contains(path)) continue;
+                    const ref = self.readContentForSearch(path, allocator) orelse continue;
+                    defer ref.deinit();
+                    searched.put(path, {}) catch {};
+                    try searchInContent(path, ref.data, query, allocator, max_results, max_results, &result_list);
+                    if (result_list.items.len >= max_results) break;
+                }
+            }
+        }
 
-        if (num_candidates > 0) {
-            // Per-file cap prevents one file from dominating results (#267).
-            const max_per_file = @max(@as(usize, 1), max_results / @max(@as(usize, 1), num_candidates));
-
-            var iter = all_candidates.keyIterator();
-            while (iter.next()) |key_ptr| {
+        // Tier 3: skip_trigram_files not already searched.
+        if (result_list.items.len < max_results) {
+            var skip_iter = self.skip_trigram_files.keyIterator();
+            while (skip_iter.next()) |key_ptr| {
+                if (searched.contains(key_ptr.*)) continue;
                 const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                 defer ref.deinit();
-                try searchInContent(key_ptr.*, ref.data, query, allocator, max_per_file, max_results, &result_list);
+                searched.put(key_ptr.*, {}) catch {};
+                try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, max_results, &result_list);
                 if (result_list.items.len >= max_results) break;
             }
-        } else {
-            // No trigram/sparse/skip_trigram candidates — use word_index to narrow (#250)
+        }
+
+        // Tier 4: word index — narrows candidates for short queries or missed trigrams.
+        if (result_list.items.len < max_results) {
             const word_hits = self.word_index.search(query);
             if (word_hits.len > 0) {
                 var word_paths = std.StringHashMap(void).init(allocator);
@@ -1033,19 +1051,26 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
                 for (word_hits) |hit| word_paths.put(self.word_index.hitPath(hit), {}) catch {};
                 var wp_iter = word_paths.keyIterator();
                 while (wp_iter.next()) |key_ptr| {
+                    if (searched.contains(key_ptr.*)) continue;
                     const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
                     defer ref.deinit();
+                    searched.put(key_ptr.*, {}) catch {};
                     try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, max_results, &result_list);
                     if (result_list.items.len >= max_results) break;
                 }
-            } else {
-                var iter = self.outlines.keyIterator();
-                while (iter.next()) |key_ptr| {
-                    const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
+            }
+        }
+
+        // Tier 5: full scan fallback — only when NO results from any tier.
+        // Avoids 100ms+ scans on large repos when indices already found matches.
+        if (result_list.items.len == 0) {
+            var iter = self.outlines.keyIterator();
+            while (iter.next()) |key_ptr| {
+                if (searched.contains(key_ptr.*)) continue;
+                const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
+                defer ref.deinit();
+                try searchInContent(key_ptr.*, ref.data, query, allocator, max_results, max_results, &result_list);
+                if (result_list.items.len >= max_results) break;
             }
         }
 
@@ -2681,9 +2706,32 @@ fn matchElement(c: u8, pattern: []const u8, start: usize, end: usize) bool {
 fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
-    for (0..haystack.len - needle.len + 1) |i| {
+
+    // Pre-compute lowered first byte + second byte for fast skip.
+    const first_lower: u8 = if (needle[0] >= 'A' and needle[0] <= 'Z') needle[0] + 32 else needle[0];
+    const first_upper: u8 = if (needle[0] >= 'a' and needle[0] <= 'z') needle[0] - 32 else needle[0];
+    const end = haystack.len - needle.len + 1;
+
+    if (needle.len == 1) {
+        // Single-char: use std.mem.indexOfAny for speed.
+        const chars = [2]u8{ first_lower, first_upper };
+        return std.mem.indexOfAny(u8, haystack, &chars);
+    }
+
+    const second_lower: u8 = if (needle[1] >= 'A' and needle[1] <= 'Z') needle[1] + 32 else needle[1];
+
+    var i: usize = 0;
+    while (i < end) : (i += 1) {
+        // Fast reject: check first byte, then second byte before full compare.
+        const c0 = haystack[i];
+        if (c0 != first_lower and c0 != first_upper) continue;
+        const c1 = haystack[i + 1];
+        const c1_lower = if (c1 >= 'A' and c1 <= 'Z') c1 + 32 else c1;
+        if (c1_lower != second_lower) continue;
+
+        // First two bytes match — verify the rest.
         var match = true;
-        for (0..needle.len) |j| {
+        for (2..needle.len) |j| {
             const hc = if (haystack[i + j] >= 'A' and haystack[i + j] <= 'Z') haystack[i + j] + 32 else haystack[i + j];
             const nc = if (needle[j] >= 'A' and needle[j] <= 'Z') needle[j] + 32 else needle[j];
             if (hc != nc) {
