@@ -1289,6 +1289,35 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
         var result_list: std.ArrayList(SearchResult) = .{};
         errdefer result_list.deinit(allocator);
 
+        // Tier 0: word index direct lookup — O(1) hash lookup, no content scan.
+        // Only use when hit count is small; large hit lists (e.g. "fn" → 924 hits)
+        // are slower to iterate than trigram candidate scanning.
+        const word_hits = self.word_index.search(query);
+        if (word_hits.len > 0 and word_hits.len <= max_results * 2) {
+            for (word_hits) |hit| {
+                const hit_path = self.word_index.hitPath(hit);
+                if (hit_path.len == 0) continue;
+                const cached = self.contents.get(hit_path) orelse continue;
+                const line_text = extractLineByNumber(cached, hit.line_num) orelse continue;
+                // Verify the line actually contains the query (word index is whole-word,
+                // but searchContent is substring — confirm before returning).
+                if (indexOfCaseInsensitive(line_text, query) == null) continue;
+                const duped_text = try allocator.dupe(u8, line_text);
+                errdefer allocator.free(duped_text);
+                const duped_path = try allocator.dupe(u8, hit_path);
+                errdefer allocator.free(duped_path);
+                try result_list.append(allocator, .{
+                    .path = duped_path,
+                    .line_num = hit.line_num,
+                    .line_text = duped_text,
+                });
+                if (result_list.items.len >= max_results) return result_list.toOwnedSlice(allocator);
+            }
+            // If word index found enough results, return early.
+            if (result_list.items.len >= max_results)
+                return result_list.toOwnedSlice(allocator);
+        }
+
         const candidate_paths = self.trigram_index.candidates(query, allocator);
         defer if (candidate_paths) |cp| allocator.free(cp);
 
@@ -1339,13 +1368,13 @@ pub fn parseContentForIndexing(allocator: std.mem.Allocator, path: []const u8, c
             }
         }
 
-        // Tier 4: word index — narrows candidates for short queries or missed trigrams.
+        // Tier 4: word index scan — for files not yet searched.
         if (result_list.items.len < max_results) {
-            const word_hits = self.word_index.search(query);
-            if (word_hits.len > 0) {
+            const tier4_hits = self.word_index.search(query);
+            if (tier4_hits.len > 0) {
                 var word_paths = std.StringHashMap(void).init(allocator);
                 defer word_paths.deinit();
-                for (word_hits) |hit| word_paths.put(self.word_index.hitPath(hit), {}) catch {};
+                for (tier4_hits) |hit| word_paths.put(self.word_index.hitPath(hit), {}) catch {};
                 var wp_iter = word_paths.keyIterator();
                 while (wp_iter.next()) |key_ptr| {
                     if (searched.contains(key_ptr.*)) continue;
@@ -2744,6 +2773,22 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
         current_line_start = line_end + 1;
         pos = line_end + 1;
     }
+}
+
+
+fn extractLineByNumber(content: []const u8, target_line: u32) ?[]const u8 {
+    if (target_line == 0) return null;
+    var line_num: u32 = 1;
+    var start: usize = 0;
+    for (content, 0..) |c, i| {
+        if (c == '\n') {
+            if (line_num == target_line) return content[start..i];
+            line_num += 1;
+            start = i + 1;
+        }
+    }
+    if (line_num == target_line and start <= content.len) return content[start..];
+    return null;
 }
 
 fn matchAtCaseInsensitive(content: []const u8, pos: usize, query: []const u8) bool {
