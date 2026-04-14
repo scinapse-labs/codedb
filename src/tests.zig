@@ -6484,6 +6484,7 @@ test "symbol-index: removeFile cleans symbol_index" {
     try testing.expect(before != null);
     testing.allocator.free(before.?.path);
     testing.allocator.free(before.?.symbol.name);
+    if (before.?.symbol.detail) |d| testing.allocator.free(d);
 
     explorer.removeFile("a.zig");
 
@@ -6501,6 +6502,7 @@ test "symbol-index: re-index updates symbol_index" {
     try testing.expect(r1 != null);
     testing.allocator.free(r1.?.path);
     testing.allocator.free(r1.?.symbol.name);
+    if (r1.?.symbol.detail) |d| testing.allocator.free(d);
 
     // Re-index same file with different content
     try explorer.indexFile("a.zig", "pub fn new_name() void {}");
@@ -6511,6 +6513,7 @@ test "symbol-index: re-index updates symbol_index" {
     try testing.expect(r3 != null);
     testing.allocator.free(r3.?.path);
     testing.allocator.free(r3.?.symbol.name);
+    if (r3.?.symbol.detail) |d| testing.allocator.free(d);
 }
 
 // ── searchInContent incremental line counting test ─────────
