@@ -149,7 +149,7 @@ const html =
     \\    </button>
     \\    <div class="nav-links" id="nav-links">
     \\      <a href="/benchmarks">Benchmarks</a>
-    \\      <a href="/v0.2.57" style="color:var(--accent);font-weight:600;">v0.2.57</a>
+    \\      <a href="/v0.2.572" style="color:var(--accent);font-weight:600;">v0.2.572</a>
     \\      <a href="/quickstart">Install</a>
     \\      <a href="https://github.com/justrach/codedb">GitHub</a>
     \\      <a href="/quickstart" class="nav-cta">Get started</a>
