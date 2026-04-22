@@ -365,7 +365,11 @@ fn handleConnection(
             respondJson(&conn, "403 Forbidden", "{\"error\":\"path traversal not allowed\"}");
             return;
         }
-        const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
+        const root_dir = explorer.root_dir orelse {
+            respondJson(&conn, "500 Internal Server Error", "{\"error\":\"root not configured\"}");
+            return;
+        };
+        const content = root_dir.readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => {
                 respondJson(&conn, "404 Not Found", "{\"error\":\"file not found\"}");
                 return;
