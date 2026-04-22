@@ -65,7 +65,7 @@ fn mainImpl() !void {
     const stdout = cio.File.stdout();
     const use_color = stdout.isTty();
     const s = sty.style(use_color);
-    const out = Out{ .file = stdout, .alloc = allocator };
+    var out = Out{ .file = stdout, .alloc = allocator };
 
     const args = try cio.argsAlloc(allocator);
     defer cio.argsFree(allocator, args);
@@ -104,6 +104,13 @@ fn mainImpl() !void {
     } else {
         printUsage(out, s);
         std.process.exit(1);
+    }
+
+    // MCP stdio reserves stdout for JSON-RPC — route status/error output to
+    // stderr so startup/failure paths don't corrupt the protocol stream.
+    // See #304.
+    if (std.mem.eql(u8, cmd, "mcp")) {
+        out.file = cio.File.stderr();
     }
 
     // Handle --version early (no root needed)
