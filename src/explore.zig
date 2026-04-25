@@ -100,6 +100,20 @@ pub const Language = enum(u8) {
     yaml,
     unknown,
     dart,
+    java,
+    kotlin,
+    svelte,
+    vue,
+    astro,
+    shell,
+    css,
+    scss,
+    sql,
+    protobuf,
+    fortran,
+    llvm_ir,
+    mlir,
+    tablegen,
 };
 
 pub fn detectLanguage(path: []const u8) Language {
@@ -107,7 +121,8 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".c") or std.mem.endsWith(u8, path, ".h")) return .c;
     if (std.mem.endsWith(u8, path, ".cpp") or std.mem.endsWith(u8, path, ".hpp") or
         std.mem.endsWith(u8, path, ".cc") or std.mem.endsWith(u8, path, ".hh") or
-        std.mem.endsWith(u8, path, ".cxx") or std.mem.endsWith(u8, path, ".hxx"))
+        std.mem.endsWith(u8, path, ".cxx") or std.mem.endsWith(u8, path, ".hxx") or
+        std.mem.endsWith(u8, path, ".mm"))
         return .cpp;
     if (std.mem.endsWith(u8, path, ".py")) return .python;
     if (std.mem.endsWith(u8, path, ".js") or std.mem.endsWith(u8, path, ".jsx")) return .javascript;
@@ -122,6 +137,20 @@ pub fn detectLanguage(path: []const u8) Language {
     if (std.mem.endsWith(u8, path, ".json")) return .json;
     if (std.mem.endsWith(u8, path, ".yaml") or std.mem.endsWith(u8, path, ".yml")) return .yaml;
     if (std.mem.endsWith(u8, path, ".dart")) return .dart;
+    if (std.mem.endsWith(u8, path, ".java")) return .java;
+    if (std.mem.endsWith(u8, path, ".kt")) return .kotlin;
+    if (std.mem.endsWith(u8, path, ".svelte")) return .svelte;
+    if (std.mem.endsWith(u8, path, ".vue")) return .vue;
+    if (std.mem.endsWith(u8, path, ".astro")) return .astro;
+    if (std.mem.endsWith(u8, path, ".sh")) return .shell;
+    if (std.mem.endsWith(u8, path, ".css")) return .css;
+    if (std.mem.endsWith(u8, path, ".scss")) return .scss;
+    if (std.mem.endsWith(u8, path, ".sql")) return .sql;
+    if (std.mem.endsWith(u8, path, ".proto")) return .protobuf;
+    if (std.mem.endsWith(u8, path, ".f90")) return .fortran;
+    if (std.mem.endsWith(u8, path, ".ll")) return .llvm_ir;
+    if (std.mem.endsWith(u8, path, ".mlir")) return .mlir;
+    if (std.mem.endsWith(u8, path, ".td")) return .tablegen;
     return .unknown;
 }
 
@@ -3031,9 +3060,15 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
     if (trimmed.len == 0) return true;
     return switch (language) {
         .zig, .rust, .go_lang => std.mem.startsWith(u8, trimmed, "//"),
-        .python, .ruby, .r => std.mem.startsWith(u8, trimmed, "#"),
+        .python, .ruby, .r, .shell => std.mem.startsWith(u8, trimmed, "#"),
         .hcl => std.mem.startsWith(u8, trimmed, "#") or std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
-        .javascript, .typescript, .c, .cpp, .dart => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
+        .javascript, .typescript, .c, .cpp, .dart, .java, .kotlin, .protobuf, .mlir, .tablegen => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
+        .svelte, .vue, .astro => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*") or std.mem.startsWith(u8, trimmed, "<!--"),
+        .css => std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
+        .scss => std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
+        .sql => std.mem.startsWith(u8, trimmed, "--") or std.mem.startsWith(u8, trimmed, "/*") or std.mem.startsWith(u8, trimmed, "*"),
+        .fortran => std.mem.startsWith(u8, trimmed, "!"),
+        .llvm_ir => std.mem.startsWith(u8, trimmed, ";"),
         else => false,
     };
 }

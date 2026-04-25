@@ -1896,7 +1896,7 @@ test "detectLanguage: public access and correct detection" {
     try testing.expect(explore.detectLanguage("src/main.zig") == .zig);
     try testing.expect(explore.detectLanguage("app.py") == .python);
     try testing.expect(explore.detectLanguage("index.ts") == .typescript);
-    try testing.expect(explore.detectLanguage("style.css") == .unknown);
+    try testing.expect(explore.detectLanguage("style.css") == .css);
 }
 
 test "extractLines: without line numbers" {
@@ -1991,6 +1991,24 @@ test "isCommentOrBlank: cpp block and line comments" {
     try testing.expect(isCommentOrBlank("  /* cpp block comment */", .cpp));
     try testing.expect(isCommentOrBlank("  * continued block comment", .cpp));
     try testing.expect(!isCommentOrBlank("  int x = 0;", .cpp));
+}
+
+test "isCommentOrBlank: detected extension language comments" {
+    try testing.expect(isCommentOrBlank("  // java line comment", .java));
+    try testing.expect(isCommentOrBlank("  // kotlin line comment", .kotlin));
+    try testing.expect(isCommentOrBlank("  <!-- component comment -->", .svelte));
+    try testing.expect(isCommentOrBlank("  <!-- component comment -->", .vue));
+    try testing.expect(isCommentOrBlank("  <!-- component comment -->", .astro));
+    try testing.expect(isCommentOrBlank("  # shell comment", .shell));
+    try testing.expect(isCommentOrBlank("  /* css block comment */", .css));
+    try testing.expect(isCommentOrBlank("  // scss line comment", .scss));
+    try testing.expect(isCommentOrBlank("  -- sql comment", .sql));
+    try testing.expect(isCommentOrBlank("  // proto comment", .protobuf));
+    try testing.expect(isCommentOrBlank("  ! fortran comment", .fortran));
+    try testing.expect(isCommentOrBlank("  ; llvm ir comment", .llvm_ir));
+    try testing.expect(isCommentOrBlank("  // mlir comment", .mlir));
+    try testing.expect(isCommentOrBlank("  // tablegen comment", .tablegen));
+    try testing.expect(!isCommentOrBlank("  SELECT * FROM users;", .sql));
 }
 
 test "isCommentOrBlank: tabs and mixed whitespace" {
@@ -2146,6 +2164,7 @@ test "detectLanguage: all supported extensions" {
     try testing.expect(explore.detectLanguage("app.hh") == .cpp);
     try testing.expect(explore.detectLanguage("app.cxx") == .cpp);
     try testing.expect(explore.detectLanguage("app.hxx") == .cpp);
+    try testing.expect(explore.detectLanguage("bridge.mm") == .cpp);
     try testing.expect(explore.detectLanguage("script.py") == .python);
     try testing.expect(explore.detectLanguage("app.js") == .javascript);
     try testing.expect(explore.detectLanguage("comp.jsx") == .javascript);
@@ -2158,6 +2177,20 @@ test "detectLanguage: all supported extensions" {
     try testing.expect(explore.detectLanguage("pkg.json") == .json);
     try testing.expect(explore.detectLanguage("config.yaml") == .yaml);
     try testing.expect(explore.detectLanguage("config.yml") == .yaml);
+    try testing.expect(explore.detectLanguage("Main.java") == .java);
+    try testing.expect(explore.detectLanguage("App.kt") == .kotlin);
+    try testing.expect(explore.detectLanguage("Widget.svelte") == .svelte);
+    try testing.expect(explore.detectLanguage("Widget.vue") == .vue);
+    try testing.expect(explore.detectLanguage("Page.astro") == .astro);
+    try testing.expect(explore.detectLanguage("bootstrap.sh") == .shell);
+    try testing.expect(explore.detectLanguage("styles.css") == .css);
+    try testing.expect(explore.detectLanguage("styles.scss") == .scss);
+    try testing.expect(explore.detectLanguage("schema.sql") == .sql);
+    try testing.expect(explore.detectLanguage("service.proto") == .protobuf);
+    try testing.expect(explore.detectLanguage("solver.f90") == .fortran);
+    try testing.expect(explore.detectLanguage("module.ll") == .llvm_ir);
+    try testing.expect(explore.detectLanguage("dialect.mlir") == .mlir);
+    try testing.expect(explore.detectLanguage("records.td") == .tablegen);
     try testing.expect(explore.detectLanguage("Makefile") == .unknown);
     try testing.expect(explore.detectLanguage("no_ext") == .unknown);
 }
