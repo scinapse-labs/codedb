@@ -37,7 +37,7 @@
 >
 > codedb works and is used daily in production AI workflows, but:
 > - **Parser support** — Zig, C/C++, Python, TypeScript/JavaScript, Rust, Go, PHP, Ruby, HCL, R, Dart/Flutter
-> - **Language detection** — also tags Java, Kotlin, Svelte, Vue, Astro, shell, CSS/SCSS, SQL, protobuf, Fortran, LLVM IR, MLIR, and TableGen files in trees/snapshots
+> - **Lightweight outline support** — Java, Kotlin, Svelte, Vue, Astro, shell, CSS/SCSS, SQL, protobuf, Fortran, LLVM IR, MLIR, and TableGen
 > - **No auth** — HTTP server binds to localhost only
 > - **Snapshot format** may change between versions
 > - **MCP protocol** is JSON-RPC 2.0 over stdio (stable)
