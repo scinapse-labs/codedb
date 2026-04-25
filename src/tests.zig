@@ -6341,6 +6341,187 @@ test "issue-319: C parser avoids comments strings prototypes and macro calls" {
     try testing.expectEqual(@as(usize, 0), handler.len);
 }
 
+test "issue-321: common detected extensions produce outlines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var explorer = Explorer.init(alloc);
+
+    try explorer.indexFile("src/App.java",
+        \\package demo;
+        \\import java.util.List;
+        \\public class Worker {
+        \\    public void run() {}
+        \\}
+        \\interface RunnableThing {}
+        \\enum Mode { A }
+        \\record Pair(int left, int right) {}
+    );
+    try explorer.indexFile("src/App.kt",
+        \\package demo
+        \\import kotlinx.coroutines.runBlocking
+        \\data class User(val name: String)
+        \\interface Repo
+        \\enum class KotlinMode { A }
+        \\fun loadUser(): User = User("a")
+        \\val answer = 42
+    );
+    try explorer.indexFile("src/Widget.svelte",
+        \\<script>
+        \\import Thing from './Thing.svelte';
+        \\export let title;
+        \\function renderTitle() {}
+        \\</script>
+        \\.card { color: red; }
+    );
+    try explorer.indexFile("src/View.vue",
+        \\<script setup>
+        \\import Child from './Child.vue'
+        \\const count = 0
+        \\function inc() {}
+        \\</script>
+    );
+    try explorer.indexFile("src/Page.astro",
+        \\---
+        \\import Layout from '../layouts/Layout.astro';
+        \\const title = 'Home';
+        \\---
+    );
+    try explorer.indexFile("scripts/build.sh",
+        \\source ./env.sh
+        \\function build_app() {
+        \\}
+        \\deploy_app() {
+        \\}
+        \\BUILD_MODE=release
+    );
+    try explorer.indexFile("styles/app.css",
+        \\:root {
+        \\  --brand: red;
+        \\}
+        \\.button {
+        \\  color: var(--brand);
+        \\}
+        \\@keyframes fade {}
+    );
+    try explorer.indexFile("styles/app.scss",
+        \\$gap: 8px;
+        \\@mixin center {}
+        \\.panel {}
+    );
+    try explorer.indexFile("db/schema.sql",
+        \\CREATE TABLE users (id integer);
+        \\CREATE OR REPLACE FUNCTION do_thing() RETURNS void AS $$ SELECT 1; $$ LANGUAGE sql;
+        \\CREATE INDEX idx_users_id ON users(id);
+    );
+    try explorer.indexFile("api/service.proto",
+        \\syntax = "proto3";
+        \\import "google/protobuf/timestamp.proto";
+        \\message User {}
+        \\enum Status { STATUS_OK = 0; }
+        \\service UserService {
+        \\  rpc GetUser (User) returns (User);
+        \\}
+    );
+    try explorer.indexFile("math/solver.f90",
+        \\module solver
+        \\use mathlib
+        \\type :: Particle
+        \\end type
+        \\subroutine step()
+        \\end subroutine
+        \\function energy()
+        \\end function
+    );
+    try explorer.indexFile("ir/module.ll",
+        \\%Pair = type { i32, i32 }
+        \\@global_value = global i32 0
+        \\define i32 @main() {
+        \\  ret i32 0
+        \\}
+    );
+    try explorer.indexFile("ir/dialect.mlir",
+        \\module @kernel_mod {
+        \\  func.func @kernel() {
+        \\    return
+        \\  }
+        \\}
+    );
+    try explorer.indexFile("llvm/records.td",
+        \\include "Base.td"
+        \\class Register<string name>;
+        \\multiclass Pat<string op>;
+        \\def R0 : Register<"r0">;
+        \\defm ADD : Pat<"add">;
+        \\let Namespace = "Toy";
+    );
+
+    const java_outline = try explorer.getOutline("src/App.java", alloc) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Language.java, java_outline.language);
+    try testing.expectEqualStrings("java.util.List", java_outline.imports.items[0]);
+
+    const worker = try explorer.findAllSymbols("Worker", alloc);
+    defer alloc.free(worker);
+    try testing.expectEqual(@as(usize, 1), worker.len);
+    try testing.expectEqual(SymbolKind.class_def, worker[0].symbol.kind);
+
+    const run = try explorer.findAllSymbols("run", alloc);
+    defer alloc.free(run);
+    try testing.expectEqual(@as(usize, 1), run.len);
+    try testing.expectEqual(SymbolKind.method, run[0].symbol.kind);
+
+    const user = try explorer.findAllSymbols("User", alloc);
+    defer alloc.free(user);
+    try testing.expect(user.len >= 2);
+
+    const load_user = try explorer.findAllSymbols("loadUser", alloc);
+    defer alloc.free(load_user);
+    try testing.expectEqual(@as(usize, 1), load_user.len);
+    try testing.expectEqual(SymbolKind.function, load_user[0].symbol.kind);
+
+    const title = try explorer.findAllSymbols("title", alloc);
+    defer alloc.free(title);
+    try testing.expect(title.len >= 2);
+
+    const build_app = try explorer.findAllSymbols("build_app", alloc);
+    defer alloc.free(build_app);
+    try testing.expectEqual(@as(usize, 1), build_app.len);
+    try testing.expectEqual(SymbolKind.function, build_app[0].symbol.kind);
+
+    const button = try explorer.findAllSymbols(".button", alloc);
+    defer alloc.free(button);
+    try testing.expectEqual(@as(usize, 1), button.len);
+
+    const users = try explorer.findAllSymbols("users", alloc);
+    defer alloc.free(users);
+    try testing.expectEqual(@as(usize, 1), users.len);
+    try testing.expectEqual(SymbolKind.struct_def, users[0].symbol.kind);
+
+    const user_service = try explorer.findAllSymbols("UserService", alloc);
+    defer alloc.free(user_service);
+    try testing.expectEqual(@as(usize, 1), user_service.len);
+    try testing.expectEqual(SymbolKind.interface_def, user_service[0].symbol.kind);
+
+    const particle = try explorer.findAllSymbols("Particle", alloc);
+    defer alloc.free(particle);
+    try testing.expectEqual(@as(usize, 1), particle.len);
+    try testing.expectEqual(SymbolKind.struct_def, particle[0].symbol.kind);
+
+    const main_sym = try explorer.findAllSymbols("main", alloc);
+    defer alloc.free(main_sym);
+    try testing.expectEqual(@as(usize, 1), main_sym.len);
+    try testing.expectEqual(SymbolKind.function, main_sym[0].symbol.kind);
+
+    const kernel = try explorer.findAllSymbols("kernel", alloc);
+    defer alloc.free(kernel);
+    try testing.expectEqual(@as(usize, 1), kernel.len);
+    try testing.expectEqual(SymbolKind.function, kernel[0].symbol.kind);
+
+    const r0 = try explorer.findAllSymbols("R0", alloc);
+    defer alloc.free(r0);
+    try testing.expectEqual(@as(usize, 1), r0.len);
+}
+
 test "issue-179: Python inline docstring does not leak symbols" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
