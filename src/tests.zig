@@ -1647,6 +1647,14 @@ test "snapshot_json: snapshot builds and is valid JSON" {
     try testing.expect(parsed.value.object.contains("outlines"));
     try testing.expect(parsed.value.object.contains("symbol_index"));
     try testing.expect(parsed.value.object.contains("dep_graph"));
+
+    const tree = parsed.value.object.get("tree").?.string;
+    try testing.expect(std.mem.indexOf(u8, tree, "src/") != null);
+    try testing.expect(std.mem.indexOf(u8, tree, "main.zig") != null);
+
+    const symbol_index = parsed.value.object.get("symbol_index").?.object;
+    try testing.expect(symbol_index.contains("main"));
+    try testing.expect(symbol_index.contains("version"));
 }
 
 // ── Deep copy correctness tests ─────────────────────────────
