@@ -2,7 +2,7 @@ const mer = @import("mer");
 
 pub const meta: mer.Meta = .{
     .title = "codedb — Code intelligence for AI agents. Zig core. Sub-millisecond queries.",
-    .description = "Code intelligence server for AI agents. 12 MCP tools, trigram search, dependency graph, sub-millisecond queries. Pure Zig. Zero dependencies.",
+    .description = "Code intelligence server for AI agents. 16 MCP tools, trigram search, dependency graph, sub-millisecond queries. Pure Zig. Zero dependencies.",
 };
 
 pub const prerender = true;
@@ -163,7 +163,7 @@ const html =
     \\  <div class="hero-headline">
     \\    Code intelligence<br>for <span class="hl">AI agents</span>.
     \\  </div>
-    \\  <div class="hero-sub">Sub-millisecond queries. Zero dependencies. Pure Zig. 12 MCP tools that give your agent structural understanding of any codebase.</div>
+    \\  <div class="hero-sub">Sub-millisecond queries. Zero dependencies. Pure Zig. 16 MCP tools that give your agent structural understanding of any codebase.</div>
     \\  <div class="hero-install">
     \\    <span class="prompt">$</span> curl -fsSL https://codedb.codegraff.com/install.sh | bash
     \\  </div>
@@ -199,7 +199,7 @@ const html =
     \\
     \\<!-- What it does -->
     \\<div class="section">
-    \\  <div class="section-label">12 MCP tools</div>
+    \\  <div class="section-label">16 MCP tools</div>
     \\  <div class="section-title">Everything an agent needs</div>
     \\  <div class="section-desc">codedb indexes your codebase on startup &mdash; outlines, trigram search, word index, dependency graph &mdash; and serves it all over the Model Context Protocol. Your AI agent gets structural understanding, not raw text.</div>
     \\  <div class="tool-grid">

@@ -68,7 +68,7 @@
 curl -fsSL https://codedb.codegraff.com/install.sh | bash
 ```
 
-Downloads the binary for your platform and auto-registers codedb as an MCP server in **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor**.
+Downloads the binary for your platform and auto-registers codedb as an MCP server in **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor**. The installer prints the exact `codedb mcp` command it registered plus hook setup pointers for Codex and Claude Code.
 
 | Platform | Binary | Signed |
 |----------|--------|--------|
@@ -85,7 +85,7 @@ Or install manually from [GitHub Releases](https://github.com/justrach/codedb/re
 
 ### As an MCP server (recommended)
 
-After installing, codedb is automatically registered. Just open a project and the 12 MCP tools are available to your AI agent.
+After installing, codedb is automatically registered. Just open a project and the 16 MCP tools are available to your AI agent.
 
 ```bash
 # Manual MCP start (auto-configured by install script)
@@ -131,37 +131,46 @@ codedb hot                            # recently modified files
 | `codedb_status` | Index status (file count, current sequence) |
 | `codedb_snapshot` | Full pre-rendered JSON snapshot of the codebase |
 | `codedb_bundle` | Batch multiple read-only queries in one call (max 20 ops) |
-| `codedb_remote` | Query any GitHub repo via cloud intelligence — no local clone needed |
+| `codedb_remote` | Query indexed public repos via api.wiki.codes — no local clone needed |
 | `codedb_projects` | List all locally indexed projects on this machine |
 | `codedb_index` | Index a local folder and create a codedb.snapshot |
 
 
 ### `codedb_remote` — Cloud Intelligence
 
-Query any public GitHub repo without cloning it. The default backend uses `codedb.codegraff.com`; `backend="wiki"` uses `api.wiki.codes` for code intelligence plus dependency/security artifacts.
+Query any indexed public GitHub repo without cloning it. `codedb_remote` always uses `api.wiki.codes`; the old `codegraff` backend name is no longer a supported route. Omit `backend`, or keep `backend="wiki"` only for older prompts.
 
 ```
-# Get the file tree of an external repo via the default backend
-codedb_remote repo="vercel/next.js" action="tree"
+# Check what the remote slug supports
+codedb_remote repo="vercel/next.js" action="actions"
+
+# Get a compact directory summary instead of dumping a huge file list
+codedb_remote repo="vercel/next.js" action="tree" expand=false
+
+# Page a file tree by prefix and limit
+codedb_remote repo="vercel/next.js" action="tree" prefix="packages/" limit=100
 
 # Search for code in a dependency
 codedb_remote repo="justrach/merjs" action="search" query="handleRequest"
 
-# Exact symbol lookup through api.wiki.codes
-codedb_remote repo="justrach/codedb" backend="wiki" action="symbol" query="buildSnapshot"
+# Read a small file slice
+codedb_remote repo="openai/codex" action="read" path="codex-rs/core/src/codex.rs" lines="1-80"
+
+# Exact symbol lookup
+codedb_remote repo="justrach/codedb" action="symbol" query="buildSnapshot"
 
 # Check dependency CVE evidence; scope can be runtime or all
-codedb_remote repo="axios/axios" backend="wiki" action="cves" scope="runtime"
+codedb_remote repo="axios/axios" action="cves" scope="runtime"
 
 # Raw wiki slugs are accepted for repos that are indexed that way
-codedb_remote repo="chromium" backend="wiki" action="policy"
+codedb_remote repo="chromium" action="policy"
 ```
 
-**Default actions:** `tree`, `outline`, `search`, `meta`
+**Remote actions:** `actions`, `tree`, `outline`, `search`, `read`, `symbol`, `policy`, `deps`, `score`, `cves`, `commits`, `branches`, `dep-history`
 
-**Wiki actions:** `tree`, `outline`, `search`, `symbol`, `policy`, `deps`, `score`, `cves`, `commits`, `branches`, `dep-history`
+For Codex and Claude Code hook examples around `codedb_remote`, see [`docs/hooks-labs.md`](docs/hooks-labs.md).
 
-**Note:** This tool calls remote HTTPS services. No API key required. The selected service must be available for this tool to work.
+**Note:** This tool calls `https://api.wiki.codes`. No API key required. The repo must already be indexed by the public service.
 
 ### CLI Commands
 

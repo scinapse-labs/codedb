@@ -150,6 +150,20 @@ PYEOF
   printf "  ${G}✓${N} cursor       ${D}→ $config${N}\n"
 }
 
+print_hook_notes() {
+  local codedb_bin="$1"
+
+  echo ""
+  printf "  ${W}mcp command${N}\n"
+  printf "  ${C}$codedb_bin mcp${N}\n"
+  echo ""
+  printf "  ${W}optional hooks${N}\n"
+  printf "  ${D}codex${N}        enable [features].codex_hooks in ~/.codex/config.toml\n"
+  printf "  ${D}codex paths${N}  ~/.codex/hooks.json or <repo>/.codex/hooks.json\n"
+  printf "  ${D}claude paths${N} ~/.claude/settings.json or <repo>/.claude/settings.json\n"
+  printf "  ${D}examples${N}     https://github.com/justrach/codedb/blob/release/0.2.579/docs/hooks-labs.md\n"
+}
+
 main() {
   local platform version ext=""
   platform="$(detect_platform)"
@@ -203,6 +217,7 @@ main() {
   register_codex "$dest"
   register_gemini "$dest"
   register_cursor "$dest"
+  print_hook_notes "$dest"
 
   # Check PATH
   case ":$PATH:" in
