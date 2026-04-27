@@ -449,7 +449,7 @@ const tools_list =
     \\{"name":"codedb_status","description":"Get current codedb status: number of indexed files and current sequence number.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_snapshot","description":"Get the full pre-rendered snapshot of the codebase as a single JSON blob. Contains tree, all outlines, symbol index, and dependency graph. Ideal for caching or deploying to edge workers.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_bundle","description":"Batch multiple queries in one call. Max 20 ops. WARNING: Avoid bundling multiple codedb_read calls on large files — use codedb_outline + codedb_symbol instead. Bundle outline+symbol+search, not full file reads. Total response is not size-capped, so large bundles can exceed token limits.","inputSchema":{"type":"object","properties":{"ops":{"type":"array","items":{"type":"object","properties":{"tool":{"type":"string","description":"Tool name (e.g. codedb_outline, codedb_symbol, codedb_read)"},"arguments":{"type":"object","description":"Tool arguments"}},"required":["tool"]},"description":"Array of tool calls to execute"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["ops"]}},
-    \\{"name":"codedb_remote","description":"Query any GitHub repo via cloud intelligence. Default backend 'codegraff' (codedb.codegraff.com) gets file tree, symbol outlines, searches, repo meta, and file contents via action=read. Backend 'wiki' (api.wiki.codes) fronts the Hetzner parquet router and adds exact-identifier lookup, hot-pin policy, dependency/CVE scoring artifacts, commit metadata, capabilities, and file reads. For huge repos paginate tree with limit/offset/prefix and commits/dep-history with since/limit. Use action=read with path and optional lines='10-60' to fetch file slices.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. justrach/merjs). With backend=wiki, raw wiki slugs such as chromium are also accepted."},"action":{"type":"string","enum":["tree","outline","search","meta","read","actions","symbol","policy","deps","score","cves","commits","branches","dep-history"],"description":"What to query. codegraff backend: tree, outline, search, meta, read, actions. wiki backend: tree, outline, search, read, actions, symbol, policy, deps, score, cves, commits, branches, dep-history."},"query":{"type":"string","description":"Action-specific argument. search: text query. symbol: identifier name. outline: file path."},"path":{"type":"string","description":"For action=read: the file path to fetch."},"lines":{"type":"string","description":"For action=read: line range like '10-60' (1-indexed, inclusive). Omit for full file."},"limit":{"type":"integer","description":"For tree/commits/dep-history: cap the number of items returned (server may enforce its own ceiling)."},"offset":{"type":"integer","description":"For tree: skip the first N items (pagination)."},"prefix":{"type":"string","description":"For tree: only return paths starting with this prefix (e.g. 'src/')."},"expand":{"type":"boolean","description":"For tree: when true, return the full file list. When false (and the server supports it) returns a compact directory summary."},"since":{"type":"string","description":"For commits/dep-history: ISO timestamp or commit SHA to start from."},"scope":{"type":"string","enum":["runtime","all"],"description":"For wiki score/cves only. Defaults to runtime; use all to include dev/tooling dependencies."},"backend":{"type":"string","enum":["codegraff","wiki"],"description":"Which remote indexer to query. Default: codegraff. Use 'wiki' for api.wiki.codes symbol, policy, dependency, CVE, and history actions."}},"required":["repo","action"]}},
+    \\{"name":"codedb_remote","description":"Query indexed GitHub repos through api.wiki.codes. Supports tree pagination, search, exact symbol lookup, outlines, file reads, dependency/CVE scoring artifacts, commit metadata, and capabilities. For huge repos paginate tree with limit/offset/prefix and commits/dep-history with since/limit. Use action=read with path and optional lines='10-60' to fetch file slices.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. vercel/next.js) or a raw wiki slug such as chromium."},"action":{"type":"string","enum":["tree","outline","search","read","actions","symbol","policy","deps","score","cves","commits","branches","dep-history"],"description":"What to query from api.wiki.codes: tree, outline, search, read, actions, symbol, policy, deps, score, cves, commits, branches, dep-history."},"query":{"type":"string","description":"Action-specific argument. search: text query. symbol: identifier name. outline: file path."},"path":{"type":"string","description":"For action=read: the file path to fetch."},"lines":{"type":"string","description":"For action=read: line range like '10-60' (1-indexed, inclusive). Omit for full file."},"limit":{"type":"integer","description":"For tree/commits/dep-history: cap the number of items returned (server may enforce its own ceiling)."},"offset":{"type":"integer","description":"For tree: skip the first N items (pagination)."},"prefix":{"type":"string","description":"For tree: only return paths starting with this prefix (e.g. 'src/')."},"expand":{"type":"boolean","description":"For tree: when true, return the full file list. When false (and the server supports it) returns a compact directory summary."},"since":{"type":"string","description":"For commits/dep-history: ISO timestamp or commit SHA to start from."},"scope":{"type":"string","enum":["runtime","all"],"description":"For score/cves only. Defaults to runtime; use all to include dev/tooling dependencies."},"backend":{"type":"string","enum":["wiki"],"description":"Deprecated compatibility field. Only 'wiki' is accepted; requests always use api.wiki.codes."}},"required":["repo","action"]}},
     \\{"name":"codedb_projects","description":"List all locally indexed projects on this machine. Shows project paths, data directory hashes, and whether a snapshot exists. Use to discover what codebases are available.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the folder to index (e.g. /Users/you/myproject)"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy file search — finds files by approximate name. Typo-tolerant subsequence matching with word-boundary and filename bonuses. Use when you know roughly what file you're looking for but not the exact path. Much faster than codedb_tree + manual scan.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy search query (e.g. 'authmidlware', 'test_auth', 'main.zig')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
@@ -1430,16 +1430,30 @@ fn isRemoteRepoPart(part: []const u8) bool {
     return true;
 }
 
-fn isCodegraffRepo(repo: []const u8) bool {
-    if (repo.len == 0 or repo[0] == '/') return false;
-    if (std.mem.indexOf(u8, repo, "..") != null or
-        std.mem.indexOf(u8, repo, "//") != null)
-    {
-        return false;
+fn appendSlugChar(out: []u8, len: *usize, c: u8, last_dash: *bool) void {
+    const lower = std.ascii.toLower(c);
+    if ((lower >= 'a' and lower <= 'z') or (lower >= '0' and lower <= '9')) {
+        out[len.*] = lower;
+        len.* += 1;
+        last_dash.* = false;
+    } else if (!last_dash.* and len.* > 0) {
+        out[len.*] = '-';
+        len.* += 1;
+        last_dash.* = true;
     }
-    const slash_pos = std.mem.indexOfScalar(u8, repo, '/') orelse return false;
-    if (std.mem.indexOfScalarPos(u8, repo, slash_pos + 1, '/') != null) return false;
-    return isRemoteRepoPart(repo[0..slash_pos]) and isRemoteRepoPart(repo[slash_pos + 1 ..]);
+}
+
+fn ingestSlugForOwnerRepo(owner: []const u8, repo: []const u8, buf: []u8) ?[]const u8 {
+    if (!isRemoteRepoPart(owner) or !isRemoteRepoPart(repo)) return null;
+
+    var len: usize = 0;
+    var last_dash = false;
+    for (owner) |c| appendSlugChar(buf, &len, c, &last_dash);
+    appendSlugChar(buf, &len, '-', &last_dash);
+    for (repo) |c| appendSlugChar(buf, &len, c, &last_dash);
+    if (len > 0 and buf[len - 1] == '-') len -= 1;
+    if (len == 0) return null;
+    return buf[0..len];
 }
 
 fn wikiSlugForRepo(repo: []const u8, buf: []u8) ?[]const u8 {
@@ -1452,11 +1466,7 @@ fn wikiSlugForRepo(repo: []const u8, buf: []u8) ?[]const u8 {
 
     if (std.mem.indexOfScalar(u8, repo, '/')) |slash_pos| {
         if (std.mem.indexOfScalarPos(u8, repo, slash_pos + 1, '/') != null) return null;
-        if (!isRemoteRepoPart(repo[0..slash_pos]) or !isRemoteRepoPart(repo[slash_pos + 1 ..])) return null;
-
-        @memcpy(buf[0..repo.len], repo);
-        buf[slash_pos] = '-';
-        return buf[0..repo.len];
+        return ingestSlugForOwnerRepo(repo[0..slash_pos], repo[slash_pos + 1 ..], buf);
     }
 
     if (!isRemoteRepoPart(repo)) return null;
@@ -1468,18 +1478,13 @@ test "wikiSlugForRepo normalizes owner repo and raw slugs" {
     var buf: [256]u8 = undefined;
 
     try testing.expectEqualStrings("justrach-codedb", wikiSlugForRepo("justrach/codedb", buf[0..]).?);
-    try testing.expectEqualStrings("vercel-next.js", wikiSlugForRepo("vercel/next.js", buf[0..]).?);
+    try testing.expectEqualStrings("vercel-next-js", wikiSlugForRepo("vercel/next.js", buf[0..]).?);
+    try testing.expectEqualStrings("owner-repo-name", wikiSlugForRepo("OWNER/Repo.Name", buf[0..]).?);
     try testing.expectEqualStrings("chromium", wikiSlugForRepo("chromium", buf[0..]).?);
 }
 
 test "remote repo validation rejects traversal and malformed paths" {
     var buf: [256]u8 = undefined;
-
-    try testing.expect(isCodegraffRepo("justrach/codedb"));
-    try testing.expect(!isCodegraffRepo("chromium"));
-    try testing.expect(!isCodegraffRepo("../codedb"));
-    try testing.expect(!isCodegraffRepo("justrach//codedb"));
-    try testing.expect(!isCodegraffRepo("justrach/codedb/extra"));
 
     try testing.expect(wikiSlugForRepo("chromium", buf[0..]) != null);
     try testing.expect(wikiSlugForRepo("../codedb", buf[0..]) == null);
@@ -1563,20 +1568,15 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         return;
     };
 
-    // Backend selection: default preserves existing behavior. "wiki" routes
-    // directly to api.wiki.codes, which fronts the Hetzner parquet router and
-    // exposes code intelligence plus compact dependency/security artifacts.
-    const backend = getStr(args, "backend") orelse "codegraff";
-    const is_wiki = std.mem.eql(u8, backend, "wiki");
-    const is_codegraff = std.mem.eql(u8, backend, "codegraff");
-    if (!is_wiki and !is_codegraff) {
-        out.appendSlice(alloc, "error: invalid backend, must be one of: codegraff, wiki") catch {};
-        return;
+    // api.wiki.codes is the remote backend. Keep backend=wiki as a tolerated
+    // compatibility arg, but never route elsewhere.
+    if (getStr(args, "backend")) |backend| {
+        if (!std.mem.eql(u8, backend, "wiki")) {
+            out.appendSlice(alloc, "error: invalid backend, only 'wiki' / api.wiki.codes is supported") catch {};
+            return;
+        }
     }
 
-    // Per-backend action allowlists. Wiki adds symbol/security/history
-    // artifacts and drops meta; both backends expose read/actions now.
-    const codegraff_actions = [_][]const u8{ "tree", "outline", "search", "meta", "read", "actions" };
     const wiki_actions = [_][]const u8{
         "tree",
         "outline",
@@ -1592,9 +1592,8 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         "dep-history",
         "actions",
     };
-    const allowed: []const []const u8 = if (is_wiki) &wiki_actions else &codegraff_actions;
     var action_valid = false;
-    for (allowed) |va| {
+    for (&wiki_actions) |va| {
         if (std.mem.eql(u8, action, va)) {
             action_valid = true;
             break;
@@ -1603,35 +1602,23 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     if (!action_valid) {
         out.appendSlice(alloc, "error: action '") catch {};
         out.appendSlice(alloc, action) catch {};
-        out.appendSlice(alloc, "' not supported on backend '") catch {};
-        out.appendSlice(alloc, backend) catch {};
-        out.appendSlice(alloc, "' (") catch {};
-        if (is_wiki) {
-            out.appendSlice(alloc, "wiki supports: tree, outline, search, read, symbol, policy, deps, score, cves, commits, branches, dep-history, actions)") catch {};
-        } else {
-            out.appendSlice(alloc, "codegraff supports: tree, outline, search, meta, read, actions)") catch {};
-        }
+        out.appendSlice(alloc, "' not supported by api.wiki.codes (supports: tree, outline, search, read, symbol, policy, deps, score, cves, commits, branches, dep-history, actions)") catch {};
         return;
     }
 
     var wiki_slug_buf: [256]u8 = undefined;
-    var wiki_slug: []const u8 = "";
-    if (is_wiki) {
-        wiki_slug = wikiSlugForRepo(repo, wiki_slug_buf[0..]) orelse {
-            out.appendSlice(alloc, "error: invalid wiki repo, use owner/repo or raw wiki slug (e.g. justrach/codedb or chromium)") catch {};
-            return;
-        };
-    } else if (!isCodegraffRepo(repo)) {
-        out.appendSlice(alloc, "error: invalid repo format, use owner/repo (e.g. justrach/merjs)") catch {};
+    const wiki_slug = wikiSlugForRepo(repo, wiki_slug_buf[0..]) orelse {
+        out.appendSlice(alloc, "error: invalid wiki repo, use owner/repo or raw wiki slug (e.g. vercel/next.js or chromium)") catch {};
         return;
-    }
+    };
 
     const query = getStr(args, "query");
 
     // Require a non-empty 'query' for actions that consume it. Sending an
     // empty value silently masked real user mistakes.
     const needs_query = std.mem.eql(u8, action, "search") or
-        (is_wiki and (std.mem.eql(u8, action, "symbol") or std.mem.eql(u8, action, "outline")));
+        std.mem.eql(u8, action, "symbol") or
+        std.mem.eql(u8, action, "outline");
     if (needs_query and (query == null or query.?.len == 0)) {
         out.appendSlice(alloc, "error: action '") catch {};
         out.appendSlice(alloc, action) catch {};
@@ -1663,16 +1650,10 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     }
 
     var url_buf: [512]u8 = undefined;
-    const url = if (is_wiki)
-        std.fmt.bufPrint(&url_buf, "https://api.wiki.codes/api/{s}/{s}", .{ wiki_slug, action }) catch {
-            out.appendSlice(alloc, "error: URL too long") catch {};
-            return;
-        }
-    else
-        std.fmt.bufPrint(&url_buf, "https://codedb.codegraff.com/{s}/{s}", .{ repo, action }) catch {
-            out.appendSlice(alloc, "error: URL too long") catch {};
-            return;
-        };
+    const url = std.fmt.bufPrint(&url_buf, "https://api.wiki.codes/api/{s}/{s}", .{ wiki_slug, action }) catch {
+        out.appendSlice(alloc, "error: URL too long") catch {};
+        return;
+    };
 
     // Build the URL params list. Action-specific arg first, then optional
     // pagination/filter params. Server is free to ignore unknown keys.
@@ -1712,8 +1693,17 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         if (getStr(args, "prefix")) |v| {
             if (v.len > 0) params.append(alloc, .{ .name = "prefix", .value = v }) catch {};
         }
-        if (getBool(args, "expand")) {
-            params.append(alloc, .{ .name = "expand", .value = "true" }) catch {};
+        if (args.get("expand")) |expand_val| {
+            switch (expand_val) {
+                .bool => |expand| {
+                    if (expand) {
+                        params.append(alloc, .{ .name = "expand", .value = "true" }) catch {};
+                    } else {
+                        params.append(alloc, .{ .name = "summary", .value = "true" }) catch {};
+                    }
+                },
+                else => {},
+            }
         }
     } else if (std.mem.eql(u8, action, "commits") or std.mem.eql(u8, action, "dep-history")) {
         if (getInt(args, "limit")) |n| {
@@ -1727,11 +1717,7 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     }
 
     const remote = fetchRemote(alloc, url, params.items) catch {
-        if (is_wiki) {
-            out.appendSlice(alloc, "error: failed to fetch from api.wiki.codes") catch {};
-        } else {
-            out.appendSlice(alloc, "error: failed to fetch from codedb.codegraff.com") catch {};
-        }
+        out.appendSlice(alloc, "error: failed to fetch from api.wiki.codes") catch {};
         return;
     };
     defer alloc.free(remote.captured.stdout);
@@ -1746,10 +1732,8 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         return;
     }
 
-    const host_label: []const u8 = if (is_wiki) "api.wiki.codes" else "codedb.codegraff.com";
-    const path_slug: []const u8 = if (is_wiki) wiki_slug else repo;
     out.appendSlice(alloc, "error: ") catch {};
-    out.appendSlice(alloc, host_label) catch {};
+    out.appendSlice(alloc, "api.wiki.codes") catch {};
     if (remote.status == 0) {
         out.appendSlice(alloc, " transport error for ") catch {};
     } else {
@@ -1759,7 +1743,7 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         out.appendSlice(alloc, s) catch {};
         out.appendSlice(alloc, " for ") catch {};
     }
-    out.appendSlice(alloc, path_slug) catch {};
+    out.appendSlice(alloc, wiki_slug) catch {};
     out.appendSlice(alloc, "/") catch {};
     out.appendSlice(alloc, action) catch {};
     if (body.len > 0) {
