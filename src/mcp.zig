@@ -1693,8 +1693,17 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         if (getStr(args, "prefix")) |v| {
             if (v.len > 0) params.append(alloc, .{ .name = "prefix", .value = v }) catch {};
         }
-        if (getBool(args, "expand")) {
-            params.append(alloc, .{ .name = "expand", .value = "true" }) catch {};
+        if (args.get("expand")) |expand_val| {
+            switch (expand_val) {
+                .bool => |expand| {
+                    if (expand) {
+                        params.append(alloc, .{ .name = "expand", .value = "true" }) catch {};
+                    } else {
+                        params.append(alloc, .{ .name = "summary", .value = "true" }) catch {};
+                    }
+                },
+                else => {},
+            }
         }
     } else if (std.mem.eql(u8, action, "commits") or std.mem.eql(u8, action, "dep-history")) {
         if (getInt(args, "limit")) |n| {
