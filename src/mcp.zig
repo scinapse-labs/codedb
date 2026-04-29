@@ -459,12 +459,8 @@ const tools_list =
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
 
-/// Monotonic timestamp of last MCP request, used by idle-exit watchdog.
+/// Monotonic timestamp of last MCP request, used for activity accounting.
 pub var last_activity: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
-
-/// How long (ms) the server may sit idle before auto-exiting.
-/// Claude Code restarts MCP servers on demand, so this is safe.
-pub const idle_timeout_ms: i64 = 60 * 60 * 1000; // 1 hour — allows long debugging sessions; stdin EOF is still detected separately.
 
 /// How often the watchdog checks whether the MCP client disconnected.
 pub const dead_client_poll_ms: u64 = 1000;
@@ -1356,11 +1352,9 @@ fn handleBundle(
     }
 
     const w = cio.listWriter(out, alloc);
-    // Refresh the idle clock as we start the bundle — long bundles (slow
-    // sub-ops, many ops, remote fetches) would otherwise leave
-    // `last_activity` frozen at message-arrival time, and the watchdog
-    // would close stdin mid-processing. Repeated inside the loop so each
-    // completed sub-op keeps us marked active. See #278.
+    // Refresh activity accounting as we start the bundle. Long bundles can
+    // include slow sub-ops, many ops, and remote fetches, so each completed
+    // sub-op updates the same timestamp. See #278.
     last_activity.store(cio.milliTimestamp(), .release);
     for (ops, 0..) |op, i| {
         if (op != .object) {
