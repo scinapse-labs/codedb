@@ -40,6 +40,7 @@ const nuke_mod = @import("nuke.zig");
 const update_mod = @import("update.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
+const release_info = @import("release_info.zig");
 // ── Store tests ─────────────────────────────────────────────
 
 test "store: record and retrieve snapshots" {
@@ -3982,6 +3983,9 @@ test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
     defer testing.allocator.free(contents);
 
     try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"session_start\"") != null);
+    const version_needle = try std.fmt.allocPrint(testing.allocator, "\"version\":\"{s}\"", .{release_info.semver});
+    defer testing.allocator.free(version_needle);
+    try testing.expect(std.mem.indexOf(u8, contents, version_needle) != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"tool_call\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"tool\":\"codedb_status\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"codebase_stats\"") != null);
