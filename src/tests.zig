@@ -7591,3 +7591,14 @@ test "issue-207: ScanState.name covers all states" {
     try testing.expectEqualStrings("indexing", mcp_mod.ScanState.indexing.name());
     try testing.expectEqualStrings("ready", mcp_mod.ScanState.ready.name());
 }
+
+test "issue-346: root_policy rejects dangerous ambient cwd roots" {
+    const root_policy = @import("root_policy.zig");
+    try testing.expect(!root_policy.isIndexableRoot("/"));
+    try testing.expect(!root_policy.isIndexableRoot("/Applications"));
+    try testing.expect(!root_policy.isIndexableRoot("/usr"));
+    try testing.expect(!root_policy.isIndexableRoot("/usr/local"));
+    try testing.expect(!root_policy.isIndexableRoot("/usr/local/bin"));
+    try testing.expect(!root_policy.isIndexableRoot("/opt"));
+    try testing.expect(!root_policy.isIndexableRoot("/opt/homebrew"));
+}
