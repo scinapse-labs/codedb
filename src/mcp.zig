@@ -22,6 +22,20 @@ const telemetry_mod = @import("telemetry.zig");
 const git_mod = @import("git.zig");
 const root_policy = @import("root_policy.zig");
 const release_info = @import("release_info.zig");
+pub const DeferredScan = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    store: *Store,
+    explorer: *Explorer,
+    scan_done: *std.atomic.Value(bool),
+    shutdown: *std.atomic.Value(bool),
+    telem: *telemetry_mod.Telemetry,
+    queue: *watcher.EventQueue,
+    startup_t0: i64,
+    triggered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    triggerFn: *const fn (ctx: *DeferredScan, abs_root: []const u8) void,
+};
+
 // ── Project cache ────────────────────────────────────────────────────────────
 
 const SnapshotCache = struct {
@@ -509,6 +523,7 @@ const Session = struct {
     client_name: ?[]const u8 = null,
     pending_roots_id: ?i64 = null,
     roots: std.ArrayList(Root) = .empty,
+    deferred_scan: ?*DeferredScan = null,
 
     fn freeRoots(self: *Session) void {
         for (self.roots.items) |r| {
@@ -532,6 +547,7 @@ pub fn run(
     agents: *AgentRegistry,
     default_path: []const u8,
     telem: *telemetry_mod.Telemetry,
+    deferred_scan: ?*DeferredScan,
 ) void {
     const stdout = cio.File.stdout();
     const stdin = std.Io.File.stdin();
@@ -543,6 +559,7 @@ pub fn run(
     var session = Session{
         .alloc = alloc,
         .stdout = stdout,
+        .deferred_scan = deferred_scan,
     };
     defer session.deinit();
 
@@ -681,6 +698,13 @@ fn parseRoots(s: *Session, result: *const std.json.ObjectMap) void {
             s.alloc.free(name);
             continue;
         };
+    }
+    if (s.deferred_scan) |ds| {
+        if (s.roots.items.len > 0 and !ds.triggered.swap(true, .acq_rel)) {
+            const uri_raw = s.roots.items[0].uri;
+            const abs_path = if (std.mem.startsWith(u8, uri_raw, "file://")) uri_raw[7..] else uri_raw;
+            ds.triggerFn(ds, abs_path);
+        }
     }
 }
 
