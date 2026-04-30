@@ -65,7 +65,7 @@ fn mainImpl() !void {
     const stdout = cio.File.stdout();
     const use_color = stdout.isTty();
     const s = sty.style(use_color);
-    const out = Out{ .file = stdout, .alloc = allocator };
+    var out = Out{ .file = stdout, .alloc = allocator };
 
     const args = try cio.argsAlloc(allocator);
     defer cio.argsFree(allocator, args);
@@ -73,6 +73,7 @@ fn mainImpl() !void {
     var root: []const u8 = undefined;
     var cmd: []const u8 = undefined;
     var cmd_args_start: usize = undefined;
+    var root_is_explicit: bool = false;
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--mcp")) {
         root = ".";
@@ -101,9 +102,17 @@ fn mainImpl() !void {
         root = args[1];
         cmd = args[2];
         cmd_args_start = 3;
+        root_is_explicit = true;
     } else {
         printUsage(out, s);
         std.process.exit(1);
+    }
+
+    // MCP stdio reserves stdout for JSON-RPC — route status/error output to
+    // stderr so startup/failure paths don't corrupt the protocol stream.
+    // See #304.
+    if (std.mem.eql(u8, cmd, "mcp")) {
+        out.file = cio.File.stderr();
     }
 
     // Handle --version early (no root needed)
@@ -141,7 +150,8 @@ fn mainImpl() !void {
         });
         std.process.exit(1);
     };
-    if (!root_policy.isIndexableRoot(abs_root)) {
+    const mcp_deferred_root = std.mem.eql(u8, cmd, "mcp") and std.mem.eql(u8, root, ".") and !root_is_explicit;
+    if (!mcp_deferred_root and !root_policy.isIndexableRoot(abs_root)) {
         out.p("{s}\xe2\x9c\x97{s} refusing to index temporary root: {s}{s}{s}\n", .{
             s.red, s.reset, s.bold, abs_root, s.reset,
         });
@@ -258,6 +268,7 @@ fn mainImpl() !void {
                 s.reset,
             });
 
+            var release_contents_after_cache = false;
             if (heads_match) {
                 // Verify file count then load trigram from disk via mmap
                 const current_count = @as(u32, @intCast(explorer.outlines.count()));
@@ -312,7 +323,7 @@ fn mainImpl() !void {
                     explorer.trigram_index = .{ .mmap = loaded };
                     explorer.mu.unlock();
                 }
-                explorer.releaseContents();
+                release_contents_after_cache = true;
             }
 
             // If no freq table was loaded, build one from indexed content and
@@ -324,6 +335,15 @@ fn mainImpl() !void {
                         std.log.warn("could not persist frequency table: {}", .{err});
                     };
                 }
+            }
+
+            if (!std.mem.eql(u8, cmd, "snapshot")) {
+                snapshot_mod.writeProjectCacheSnapshot(io, &explorer, abs_root, allocator) catch |err| {
+                    std.log.warn("could not persist project-cache snapshot: {}", .{err});
+                };
+            }
+            if (release_contents_after_cache) {
+                explorer.releaseContents();
             }
         } // end else (no snapshot)
     }
@@ -531,13 +551,14 @@ fn mainImpl() !void {
         };
         const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
         loadWordIndexFromDiskIfPresent(io, &explorer, data_dir, git_head, allocator);
-        if (!explorer.wordIndexIsComplete()) {
-            explorer.rebuildWordIndex() catch |err| {
-                out.p("{s}\xe2\x9c\x97{s} word index rebuild failed: {}\n", .{ s.red, s.reset, err });
+        if (!wordIndexMatchesOutlines(&explorer)) {
+            persistWordIndexFromSource(io, &explorer, abs_root, data_dir, git_head, allocator) catch |err| {
+                out.p("{s}\xe2\x9c\x97{s} word index persist failed: {}\n", .{ s.red, s.reset, err });
                 std.process.exit(1);
             };
+        } else {
+            persistWordIndexToDisk(io, &explorer, data_dir, git_head);
         }
-        persistWordIndexToDisk(io, &explorer, data_dir, git_head);
         const elapsed = cio.nanoTimestamp() - t0;
         var dur_buf: [64]u8 = undefined;
         out.p("{s}\xe2\x9c\x93{s} {s}snapshot{s}  {s}{s}{s}  {s}{d} files{s}  {s}{s}{s}\n", .{
@@ -550,7 +571,10 @@ fn mainImpl() !void {
             s.reset,
         });
     } else if (std.mem.eql(u8, cmd, "serve")) {
-        const port: u16 = 7719;
+        const port: u16 = blk: {
+            const raw = cio.posixGetenv("CODEDB_PORT") orelse break :blk 6767;
+            break :blk std.fmt.parseInt(u16, raw, 10) catch 6767;
+        };
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
         _ = try agents.register("__filesystem__");
@@ -575,24 +599,15 @@ fn mainImpl() !void {
         defer agents.deinit();
         _ = try agents.register("__filesystem__");
 
+        const root_from_cwd = mcp_deferred_root;
+
         saveProjectInfo(io, allocator, data_dir, abs_root) catch {};
 
         // Set up query tracking WAL
         const query_log = std.fmt.allocPrint(allocator, "{s}/queries.log", .{data_dir}) catch null;
         if (query_log) |ql| mcp_server.setQueryLogPath(ql);
 
-        const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
         const startup_t0 = cio.milliTimestamp();
-        mcp_server.setScanState(.loading_snapshot);
-        const snapshot_loaded = blk: {
-            const snap_head = snapshot_mod.readSnapshotGitHead(io, "codedb.snapshot") orelse {
-                if (git_head != null) break :blk false;
-                break :blk snapshot_mod.loadSnapshot(io, "codedb.snapshot", &explorer, &store, allocator);
-            };
-            const cur_head = git_head orelse break :blk false;
-            if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
-            break :blk snapshot_mod.loadSnapshot(io, "codedb.snapshot", &explorer, &store, allocator);
-        };
         var telemetry_disabled = false;
         for (args[cmd_args_start..]) |arg| {
             if (std.mem.eql(u8, arg, "--no-telemetry")) {
@@ -606,31 +621,69 @@ fn mainImpl() !void {
         telem.recordSessionStart();
 
         var shutdown = std.atomic.Value(bool).init(false);
-        var scan_done = std.atomic.Value(bool).init(snapshot_loaded);
 
         const queue = try allocator.create(watcher.EventQueue);
         defer allocator.destroy(queue);
         queue.* = watcher.EventQueue{};
+
         var scan_thread: ?std.Thread = null;
-        if (!snapshot_loaded) {
-            mcp_server.setScanState(.walking);
-            scan_thread = try std.Thread.spawn(.{}, scanBg, .{ io, &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root, &telem, startup_t0 });
+        var watch_thread: std.Thread = undefined;
+
+        var deferred: mcp_server.DeferredScan = undefined;
+        var maybe_deferred: ?*mcp_server.DeferredScan = null;
+
+        if (root_from_cwd) {
+            deferred = .{
+                .io = io,
+                .allocator = allocator,
+                .store = &store,
+                .explorer = &explorer,
+                .scan_done = try allocator.create(std.atomic.Value(bool)),
+                .shutdown = &shutdown,
+                .telem = &telem,
+                .queue = queue,
+                .startup_t0 = startup_t0,
+                .triggerFn = triggerScanFromRoots,
+            };
+            deferred.scan_done.* = std.atomic.Value(bool).init(false);
+            maybe_deferred = &deferred;
+            mcp_server.setScanState(.loading_snapshot);
+            watch_thread = try std.Thread.spawn(.{}, watcherDeferredLoop, .{&deferred});
         } else {
-            const startup_time_ms: u64 = @intCast(@max(cio.milliTimestamp() - startup_t0, 0));
-            loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
-            telem.recordCodebaseStats(&explorer, startup_time_ms);
-            mcp_server.setScanState(.ready);
+            const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
+            mcp_server.setScanState(.loading_snapshot);
+            const snapshot_loaded = blk: {
+                const snap_head = snapshot_mod.readSnapshotGitHead(io, "codedb.snapshot") orelse {
+                    if (git_head != null) break :blk false;
+                    break :blk snapshot_mod.loadSnapshot(io, "codedb.snapshot", &explorer, &store, allocator);
+                };
+                const cur_head = git_head orelse break :blk false;
+                if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
+                break :blk snapshot_mod.loadSnapshot(io, "codedb.snapshot", &explorer, &store, allocator);
+            };
+            var scan_done = std.atomic.Value(bool).init(snapshot_loaded);
+            if (!snapshot_loaded) {
+                mcp_server.setScanState(.walking);
+                scan_thread = try std.Thread.spawn(.{}, scanBg, .{ io, &store, &explorer, root, allocator, &scan_done, &shutdown, data_dir, abs_root, &telem, startup_t0 });
+            } else {
+                const startup_time_ms: u64 = @intCast(@max(cio.milliTimestamp() - startup_t0, 0));
+                loadTrigramFromDiskIfPresent(io, &explorer, data_dir, allocator);
+                telem.recordCodebaseStats(&explorer, startup_time_ms);
+                compactMcpReadyMemory(io, &explorer, data_dir, git_head, allocator);
+                mcp_server.setScanState(.ready);
+            }
+            watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ io, &store, &explorer, queue, root, &shutdown, &scan_done });
         }
 
-        const watch_thread = try std.Thread.spawn(.{}, watcher.incrementalLoop, .{ io, &store, &explorer, queue, root, &shutdown, &scan_done });
         const idle_thread = try std.Thread.spawn(.{}, idleWatchdog, .{&shutdown});
 
         std.log.info("codedb mcp: root={s} files={d} data={s} scan={s}", .{ abs_root, store.currentSeq(), data_dir, mcp_server.getScanState().name() });
 
-        mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, &telem);
+        mcp_server.run(io, allocator, &store, &explorer, &agents, abs_root, &telem, maybe_deferred);
 
         shutdown.store(true, .release);
         if (scan_thread) |st| st.join();
+        if (maybe_deferred) |d| { if (d.scan_thread) |st| st.join(); }
         watch_thread.join();
         idle_thread.join();
     } else {
@@ -726,6 +779,52 @@ fn loadWordIndexFromDiskIfPresent(
     }
 }
 
+fn wordIndexDiskMatches(
+    io: std.Io,
+    explorer: *Explorer,
+    data_dir: []const u8,
+    current_git_head: ?[40]u8,
+    allocator: std.mem.Allocator,
+) bool {
+    const header = WordIndex.readDiskHeader(io, data_dir, allocator) catch null orelse return false;
+
+    explorer.mu.lockShared();
+    const current_count = @as(u32, @intCast(explorer.outlines.count()));
+    explorer.mu.unlockShared();
+    if (header.file_count != current_count) return false;
+
+    if (current_git_head == null and header.git_head == null) return true;
+    if (current_git_head == null or header.git_head == null) return false;
+    return std.mem.eql(u8, &current_git_head.?, &header.git_head.?);
+}
+
+fn compactMcpReadyMemory(
+    io: std.Io,
+    explorer: *Explorer,
+    data_dir: []const u8,
+    current_git_head: ?[40]u8,
+    allocator: std.mem.Allocator,
+) void {
+    explorer.mu.lockShared();
+    const file_count = explorer.outlines.count();
+    explorer.mu.unlockShared();
+
+    if (file_count <= 1000 and cio.posixGetenv("CODEDB_LOW_MEMORY") == null) return;
+
+    const can_release_contents =
+        explorer.wordIndexIsComplete() or
+        (explorer.wordIndexCanLoadFromDisk() and wordIndexDiskMatches(io, explorer, data_dir, current_git_head, allocator));
+
+    if (can_release_contents) {
+        explorer.releaseContents();
+    }
+    explorer.releaseSecondaryIndexes();
+
+    // Shrink index allocations to reclaim ArrayList over-allocation.
+    if (explorer.trigram_index.asHeap()) |heap| heap.shrinkPostingLists();
+    explorer.word_index.shrinkAllocations();
+}
+
 fn persistWordIndexToDisk(io: std.Io, explorer: *Explorer, data_dir: []const u8, git_head: ?[40]u8) void {
     const generation = explorer.wordIndexGenerationToPersist() orelse return;
 
@@ -737,6 +836,52 @@ fn persistWordIndexToDisk(io: std.Io, explorer: *Explorer, data_dir: []const u8,
     };
     explorer.mu.unlockShared();
     explorer.markWordIndexPersisted(generation);
+}
+
+fn wordIndexMatchesOutlines(explorer: *Explorer) bool {
+    explorer.mu.lockShared();
+    defer explorer.mu.unlockShared();
+    return explorer.word_index_complete and
+        explorer.word_index.id_to_path.items.len == explorer.outlines.count();
+}
+
+fn persistWordIndexFromSource(
+    io: std.Io,
+    explorer: *Explorer,
+    root_path: []const u8,
+    data_dir: []const u8,
+    git_head: ?[40]u8,
+    allocator: std.mem.Allocator,
+) !void {
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(allocator);
+
+    {
+        explorer.mu.lockShared();
+        defer explorer.mu.unlockShared();
+        try paths.ensureTotalCapacity(allocator, explorer.outlines.count());
+        var path_iter = explorer.outlines.keyIterator();
+        while (path_iter.next()) |path_ptr| {
+            paths.appendAssumeCapacity(path_ptr.*);
+        }
+    }
+
+    var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{});
+    defer root_dir.close(io);
+
+    var word_index = WordIndex.init(allocator);
+    defer word_index.deinit();
+    word_index.skip_file_words = true;
+
+    for (paths.items) |path| {
+        const content = root_dir.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch continue;
+        errdefer allocator.free(content);
+        try word_index.indexFile(path, content);
+        allocator.free(content);
+    }
+
+    if (word_index.id_to_path.items.len == 0 and paths.items.len != 0) return error.NoWordIndexData;
+    try word_index.writeToDisk(io, data_dir, git_head);
 }
 
 fn saveProjectInfo(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8, abs_root: []const u8) !void {
@@ -933,17 +1078,58 @@ fn scanBg(io: std.Io, store: *Store, explorer: *Explorer, root: []const u8, allo
         explorer.releaseSecondaryIndexes();
     }
 }
+fn triggerScanFromRoots(ctx: *mcp_server.DeferredScan, abs_root: []const u8) void {
+    const data_dir = getDataDir(ctx.io, ctx.allocator, abs_root) catch {
+        ctx.triggered.store(false, .release);
+        return;
+    };
+    defer ctx.allocator.free(data_dir);
+    const git_head = git_mod.getGitHead(abs_root, ctx.allocator) catch null;
+    const snap_path = std.fmt.allocPrint(ctx.allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
+    const snap_path_owned = snap_path orelse "codedb.snapshot";
+    defer if (snap_path) |p| ctx.allocator.free(p);
+    mcp_server.setScanState(.loading_snapshot);
+    const snapshot_loaded = blk: {
+        const snap_head = snapshot_mod.readSnapshotGitHead(ctx.io, snap_path_owned) orelse {
+            if (git_head != null) break :blk false;
+            break :blk snapshot_mod.loadSnapshot(ctx.io, snap_path_owned, ctx.explorer, ctx.store, ctx.allocator);
+        };
+        const cur_head = git_head orelse break :blk false;
+        if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
+        break :blk snapshot_mod.loadSnapshot(ctx.io, snap_path_owned, ctx.explorer, ctx.store, ctx.allocator);
+    };
+    ctx.resolved_root = abs_root;
+    ctx.explorer.setRoot(ctx.io, abs_root);
+    ctx.scan_done.store(snapshot_loaded, .release);
+    if (!snapshot_loaded) {
+        mcp_server.setScanState(.walking);
+        const scan_thread = std.Thread.spawn(.{}, scanBg, .{ ctx.io, ctx.store, ctx.explorer, abs_root, ctx.allocator, ctx.scan_done, ctx.shutdown, data_dir, abs_root, ctx.telem, ctx.startup_t0 }) catch return;
+        ctx.scan_thread = scan_thread;
+    } else {
+        const startup_time_ms: u64 = @intCast(@max(cio.milliTimestamp() - ctx.startup_t0, 0));
+        loadTrigramFromDiskIfPresent(ctx.io, ctx.explorer, data_dir, ctx.allocator);
+        ctx.telem.recordCodebaseStats(ctx.explorer, startup_time_ms);
+        compactMcpReadyMemory(ctx.io, ctx.explorer, data_dir, git_head, ctx.allocator);
+        mcp_server.setScanState(.ready);
+    }
+}
+
+fn watcherDeferredLoop(ctx: *mcp_server.DeferredScan) void {
+    while (!ctx.scan_done.load(.acquire) and !ctx.shutdown.load(.acquire)) {
+        cio.sleepMs(50);
+    }
+    if (ctx.shutdown.load(.acquire)) return;
+    watcher.incrementalLoop(ctx.io, ctx.store, ctx.explorer, ctx.queue, ctx.resolved_root, ctx.shutdown, ctx.scan_done);
+}
+
 fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const mcp = @import("mcp.zig");
+    const stdin = cio.File.stdin();
     while (!shutdown.load(.acquire)) {
-        // Sleep in 1s increments for responsive shutdown
-        for (0..10) |_| {
-            if (shutdown.load(.acquire)) return;
-            cio.sleepMs(1000);
-        }
-
-        // Quick liveness check: poll stdin for POLLHUP (client disconnected)
-        const stdin = cio.File.stdin();
+        // Quick liveness check: poll stdin for POLLHUP (client disconnected).
+        // Do not close a healthy stdio transport just because it is idle:
+        // MCP stdio sessions are not resumable, and hosts such as Codex do
+        // not necessarily respawn a dead server inside an existing chat.
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = stdin.handle,
             .events = std.posix.POLL.IN | std.posix.POLL.HUP,
@@ -957,15 +1143,6 @@ fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
             return;
         }
 
-        // Fallback: idle timeout
-        const last = mcp.last_activity.load(.acquire);
-        if (last == 0) continue;
-        const now = cio.milliTimestamp();
-        if (now - last > mcp.idle_timeout_ms) {
-            std.log.info("idle for {d}s, exiting", .{@divTrunc(now - last, 1000)});
-            _ = std.c.close(stdin.handle);
-            shutdown.store(true, .release);
-            return;
-        }
+        cio.sleepMs(mcp.dead_client_poll_ms);
     }
 }

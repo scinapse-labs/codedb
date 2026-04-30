@@ -13,6 +13,27 @@ pub fn isIndexableRoot(path: []const u8) bool {
     if (isExactOrChild(path, "/tmp")) return false;
     if (isExactOrChild(path, "/var/tmp")) return false;
 
+    const system_prefixes = [_][]const u8{
+        "/Applications",
+        "/System",
+        "/Library",
+        "/usr",
+        "/opt",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/snap",
+        "/nix",
+        "/var/folders",
+        "/private/var/folders",
+    };
+    for (system_prefixes) |pfx| {
+        if (isExactOrChild(path, pfx)) return false;
+    }
+
     // Block home directory itself (not subdirectories) — prevents 17GB RAM spike (#174)
     if (cio.posixGetenv("HOME")) |home| {
         if (home.len > 0 and std.mem.eql(u8, path, home)) return false;

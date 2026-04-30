@@ -6,7 +6,7 @@ const index = @import("index.zig");
 
 const RING_SIZE = 256;
 const CLOUD_URL = "https://codedb.codegraff.com/telemetry/ingest";
-const VERSION = "0.2.53";
+const VERSION = @import("release_info.zig").semver;
 const PLATFORM = std.fmt.comptimePrint("{s}-{s}", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
 
 pub const Event = struct {
@@ -246,6 +246,20 @@ fn writeLanguages(writer: anytype, language_mask: u32) !void {
         "yaml",
         "unknown",
         "dart",
+        "java",
+        "kotlin",
+        "svelte",
+        "vue",
+        "astro",
+        "shell",
+        "css",
+        "scss",
+        "sql",
+        "protobuf",
+        "fortran",
+        "llvm_ir",
+        "mlir",
+        "tablegen",
     };
     var first = true;
     for (names, 0..) |name, idx| {
