@@ -1119,8 +1119,9 @@ fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
     const stdin = cio.File.stdin();
     while (!shutdown.load(.acquire)) {
         // Quick liveness check: poll stdin for POLLHUP (client disconnected).
-        // This stays independent from the longer idle timeout so dead MCP
-        // clients are reaped promptly.
+        // Do not close a healthy stdio transport just because it is idle:
+        // MCP stdio sessions are not resumable, and hosts such as Codex do
+        // not necessarily respawn a dead server inside an existing chat.
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = stdin.handle,
             .events = std.posix.POLL.IN | std.posix.POLL.HUP,
@@ -1129,17 +1130,6 @@ fn idleWatchdog(shutdown: *std.atomic.Value(bool)) void {
         const poll_result = std.posix.poll(&poll_fds, 0) catch 0;
         if (poll_result > 0 and (poll_fds[0].revents & std.posix.POLL.HUP) != 0) {
             std.log.info("stdin closed (client disconnected), exiting", .{});
-            _ = std.c.close(stdin.handle);
-            shutdown.store(true, .release);
-            return;
-        }
-
-        // Fallback: idle timeout
-        const last = mcp.last_activity.load(.acquire);
-        if (last == 0) continue;
-        const now = cio.milliTimestamp();
-        if (now - last > mcp.idle_timeout_ms) {
-            std.log.info("idle for {d}s, exiting", .{@divTrunc(now - last, 1000)});
             _ = std.c.close(stdin.handle);
             shutdown.store(true, .release);
             return;

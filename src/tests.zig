@@ -40,6 +40,7 @@ const nuke_mod = @import("nuke.zig");
 const update_mod = @import("update.zig");
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
+const release_info = @import("release_info.zig");
 // ── Store tests ─────────────────────────────────────────────
 
 test "store: record and retrieve snapshots" {
@@ -3982,6 +3983,9 @@ test "issue-59: telemetry writes session, tool, and codebase stats ndjson" {
     defer testing.allocator.free(contents);
 
     try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"session_start\"") != null);
+    const version_needle = try std.fmt.allocPrint(testing.allocator, "\"version\":\"{s}\"", .{release_info.semver});
+    defer testing.allocator.free(version_needle);
+    try testing.expect(std.mem.indexOf(u8, contents, version_needle) != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"tool_call\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"tool\":\"codedb_status\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"event_type\":\"codebase_stats\"") != null);
@@ -5223,11 +5227,6 @@ test "issue-116: getGitHead returns valid SHA for git repos" {
     }
 }
 
-test "issue-148: idle timeout is 1 hour" {
-    const mcp = @import("mcp.zig");
-    try testing.expectEqual(@as(i64, 60 * 60 * 1000), mcp.idle_timeout_ms);
-}
-
 test "issue-148: dead MCP clients are polled every second" {
     const mcp = @import("mcp.zig");
     try testing.expectEqual(@as(u64, 1000), mcp.dead_client_poll_ms);
@@ -5286,7 +5285,7 @@ test "issue-148: idle watchdog exits on shutdown signal" {
     }
 }
 
-test "issue-148: idle watchdog respects activity timestamp" {
+test "issue-278: MCP tracks activity without using it as a transport timeout" {
     const mcp = @import("mcp.zig");
 
     // Save and restore
@@ -5296,31 +5295,27 @@ test "issue-148: idle watchdog respects activity timestamp" {
     // Set activity to "just now"
     mcp.last_activity.store(cio.milliTimestamp(), .release);
 
-    // With 1-hour timeout, checking now should NOT trigger exit
     const last = mcp.last_activity.load(.acquire);
     const now = cio.milliTimestamp();
-    try testing.expect(now - last < mcp.idle_timeout_ms);
+    try testing.expect(now - last < 1_000);
 }
 
-test "issue-148: MCP session survives 30-minute idle" {
+test "issue-278: MCP session may remain idle longer than old timeout" {
     const mcp = @import("mcp.zig");
-    // With the old 10-min timeout, an activity 30 minutes ago would trigger exit.
-    // With the new 1-hour timeout, it should be fine.
-    const thirty_min_ago = cio.milliTimestamp() - (30 * 60 * 1000);
+    // Stale activity is now only an accounting signal. The stdio transport is
+    // kept alive until the client actually disconnects.
+    const old_idle_timeout_ms = 60 * 60 * 1000;
+    const older_than_old_timeout = cio.milliTimestamp() - old_idle_timeout_ms - 1_000;
 
     // Save and restore
     const saved = mcp.last_activity.load(.acquire);
     defer mcp.last_activity.store(saved, .release);
 
-    mcp.last_activity.store(thirty_min_ago, .release);
+    mcp.last_activity.store(older_than_old_timeout, .release);
     const last = mcp.last_activity.load(.acquire);
     const now = cio.milliTimestamp();
 
-    // Should NOT exceed 1-hour timeout
-    try testing.expect(now - last < mcp.idle_timeout_ms);
-
-    // Should have exceeded old 10-minute timeout
-    try testing.expect(now - last > 10 * 60 * 1000);
+    try testing.expect(now - last > old_idle_timeout_ms);
 }
 
 test "issue-148: open pipe does not trigger HUP" {
