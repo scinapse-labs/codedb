@@ -22,6 +22,20 @@ const telemetry_mod = @import("telemetry.zig");
 const git_mod = @import("git.zig");
 const root_policy = @import("root_policy.zig");
 const release_info = @import("release_info.zig");
+pub const DeferredScan = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    store: *Store,
+    explorer: *Explorer,
+    scan_done: *std.atomic.Value(bool),
+    shutdown: *std.atomic.Value(bool),
+    telem: *telemetry_mod.Telemetry,
+    queue: *watcher.EventQueue,
+    startup_t0: i64,
+    triggered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    triggerFn: *const fn (ctx: *DeferredScan, abs_root: []const u8) void,
+};
+
 // ── Project cache ────────────────────────────────────────────────────────────
 
 const SnapshotCache = struct {
@@ -449,7 +463,7 @@ const tools_list =
     \\{"name":"codedb_status","description":"Get current codedb status: number of indexed files and current sequence number.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_snapshot","description":"Get the full pre-rendered snapshot of the codebase as a single JSON blob. Contains tree, all outlines, symbol index, and dependency graph. Ideal for caching or deploying to edge workers.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_bundle","description":"Batch multiple queries in one call. Max 20 ops. WARNING: Avoid bundling multiple codedb_read calls on large files — use codedb_outline + codedb_symbol instead. Bundle outline+symbol+search, not full file reads. Total response is not size-capped, so large bundles can exceed token limits.","inputSchema":{"type":"object","properties":{"ops":{"type":"array","items":{"type":"object","properties":{"tool":{"type":"string","description":"Tool name (e.g. codedb_outline, codedb_symbol, codedb_read)"},"arguments":{"type":"object","description":"Tool arguments"}},"required":["tool"]},"description":"Array of tool calls to execute"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["ops"]}},
-    \\{"name":"codedb_remote","description":"Query indexed public repos through api.wiki.codes, the only remote backend. Use action=actions first when unsure what a slug supports. Use tree with expand=false for a compact directory summary, or expand=true with limit/offset/prefix for paged file lists. Use read with path and optional lines='10-60' for file slices. Search, symbol, outline, deps, score, cves, commits, branches, and dep-history expose code and artifact metadata without cloning.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. vercel/next.js) or a raw wiki slug such as chromium."},"action":{"type":"string","enum":["tree","outline","search","read","actions","symbol","policy","deps","score","cves","commits","branches","dep-history"],"description":"What to query from api.wiki.codes: actions, tree, search, outline, read, symbol, policy, deps, score, cves, commits, branches, dep-history."},"query":{"type":"string","description":"Action-specific argument. search: text query. symbol: identifier name. outline: file path."},"path":{"type":"string","description":"For action=read: the file path to fetch."},"lines":{"type":"string","description":"For action=read: line range like '10-60' (1-indexed, inclusive). Omit for full file."},"limit":{"type":"integer","description":"For tree/commits/dep-history: cap the number of items returned (server may enforce its own ceiling)."},"offset":{"type":"integer","description":"For tree: skip the first N items (pagination)."},"prefix":{"type":"string","description":"For tree: only return paths starting with this prefix (e.g. 'src/')."},"expand":{"type":"boolean","description":"For tree: when true, return the full file list. When false returns a compact directory summary when supported."},"since":{"type":"string","description":"For commits/dep-history: ISO timestamp or commit SHA to start from."},"scope":{"type":"string","enum":["runtime","all"],"description":"For score/cves only. Defaults to runtime; use all to include dev/tooling dependencies."},"backend":{"type":"string","enum":["wiki"],"description":"Deprecated compatibility field. Only 'wiki' is accepted; requests always use api.wiki.codes."}},"required":["repo","action"]}},
+    \\{"name":"codedb_remote","description":"Query indexed public repos through api.wiki.codes, the only remote backend. Use action=actions first when unsure what a slug supports. Use tree with expand=false for a compact directory summary, or expand=true with limit/offset/prefix for paged file lists. Use read with path and optional lines='10-60' for file slices. Search, symbol, outline, deps, score, cves, commits, branches, and dep-history expose code and artifact metadata without cloning.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. vercel/next.js) or a raw wiki slug such as chromium."},"action":{"type":"string","enum":["tree","outline","search","read","actions","symbol","policy","deps","score","cves","commits","branches","dep-history"],"description":"What to query from api.wiki.codes: actions, tree, search, outline, read, symbol, policy, deps, score, cves, commits, branches, dep-history."},"query":{"type":"string","description":"Action-specific argument. search: text query. symbol: identifier name. outline: file path."},"path":{"type":"string","description":"For action=read: the file path to fetch."},"lines":{"type":"string","description":"For action=read: line range like '10-60' (1-indexed, inclusive). Omit for full file."},"limit":{"type":"integer","description":"For tree: cap the number of items returned (server may enforce its own ceiling)."},"offset":{"type":"integer","description":"For tree: skip the first N items (pagination)."},"prefix":{"type":"string","description":"For tree: only return paths starting with this prefix (e.g. 'src/')."},"expand":{"type":"boolean","description":"For tree: when true, return the full file list. When false returns a compact directory summary when supported."},"scope":{"type":"string","enum":["runtime","all"],"description":"For score/cves only. Defaults to runtime; use all to include dev/tooling dependencies."},"backend":{"type":"string","enum":["wiki"],"description":"Deprecated compatibility field. Only 'wiki' is accepted; requests always use api.wiki.codes."}},"required":["repo","action"]}},
     \\{"name":"codedb_projects","description":"List all locally indexed projects on this machine. Shows project paths, data directory hashes, and whether a snapshot exists. Use to discover what codebases are available.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the folder to index (e.g. /Users/you/myproject)"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy file search — finds files by approximate name. Typo-tolerant subsequence matching with word-boundary and filename bonuses. Use when you know roughly what file you're looking for but not the exact path. Much faster than codedb_tree + manual scan.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy search query (e.g. 'authmidlware', 'test_auth', 'main.zig')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
@@ -513,6 +527,8 @@ const Session = struct {
     client_name: ?[]const u8 = null,
     pending_roots_id: ?i64 = null,
     roots: std.ArrayList(Root) = .empty,
+    deferred_scan: ?*DeferredScan = null,
+    deferred_cache: ?*ProjectCache = null,
 
     fn freeRoots(self: *Session) void {
         for (self.roots.items) |r| {
@@ -536,6 +552,7 @@ pub fn run(
     agents: *AgentRegistry,
     default_path: []const u8,
     telem: *telemetry_mod.Telemetry,
+    deferred_scan: ?*DeferredScan,
 ) void {
     const stdout = cio.File.stdout();
     const stdin = std.Io.File.stdin();
@@ -547,6 +564,8 @@ pub fn run(
     var session = Session{
         .alloc = alloc,
         .stdout = stdout,
+        .deferred_scan = deferred_scan,
+        .deferred_cache = &cache,
     };
     defer session.deinit();
 
@@ -669,7 +688,6 @@ fn parseRoots(s: *Session, result: *const std.json.ObjectMap) void {
         const obj = item.object;
         const uri_raw = mcpj.getStr(&obj, "uri") orelse continue;
         const name_raw = mcpj.getStr(&obj, "name") orelse "";
-        // Strip file:// prefix for policy check
         const path = if (std.mem.startsWith(u8, uri_raw, "file://")) uri_raw[7..] else uri_raw;
         if (!root_policy.isIndexableRoot(path)) {
             std.log.info("codedb mcp: rejected root \"{s}\" (denied by policy)", .{uri_raw});
@@ -685,6 +703,17 @@ fn parseRoots(s: *Session, result: *const std.json.ObjectMap) void {
             s.alloc.free(name);
             continue;
         };
+    }
+
+    if (s.deferred_scan) |ds| {
+        if (!ds.triggered.swap(true, .acq_rel)) {
+            if (s.roots.items.len > 0) {
+                const first_uri = s.roots.items[0].uri;
+                const abs_root = if (std.mem.startsWith(u8, first_uri, "file://")) first_uri[7..] else first_uri;
+                if (s.deferred_cache) |cache| cache.default_path = abs_root;
+                ds.triggerFn(ds, abs_root);
+            }
+        }
     }
 }
 
@@ -1677,8 +1706,7 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         params.append(alloc, .{ .name = "scope", .value = scope_value }) catch {};
     }
 
-    // Optional pagination/filter params. Server may not yet handle these;
-    // they're forwarded so they take effect transparently when it does.
+    // Optional tree pagination/filter params supported by api.wiki.codes.
     if (std.mem.eql(u8, action, "tree")) {
         if (getInt(args, "limit")) |n| {
             const s = std.fmt.bufPrint(int_bufs[int_slot][0..], "{d}", .{n}) catch "0";
@@ -1704,15 +1732,6 @@ fn handleRemote(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
                 },
                 else => {},
             }
-        }
-    } else if (std.mem.eql(u8, action, "commits") or std.mem.eql(u8, action, "dep-history")) {
-        if (getInt(args, "limit")) |n| {
-            const s = std.fmt.bufPrint(int_bufs[int_slot][0..], "{d}", .{n}) catch "0";
-            params.append(alloc, .{ .name = "limit", .value = s }) catch {};
-            int_slot += 1;
-        }
-        if (getStr(args, "since")) |v| {
-            if (v.len > 0) params.append(alloc, .{ .name = "since", .value = v }) catch {};
         }
     }
 
