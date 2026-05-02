@@ -186,19 +186,8 @@ fn mainImpl() !void {
     if (!std.mem.eql(u8, cmd, "mcp")) {
         const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
 
-        // Try loading from codedb.snapshot if it exists and git HEAD matches.
-        const snapshot_path = "codedb.snapshot";
         const snapshot_t0 = cio.nanoTimestamp();
-        const snapshot_loaded = blk: {
-            const snap_head = snapshot_mod.readSnapshotGitHead(io, snapshot_path) orelse {
-                // No git HEAD in snapshot (non-git project or missing) — load if current project also has no git
-                if (git_head != null) break :blk false;
-                break :blk snapshot_mod.loadSnapshot(io, snapshot_path, &explorer, &store, allocator);
-            };
-            const cur_head = git_head orelse break :blk false;
-            if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
-            break :blk snapshot_mod.loadSnapshot(io, snapshot_path, &explorer, &store, allocator);
-        };
+        const snapshot_loaded = loadBestSnapshot(io, &explorer, &store, abs_root, data_dir, git_head, allocator);
         const snapshot_elapsed = cio.nanoTimestamp() - snapshot_t0;
 
         const needs_word_index = std.mem.eql(u8, cmd, "word");
@@ -652,15 +641,7 @@ fn mainImpl() !void {
         } else {
             const git_head = git_mod.getGitHead(abs_root, allocator) catch null;
             mcp_server.setScanState(.loading_snapshot);
-            const snapshot_loaded = blk: {
-                const snap_head = snapshot_mod.readSnapshotGitHead(io, "codedb.snapshot") orelse {
-                    if (git_head != null) break :blk false;
-                    break :blk snapshot_mod.loadSnapshot(io, "codedb.snapshot", &explorer, &store, allocator);
-                };
-                const cur_head = git_head orelse break :blk false;
-                if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
-                break :blk snapshot_mod.loadSnapshot(io, "codedb.snapshot", &explorer, &store, allocator);
-            };
+            const snapshot_loaded = loadBestSnapshot(io, &explorer, &store, abs_root, data_dir, git_head, allocator);
             var scan_done = std.atomic.Value(bool).init(snapshot_loaded);
             if (!snapshot_loaded) {
                 mcp_server.setScanState(.walking);
@@ -683,7 +664,9 @@ fn mainImpl() !void {
 
         shutdown.store(true, .release);
         if (scan_thread) |st| st.join();
-        if (maybe_deferred) |d| { if (d.scan_thread) |st| st.join(); }
+        if (maybe_deferred) |d| {
+            if (d.scan_thread) |st| st.join();
+        }
         watch_thread.join();
         idle_thread.join();
     } else {
@@ -705,6 +688,46 @@ fn resolveRoot(io: std.Io, root: []const u8, buf: *[std.fs.max_path_bytes]u8) ![
     const sub = if (std.mem.eql(u8, root, ".")) "." else root;
     const n = std.Io.Dir.cwd().realPathFile(io, sub, buf) catch return error.ResolveFailed;
     return buf[0..n];
+}
+
+fn loadSnapshotIfHeadMatches(
+    io: std.Io,
+    snapshot_path: []const u8,
+    explorer: *Explorer,
+    store: *Store,
+    current_git_head: ?[40]u8,
+    allocator: std.mem.Allocator,
+) bool {
+    const snap_head = snapshot_mod.readSnapshotGitHead(io, snapshot_path) orelse {
+        // No git HEAD in snapshot (non-git project or legacy snapshot) — load
+        // only when the current project also has no git HEAD.
+        if (current_git_head != null) return false;
+        return snapshot_mod.loadSnapshot(io, snapshot_path, explorer, store, allocator);
+    };
+    const cur_head = current_git_head orelse return false;
+    if (!std.mem.eql(u8, &snap_head, &cur_head)) return false;
+    return snapshot_mod.loadSnapshot(io, snapshot_path, explorer, store, allocator);
+}
+
+fn loadBestSnapshot(
+    io: std.Io,
+    explorer: *Explorer,
+    store: *Store,
+    abs_root: []const u8,
+    data_dir: []const u8,
+    current_git_head: ?[40]u8,
+    allocator: std.mem.Allocator,
+) bool {
+    const root_snapshot = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
+    defer if (root_snapshot) |p| allocator.free(p);
+    const first_snapshot = root_snapshot orelse "codedb.snapshot";
+    if (loadSnapshotIfHeadMatches(io, first_snapshot, explorer, store, current_git_head, allocator)) {
+        return true;
+    }
+
+    const central_snapshot = std.fmt.allocPrint(allocator, "{s}/codedb.snapshot", .{data_dir}) catch return false;
+    defer allocator.free(central_snapshot);
+    return loadSnapshotIfHeadMatches(io, central_snapshot, explorer, store, current_git_head, allocator);
 }
 
 fn getDataDir(io: std.Io, allocator: std.mem.Allocator, abs_root: []const u8) ![]u8 {
@@ -1085,19 +1108,8 @@ fn triggerScanFromRoots(ctx: *mcp_server.DeferredScan, abs_root: []const u8) voi
     };
     defer ctx.allocator.free(data_dir);
     const git_head = git_mod.getGitHead(abs_root, ctx.allocator) catch null;
-    const snap_path = std.fmt.allocPrint(ctx.allocator, "{s}/codedb.snapshot", .{abs_root}) catch null;
-    const snap_path_owned = snap_path orelse "codedb.snapshot";
-    defer if (snap_path) |p| ctx.allocator.free(p);
     mcp_server.setScanState(.loading_snapshot);
-    const snapshot_loaded = blk: {
-        const snap_head = snapshot_mod.readSnapshotGitHead(ctx.io, snap_path_owned) orelse {
-            if (git_head != null) break :blk false;
-            break :blk snapshot_mod.loadSnapshot(ctx.io, snap_path_owned, ctx.explorer, ctx.store, ctx.allocator);
-        };
-        const cur_head = git_head orelse break :blk false;
-        if (!std.mem.eql(u8, &snap_head, &cur_head)) break :blk false;
-        break :blk snapshot_mod.loadSnapshot(ctx.io, snap_path_owned, ctx.explorer, ctx.store, ctx.allocator);
-    };
+    const snapshot_loaded = loadBestSnapshot(ctx.io, ctx.explorer, ctx.store, abs_root, data_dir, git_head, ctx.allocator);
     ctx.resolved_root = abs_root;
     ctx.explorer.setRoot(ctx.io, abs_root);
     ctx.scan_done.store(snapshot_loaded, .release);
