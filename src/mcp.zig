@@ -221,12 +221,31 @@ const ProjectCache = struct {
         self.default_snapshot_cache.deinit(self.alloc);
         for (&self.entries) |*slot| {
             if (slot.*) |entry| {
-                entry.snapshot_cache.deinit(self.alloc);
-                entry.explorer.deinit();
-                entry.store.deinit();
-                self.alloc.free(entry.path);
-                self.alloc.destroy(entry);
+                self.destroyEntry(entry);
                 slot.* = null;
+            }
+        }
+    }
+
+    fn destroyEntry(self: *ProjectCache, entry: *Entry) void {
+        entry.snapshot_cache.deinit(self.alloc);
+        entry.explorer.deinit();
+        entry.store.deinit();
+        self.alloc.free(entry.path);
+        self.alloc.destroy(entry);
+    }
+
+    fn invalidate(self: *ProjectCache, path: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        for (&self.entries) |*slot| {
+            if (slot.*) |entry| {
+                if (std.mem.eql(u8, entry.path, path)) {
+                    self.destroyEntry(entry);
+                    slot.* = null;
+                    return;
+                }
             }
         }
     }
@@ -239,8 +258,6 @@ const ProjectCache = struct {
         default_store: *Store,
     ) !ProjectCtx {
         const p = path orelse return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache };
-        if (std.mem.eql(u8, p, self.default_path))
-            return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache };
         if (!root_policy.isIndexableRoot(p))
             return error.PathNotAllowed;
 
@@ -292,6 +309,9 @@ const ProjectCache = struct {
                 new_entry.explorer.deinit();
                 self.alloc.free(new_entry.path);
                 self.alloc.destroy(new_entry);
+                if (std.mem.eql(u8, p, self.default_path) and default_store.currentSeq() > 0) {
+                    return ProjectCtx{ .explorer = default_exp, .store = default_store, .snapshot_cache = &self.default_snapshot_cache };
+                }
                 return error.SnapshotLoadFailed;
             }
         }
@@ -326,11 +346,7 @@ const ProjectCache = struct {
                 }
             }
             const evict = self.entries[oldest_i].?;
-            evict.snapshot_cache.deinit(self.alloc);
-            evict.explorer.deinit();
-            evict.store.deinit();
-            self.alloc.free(evict.path);
-            self.alloc.destroy(evict);
+            self.destroyEntry(evict);
             target_slot = oldest_i;
         }
 
@@ -363,7 +379,7 @@ pub const BenchContext = struct {
         explorer: *Explorer,
         agents: *AgentRegistry,
     ) void {
-        dispatch(io, alloc, tool, args, out, store, explorer, agents, &self.cache);
+        dispatch(io, alloc, tool, args, out, store, explorer, agents, &self.cache, null);
     }
 
     pub fn runToolCall(
@@ -382,7 +398,7 @@ pub const BenchContext = struct {
         defer out.deinit(alloc);
 
         const t0 = cio.nanoTimestamp();
-        dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache);
+        dispatch(io, alloc, tool, args, &out, store, explorer, agents, &self.cache, null);
         const elapsed = cio.nanoTimestamp() - t0;
 
         const is_error = std.mem.startsWith(u8, out.items, "error:");
@@ -614,7 +630,7 @@ pub fn run(
         } else if (mcpj.eql(method, "tools/list")) {
             if (!is_notification) writeResult(alloc, stdout, id, tools_list);
         } else if (mcpj.eql(method, "tools/call")) {
-            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, telem);
+            handleCall(io, alloc, root, stdout, id, store, explorer, agents, &cache, telem, session.deferred_scan);
         } else if (mcpj.eql(method, "ping")) {
             if (!is_notification) writeResult(alloc, stdout, id, "{}");
         } else {
@@ -736,6 +752,7 @@ fn handleCall(
     agents: *AgentRegistry,
     cache: *ProjectCache,
     telem: *telemetry_mod.Telemetry,
+    deferred_scan: ?*DeferredScan,
 ) void {
     const is_notification = id == null;
 
@@ -769,7 +786,7 @@ fn handleCall(
     defer out.deinit(alloc);
 
     const t0 = cio.nanoTimestamp();
-    dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache);
+    dispatch(io, alloc, tool, args, &out, store, explorer, agents, cache, deferred_scan);
     const elapsed = cio.nanoTimestamp() - t0;
 
     const is_error = std.mem.startsWith(u8, out.items, "error:");
@@ -843,6 +860,7 @@ fn dispatch(
     default_explorer: *Explorer,
     agents: *AgentRegistry,
     cache: *ProjectCache,
+    deferred_scan: ?*DeferredScan,
 ) void {
     const project_path = getStr(args, "project");
     const ctx = cache.get(io, project_path, default_explorer, default_store) catch |err| {
@@ -869,10 +887,10 @@ fn dispatch(
         .codedb_changes => handleChanges(alloc, args, out, default_store),
         .codedb_status => handleStatus(alloc, out, ctx.store, ctx.explorer),
         .codedb_snapshot => handleSnapshot(alloc, out, ctx.explorer, ctx.store, ctx.snapshot_cache),
-        .codedb_bundle => handleBundle(io, alloc, args, out, ctx.store, ctx.explorer, agents, cache),
+        .codedb_bundle => handleBundle(io, alloc, args, out, ctx.store, ctx.explorer, agents, cache, deferred_scan),
         .codedb_remote => handleRemote(alloc, args, out),
         .codedb_projects => handleProjects(io, alloc, out),
-        .codedb_index => handleIndex(io, alloc, args, out),
+        .codedb_index => handleIndex(io, alloc, args, out, cache, default_store, default_explorer, deferred_scan),
         .codedb_find => handleFind(io, alloc, args, out, ctx.explorer),
         .codedb_query => handleQuery(alloc, args, out, ctx.explorer, ctx.store),
     }
@@ -1356,6 +1374,7 @@ fn handleBundle(
     default_explorer: *Explorer,
     agents: *AgentRegistry,
     cache: *ProjectCache,
+    deferred_scan: ?*DeferredScan,
 ) void {
     const ops_val = args.get("ops") orelse {
         out.appendSlice(alloc, "error: missing 'ops' argument") catch {};
@@ -1420,7 +1439,7 @@ fn handleBundle(
         var sub_out: std.ArrayList(u8) = .empty;
         defer sub_out.deinit(alloc);
 
-        dispatch(io, alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache);
+        dispatch(io, alloc, tool, sub_args, &sub_out, default_store, default_explorer, agents, cache, deferred_scan);
 
         // Check size BEFORE appending to prevent blowout
         if (out.items.len + sub_out.items.len > 200 * 1024) {
@@ -1843,7 +1862,16 @@ fn handleProjects(io: std.Io, alloc: std.mem.Allocator, out: *std.ArrayList(u8))
     }
 }
 
-fn handleIndex(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8)) void {
+fn handleIndex(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    args: *const std.json.ObjectMap,
+    out: *std.ArrayList(u8),
+    cache: *ProjectCache,
+    default_store: *Store,
+    default_explorer: *Explorer,
+    deferred_scan: ?*DeferredScan,
+) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path'") catch {};
         return;
@@ -1879,9 +1907,15 @@ fn handleIndex(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Objec
     };
     defer alloc.free(exe_path);
 
+    const snapshot_path = std.fmt.allocPrint(alloc, "{s}/codedb.snapshot", .{abs_path}) catch {
+        out.appendSlice(alloc, "error: alloc failed") catch {};
+        return;
+    };
+    defer alloc.free(snapshot_path);
+
     const result = cio.runCapture(.{
         .allocator = alloc,
-        .argv = &.{ exe_path, abs_path, "snapshot" },
+        .argv = &.{ exe_path, abs_path, "snapshot", snapshot_path },
         .max_output_bytes = 64 * 1024,
     }) catch {
         out.appendSlice(alloc, "error: failed to run indexer") catch {};
@@ -1898,6 +1932,27 @@ fn handleIndex(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Objec
             out.appendSlice(alloc, result.stderr[0..@min(result.stderr.len, 300)]) catch {};
         }
         return;
+    }
+
+    cache.invalidate(abs_path);
+    if (std.mem.eql(u8, abs_path, cache.default_path) and
+        default_store.currentSeq() == 0 and
+        getScanState() == .loading_snapshot)
+    {
+        default_explorer.setRoot(io, abs_path);
+        if (snapshot_mod.loadSnapshot(io, snapshot_path, default_explorer, default_store, alloc)) {
+            loadProjectTrigramFromDiskIfPresent(io, default_explorer, abs_path, alloc);
+            if (default_explorer.outlines.count() > 1000) {
+                default_explorer.releaseContents();
+                default_explorer.releaseSecondaryIndexes();
+            }
+            setScanState(.ready);
+            if (deferred_scan) |ds| {
+                ds.resolved_root = cache.default_path;
+                ds.triggered.store(true, .release);
+                ds.scan_done.store(true, .release);
+            }
+        }
     }
 
     out.appendSlice(alloc, "indexed: ") catch {};
@@ -2913,6 +2968,107 @@ test "ProjectCache loads project from central snapshot cache" {
 
     const ctx = try cache.get(io, project_path, &default_explorer, &default_store);
     try testing.expect(ctx.explorer.outlines.contains("src/main.zig"));
+}
+
+test "issue-353: explicit default project loads snapshot when default explorer is empty" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "src/main.zig",
+        .data = "pub fn issue353() void {}\n",
+    });
+
+    var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
+    const project_path = project_path_buf[0..project_path_len];
+
+    const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
+    defer testing.allocator.free(data_dir);
+    const central_snapshot = try std.fmt.allocPrint(testing.allocator, "{s}/codedb.snapshot", .{data_dir});
+    defer testing.allocator.free(central_snapshot);
+    const project_txt = try std.fmt.allocPrint(testing.allocator, "{s}/project.txt", .{data_dir});
+    defer testing.allocator.free(project_txt);
+    defer {
+        std.Io.Dir.cwd().deleteFile(io, central_snapshot) catch {};
+        std.Io.Dir.cwd().deleteFile(io, project_txt) catch {};
+        std.Io.Dir.cwd().deleteDir(io, data_dir) catch {};
+    }
+
+    var snapshot_src = Explorer.init(testing.allocator);
+    defer snapshot_src.deinit();
+    snapshot_src.setRoot(io, project_path);
+    try snapshot_src.indexFile("src/main.zig", "pub fn issue353() void {}\n");
+    try snapshot_mod.writeProjectCacheSnapshot(io, &snapshot_src, project_path, testing.allocator);
+
+    var default_explorer = Explorer.init(testing.allocator);
+    defer default_explorer.deinit();
+    default_explorer.setRoot(io, project_path);
+    var default_store = Store.init(testing.allocator);
+    defer default_store.deinit();
+
+    var cache = ProjectCache.init(testing.allocator, project_path);
+    defer cache.deinit();
+
+    const ctx = try cache.get(io, project_path, &default_explorer, &default_store);
+    try testing.expect(ctx.explorer != &default_explorer);
+    try testing.expect(ctx.explorer.outlines.contains("src/main.zig"));
+    try testing.expectEqual(@as(u64, 0), default_store.currentSeq());
+}
+
+test "issue-353: project cache invalidation reloads newly written snapshots" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "src");
+
+    var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const project_path_len = try tmp.dir.realPathFile(io, ".", &project_path_buf);
+    const project_path = project_path_buf[0..project_path_len];
+
+    const data_dir = getProjectDataDir(testing.allocator, project_path) orelse return error.OutOfMemory;
+    defer testing.allocator.free(data_dir);
+    const central_snapshot = try std.fmt.allocPrint(testing.allocator, "{s}/codedb.snapshot", .{data_dir});
+    defer testing.allocator.free(central_snapshot);
+    const project_txt = try std.fmt.allocPrint(testing.allocator, "{s}/project.txt", .{data_dir});
+    defer testing.allocator.free(project_txt);
+    defer {
+        std.Io.Dir.cwd().deleteFile(io, central_snapshot) catch {};
+        std.Io.Dir.cwd().deleteFile(io, project_txt) catch {};
+        std.Io.Dir.cwd().deleteDir(io, data_dir) catch {};
+    }
+
+    var snapshot_src = Explorer.init(testing.allocator);
+    defer snapshot_src.deinit();
+    snapshot_src.setRoot(io, project_path);
+    try snapshot_src.indexFile("src/old.zig", "pub fn oldSymbol() void {}\n");
+    try snapshot_mod.writeProjectCacheSnapshot(io, &snapshot_src, project_path, testing.allocator);
+
+    var default_explorer = Explorer.init(testing.allocator);
+    defer default_explorer.deinit();
+    var default_store = Store.init(testing.allocator);
+    defer default_store.deinit();
+
+    var cache = ProjectCache.init(testing.allocator, "/Users/example/default");
+    defer cache.deinit();
+
+    const old_ctx = try cache.get(io, project_path, &default_explorer, &default_store);
+    try testing.expect(old_ctx.explorer.outlines.contains("src/old.zig"));
+
+    var snapshot_next = Explorer.init(testing.allocator);
+    defer snapshot_next.deinit();
+    snapshot_next.setRoot(io, project_path);
+    try snapshot_next.indexFile("src/new.zig", "pub fn newSymbol() void {}\n");
+    try snapshot_mod.writeProjectCacheSnapshot(io, &snapshot_next, project_path, testing.allocator);
+
+    cache.invalidate(project_path);
+
+    const new_ctx = try cache.get(io, project_path, &default_explorer, &default_store);
+    try testing.expect(!new_ctx.explorer.outlines.contains("src/old.zig"));
+    try testing.expect(new_ctx.explorer.outlines.contains("src/new.zig"));
 }
 
 test "codedb_snapshot cache reuses output until store seq changes" {
