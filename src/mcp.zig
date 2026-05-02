@@ -1427,14 +1427,23 @@ fn handleBundle(
             continue;
         }
 
-        var empty_args: std.json.ObjectMap = .empty;
-        defer empty_args.deinit(alloc);
-        var sub_args_val = op_obj.get("arguments") orelse std.json.Value{ .object = empty_args };
-        if (sub_args_val != .object) {
-            w.print("--- [{d}] {s} ---\nerror: arguments must be object\n", .{ i, tool_name }) catch {};
-            continue;
+        // Extract arguments. Two supported formats:
+        //   1) {"tool":"outline", "arguments":{"path":"..."}}  — MCP tools/call style
+        //   2) {"tool":"outline", "path":"..."}                 — inline args
+        var sub_args_val: std.json.Value = undefined;
+        var sub_args_ptr: ?*const std.json.ObjectMap = null;
+        if (op_obj.get("arguments")) |arguments_val| {
+            if (arguments_val != .object) {
+                w.print("--- [{d}] {s} ---\nerror: arguments must be object\n", .{ i, tool_name }) catch {};
+                continue;
+            }
+            sub_args_val = arguments_val;
+            sub_args_ptr = &sub_args_val.object;
+        } else {
+            // No "arguments" key — use op_obj directly (inline arg format)
+            sub_args_ptr = op_obj;
         }
-        const sub_args = &sub_args_val.object;
+        const sub_args = sub_args_ptr.?;
 
         var sub_out: std.ArrayList(u8) = .empty;
         defer sub_out.deinit(alloc);
@@ -2189,9 +2198,14 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                     }
                 }
                 file_set.items.len = wr;
+                w.print("{d} files after find intersect\n", .{file_set.items.len}) catch {};
             } else {
                 file_set.clearRetainingCapacity();
-                for (matches) |m| file_set.append(alloc, m.path) catch {};
+                w.print("{d} files matched:\n", .{matches.len}) catch {};
+                for (matches) |m| {
+                    w.print("  {s}\n", .{m.path}) catch {};
+                    file_set.append(alloc, m.path) catch {};
+                }
                 have_set = true;
             }
         } else if (std.mem.eql(u8, op, "search")) {
@@ -2256,10 +2270,24 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 have_set = true;
             }
         } else if (std.mem.eql(u8, op, "deps")) {
-            // Expand file set by adding dependents/dependencies of current files
+            // Expand file set by adding dependents/dependencies of current files.
+            // Accepts optional 'path' for standalone use without a prior seeding step.
             if (!have_set) {
-                w.print("error: deps needs prior step\n", .{}) catch {};
-                return;
+                if (getStr(step, "path")) |p| {
+                    const duped = alloc.dupe(u8, p) catch {
+                        w.print("error: out of memory\n", .{}) catch {};
+                        return;
+                    };
+                    file_set.append(alloc, duped) catch {
+                        alloc.free(duped);
+                        w.print("error: out of memory\n", .{}) catch {};
+                        return;
+                    };
+                    have_set = true;
+                } else {
+                    w.print("error: deps needs prior step or 'path' param\n", .{}) catch {};
+                    return;
+                }
             }
             const direction = getStr(step, "direction") orelse "imported_by";
             const transitive = getBool(step, "transitive");
@@ -2344,9 +2372,23 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             }
             file_set.items.len = wr;
         } else if (std.mem.eql(u8, op, "outline")) {
+            // Accepts optional 'path' for standalone single-file outline.
             if (!have_set) {
-                w.print("error: outline needs prior step\n", .{}) catch {};
-                return;
+                if (getStr(step, "path")) |p| {
+                    const duped = alloc.dupe(u8, p) catch {
+                        w.print("error: out of memory\n", .{}) catch {};
+                        return;
+                    };
+                    file_set.append(alloc, duped) catch {
+                        alloc.free(duped);
+                        w.print("error: out of memory\n", .{}) catch {};
+                        return;
+                    };
+                    have_set = true;
+                } else {
+                    w.print("error: outline needs prior step or 'path' param\n", .{}) catch {};
+                    return;
+                }
             }
             for (file_set.items) |path| {
                 var outline = explorer.getOutline(path, alloc) catch continue;
@@ -2361,9 +2403,23 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 }
             }
         } else if (std.mem.eql(u8, op, "read")) {
+            // Accepts optional 'path' for standalone single-file read.
             if (!have_set) {
-                w.print("error: read needs prior step\n", .{}) catch {};
-                return;
+                if (getStr(step, "path")) |p| {
+                    const duped = alloc.dupe(u8, p) catch {
+                        w.print("error: out of memory\n", .{}) catch {};
+                        return;
+                    };
+                    file_set.append(alloc, duped) catch {
+                        alloc.free(duped);
+                        w.print("error: out of memory\n", .{}) catch {};
+                        return;
+                    };
+                    have_set = true;
+                } else {
+                    w.print("error: read needs prior step or 'path' param\n", .{}) catch {};
+                    return;
+                }
             }
             const max_lines: usize = if (getInt(step, "lines")) |n| @intCast(@max(1, @min(n, 200))) else 50;
             for (file_set.items) |path| {
@@ -2401,7 +2457,97 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
                 }.lt);
             }
             // "score" sorting is implicit from find — no re-sort needed
+        } else if (std.mem.eql(u8, op, "word")) {
+            const word = getStr(step, "word") orelse {
+                w.print("error: word needs 'word'\n", .{}) catch {};
+                return;
+            };
+            const hits = explorer.searchWord(word, alloc) catch {
+                w.print("error: word search failed\n", .{}) catch {};
+                return;
+            };
+            defer alloc.free(hits);
+            if (have_set) {
+                // Intersect: only show hits from files in current set
+                var path_set = std.StringHashMap(void).init(alloc);
+                defer path_set.deinit();
+                var hit_set = std.StringHashMap(void).init(alloc);
+                defer hit_set.deinit();
+                for (file_set.items) |p| path_set.put(p, {}) catch {};
+                explorer.mu.lockShared();
+                defer explorer.mu.unlockShared();
+                for (hits) |h| {
+                    const hp = explorer.word_index.hitPath(h);
+                    if (path_set.contains(hp)) {
+                        w.print("  {s}:{d}\n", .{ hp, h.line_num }) catch {};
+                        hit_set.put(hp, {}) catch {};
+                    }
+                }
+                var wr: usize = 0;
+                for (file_set.items) |p| {
+                    if (hit_set.contains(p)) {
+                        file_set.items[wr] = p;
+                        wr += 1;
+                    }
+                }
+                file_set.items.len = wr;
+            } else {
+                explorer.mu.lockShared();
+                defer explorer.mu.unlockShared();
+                var seen = std.StringHashMap(void).init(alloc);
+                defer seen.deinit();
+                w.print("{d} word hits for '{s}':\n", .{ hits.len, word }) catch {};
+                file_set.clearRetainingCapacity();
+                for (hits) |h| {
+                    const hp = explorer.word_index.hitPath(h);
+                    w.print("  {s}:{d}\n", .{ hp, h.line_num }) catch {};
+                    if (!seen.contains(hp)) {
+                        const duped = alloc.dupe(u8, hp) catch continue;
+                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
+                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
+                    }
+                }
+                have_set = true;
+            }
+        } else if (std.mem.eql(u8, op, "symbol")) {
+            const name = getStr(step, "name") orelse {
+                w.print("error: symbol needs 'name'\n", .{}) catch {};
+                return;
+            };
+            const results = explorer.findAllSymbols(name, alloc) catch {
+                w.print("error: symbol search failed\n", .{}) catch {};
+                return;
+            };
+            defer {
+                for (results) |r| {
+                    alloc.free(r.path);
+                    alloc.free(r.symbol.name);
+                    if (r.symbol.detail) |d| alloc.free(d);
+                }
+                alloc.free(results);
+            }
+            var seen = std.StringHashMap(void).init(alloc);
+            defer seen.deinit();
+            w.print("{d} symbols '{s}':\n", .{ results.len, name }) catch {};
+            for (results) |r| {
+                w.print("  {s}:{d} ({s})\n", .{ r.path, r.symbol.line_start, @tagName(r.symbol.kind) }) catch {};
+            }
+            if (!have_set) {
+                file_set.clearRetainingCapacity();
+                for (results) |r| {
+                    if (!seen.contains(r.path)) {
+                        const duped = alloc.dupe(u8, r.path) catch continue;
+                        seen.put(duped, {}) catch { alloc.free(duped); continue; };
+                        file_set.append(alloc, duped) catch { alloc.free(duped); continue; };
+                    }
+                }
+                have_set = true;
+            }
         } else if (std.mem.eql(u8, op, "limit")) {
+            if (!have_set) {
+                w.print("error: limit needs prior step\n", .{}) catch {};
+                return;
+            }
             const n: usize = if (getInt(step, "n")) |i| @intCast(@max(1, @min(i, 100))) else 10;
             if (file_set.items.len > n) file_set.items.len = n;
         } else {
