@@ -80,6 +80,28 @@ curl -fsSL https://codedb.codegraff.com/install.sh | bash
 
 This replaces the `codedb` binary with the latest GitHub Release and keeps your existing MCP registrations, config, caches, and snapshots. Use this path for any release whose built-in updater cannot fetch release checksums.
 
+### v0.2.579 MCP hotfix and release checksums
+
+This note applies to `v0.2.579` only. Earlier `v0.2.579` binaries were rebuilt
+and re-uploaded on May 2, 2026 because they passed the normal Zig test suite but
+missed an MCP end-to-end regression: after `codedb_index` reported success,
+follow-up MCP queries could still see an empty in-memory project (`files: 0`,
+`scan: loading_snapshot`, empty `tree`/`find`/`search`, or `file not indexed`).
+
+The fixed `v0.2.579` release assets were rebuilt from source commit
+`1b634f0ba5cd1072e9ca54cabf442b573e034f53`. The values below are SHA256
+checksums for the uploaded binaries, not Git commit SHAs:
+
+| Binary | SHA256 |
+|--------|--------|
+| `codedb-darwin-arm64` | `b5bddba01767e38e9723f28c7b3ff55370c4eda5f9e0e84172aaec1ff5094cb2` |
+| `codedb-darwin-x86_64` | `cf2a9ec511f99fd839d2349cc17e671cd9566260cf601b8b23dd649665c22999` |
+| `codedb-linux-arm64` | `955b0288c5cfb5c360f7b814cd3cc288ecc42c63a569f65fac358bd9454d788b` |
+| `codedb-linux-x86_64` | `201dfe26bec33b3569c44a3d4893c51822bc793e06fab69fd93e81c0354232ee` |
+
+If you installed `v0.2.579` before this hotfix, rerun the installer above so the
+binary matches the final uploaded checksum for your platform.
+
 | Platform | Binary | Signed |
 |----------|--------|--------|
 | macOS ARM64 (Apple Silicon) | `codedb-darwin-arm64` | ✅ codesigned + notarized |
