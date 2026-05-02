@@ -70,6 +70,16 @@ curl -fsSL https://codedb.codegraff.com/install.sh | bash
 
 Downloads the binary for your platform and auto-registers codedb as an MCP server in **Claude Code**, **Codex**, **Gemini CLI**, and **Cursor**. The installer prints the exact `codedb mcp` command it registered plus hook setup pointers for Codex and Claude Code.
 
+### Updating or repairing an older install
+
+If `codedb update` fails on an older release, rerun the installer:
+
+```bash
+curl -fsSL https://codedb.codegraff.com/install.sh | bash
+```
+
+This replaces the `codedb` binary with the latest GitHub Release and keeps your existing MCP registrations, config, caches, and snapshots. Use this path for any release whose built-in updater cannot fetch release checksums.
+
 | Platform | Binary | Signed |
 |----------|--------|--------|
 | macOS ARM64 (Apple Silicon) | `codedb-darwin-arm64` | ✅ codesigned + notarized |
@@ -186,7 +196,7 @@ For Codex and Claude Code hook examples around `codedb_remote`, see [`docs/hooks
 | `codedb snapshot` | Write codedb.snapshot to project root |
 | `codedb serve` | HTTP daemon on :7719 |
 | `codedb mcp [path]` | JSON-RPC/MCP server over stdio |
-| `codedb update` | Self-update via install script |
+| `codedb update` | Self-update to the latest release; if it fails on an older build, rerun the curl installer above |
 | `codedb nuke` | Uninstall codedb, remove caches/snapshots, and deregister MCP integrations |
 | `codedb --version` | Print version |
 
