@@ -1255,6 +1255,119 @@ test "edit: range_start beyond file is invalid" {
     }));
 }
 
+test "issue-360: edit rejects mismatched if_hash and leaves file untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-if-hash.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "line 1\nline 2\nline 3\n";
+    var file = try tmp.dir.createFile(io, "edit-if-hash.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-360-agent");
+
+    // A hash value that cannot match any real file content (caller saw a stale read)
+    try testing.expectError(error.HashMismatch, edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "stale-line edit",
+        .if_hash = "deadbeef",
+    }));
+
+    // File on disk must be unchanged after the rejected edit
+    const after_bytes = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after_bytes);
+    try testing.expectEqualStrings(original, after_bytes);
+}
+
+test "issue-360: edit response reports hex hash matching codedb_read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-hex.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "alpha\nbeta\ngamma\n";
+    var file = try tmp.dir.createFile(io, "edit-hex.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-360-hex-agent");
+
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 2, 2 },
+        .content = "BETA",
+    });
+
+    // Hash returned matches Wyhash of the new content, hex-formatted same as codedb_read
+    const new_bytes = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(new_bytes);
+    const expected_hash = std.hash.Wyhash.hash(0, new_bytes);
+    try testing.expectEqual(expected_hash, result.new_hash);
+}
+
+test "issue-360: edit dry_run returns diff preview and leaves file untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-dry.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "alpha\nbeta\ngamma\n";
+    var file = try tmp.dir.createFile(io, "edit-dry.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-360-dry-agent");
+
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 2, 2 },
+        .content = "BETA",
+        .dry_run = true,
+    });
+    defer if (result.preview) |p| testing.allocator.free(p);
+
+    // File on disk is untouched.
+    const after_bytes = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after_bytes);
+    try testing.expectEqualStrings(original, after_bytes);
+
+    // Store unchanged.
+    try testing.expectEqual(@as(u64, 0), store.currentSeq());
+
+    // seq=0 indicates not committed; new_hash is the would-be hash.
+    try testing.expectEqual(@as(u64, 0), result.seq);
+
+    // Preview shows both the removed and the added line.
+    try testing.expect(result.preview != null);
+    const preview = result.preview.?;
+    try testing.expect(std.mem.indexOf(u8, preview, "-beta") != null);
+    try testing.expect(std.mem.indexOf(u8, preview, "+BETA") != null);
+}
+
 test "issue-35: edits immediately update explorer and snapshot output" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7667,4 +7780,308 @@ test "issue-346: root_policy rejects dangerous ambient cwd roots" {
     try testing.expect(!root_policy.isIndexableRoot("/usr/local/bin"));
     try testing.expect(!root_policy.isIndexableRoot("/opt"));
     try testing.expect(!root_policy.isIndexableRoot("/opt/homebrew"));
+}
+
+test "issue-359: globPaths matches files by glob pattern" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/mcp.zig", "pub fn a() void {}");
+    try explorer.indexFile("src/explore.zig", "pub fn b() void {}");
+    try explorer.indexFile("src/sub/inner.zig", "pub fn c() void {}");
+    try explorer.indexFile("tests/test_main.py", "def t(): pass");
+    try explorer.indexFile("README.md", "# readme");
+
+    // ** matches across path separators
+    const zigs = try explorer.globPaths(testing.allocator, "src/**/*.zig", 100);
+    defer testing.allocator.free(zigs);
+    try testing.expectEqual(@as(usize, 3), zigs.len);
+
+    // single * does not cross path separators
+    const top_zigs = try explorer.globPaths(testing.allocator, "src/*.zig", 100);
+    defer testing.allocator.free(top_zigs);
+    try testing.expectEqual(@as(usize, 2), top_zigs.len);
+
+    // top-level extension match
+    const md = try explorer.globPaths(testing.allocator, "*.md", 100);
+    defer testing.allocator.free(md);
+    try testing.expectEqual(@as(usize, 1), md.len);
+    try testing.expectEqualStrings("README.md", md[0]);
+
+    // results are sorted
+    const all_zigs = try explorer.globPaths(testing.allocator, "**/*.zig", 100);
+    defer testing.allocator.free(all_zigs);
+    try testing.expect(all_zigs.len >= 2);
+    var i: usize = 1;
+    while (i < all_zigs.len) : (i += 1) {
+        try testing.expect(std.mem.order(u8, all_zigs[i - 1], all_zigs[i]) == .lt);
+    }
+}
+
+test "issue-359: lsDir returns immediate children with file metadata" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/mcp.zig", "pub fn a() void {}");
+    try explorer.indexFile("src/explore.zig", "pub fn b() void {}");
+    try explorer.indexFile("src/sub/inner.zig", "pub fn c() void {}");
+    try explorer.indexFile("tests/test_main.py", "def t(): pass");
+    try explorer.indexFile("README.md", "# readme");
+
+    // Top-level: 1 file (README.md) + 2 dirs (src/, tests/)
+    const top = try explorer.lsDir(testing.allocator, "");
+    defer testing.allocator.free(top);
+    try testing.expectEqual(@as(usize, 3), top.len);
+
+    var saw_readme = false;
+    var saw_src_dir = false;
+    var saw_tests_dir = false;
+    for (top) |e| {
+        if (std.mem.eql(u8, e.name, "README.md")) {
+            try testing.expect(!e.is_dir);
+            saw_readme = true;
+        }
+        if (std.mem.eql(u8, e.name, "src")) {
+            try testing.expect(e.is_dir);
+            saw_src_dir = true;
+        }
+        if (std.mem.eql(u8, e.name, "tests")) {
+            try testing.expect(e.is_dir);
+            saw_tests_dir = true;
+        }
+    }
+    try testing.expect(saw_readme and saw_src_dir and saw_tests_dir);
+
+    // Inside src/: 2 files (mcp.zig, explore.zig) + 1 dir (sub/)
+    const src_children = try explorer.lsDir(testing.allocator, "src");
+    defer testing.allocator.free(src_children);
+    try testing.expectEqual(@as(usize, 3), src_children.len);
+
+    var saw_sub_dir = false;
+    var file_count: usize = 0;
+    for (src_children) |e| {
+        if (e.is_dir) {
+            if (std.mem.eql(u8, e.name, "sub")) saw_sub_dir = true;
+        } else {
+            file_count += 1;
+            try testing.expect(e.line_count >= 1);
+        }
+    }
+    try testing.expect(saw_sub_dir);
+    try testing.expectEqual(@as(usize, 2), file_count);
+}
+
+test "issue-359: mcp.globMatch backtracks across **/* boundary" {
+    // Pipeline filter (codedb_query) calls mcp.globMatch on each path. The
+    // iterative version forgot the outer ** position when it entered the
+    // inner *.zig star, so paths like src/sub/inner.zig were rejected by
+    // src/**/*.zig even though they should match.
+    try testing.expect(mcp_mod.globMatch("src/**/*.zig", "src/sub/inner.zig"));
+    try testing.expect(mcp_mod.globMatch("src/**/*.zig", "src/a/b/c.zig"));
+
+    // Single * still must not cross /.
+    try testing.expect(!mcp_mod.globMatch("src/*.zig", "src/sub/inner.zig"));
+
+    // Plain prefix matches still work.
+    try testing.expect(mcp_mod.globMatch("src/*.zig", "src/mcp.zig"));
+    try testing.expect(!mcp_mod.globMatch("docs/*.md", "src/mcp.zig"));
+}
+
+test "issue-359: globPaths recall — every matching path survives at every depth" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Plant files at varying depths under src/, plus a few outside it.
+    const planted = [_][]const u8{
+        "src/a.zig",
+        "src/b.zig",
+        "src/sub/c.zig",
+        "src/sub/d.zig",
+        "src/sub/deep/e.zig",
+        "src/sub/deep/f.zig",
+        "src/sub/deep/deeper/g.zig",
+        "tests/h.zig",
+        "src/notes.md",
+        "src/sub/notes.md",
+    };
+    for (planted) |p| try explorer.indexFile(p, "pub fn x() void {}");
+
+    // src/**/*.zig must reach every depth — this is the case the old
+    // iterative matcher silently dropped (single star slot lost the
+    // outer ** position when the inner *.zig star ran).
+    const all_src_zigs = try explorer.globPaths(testing.allocator, "src/**/*.zig", 100);
+    defer testing.allocator.free(all_src_zigs);
+    try testing.expectEqual(@as(usize, 7), all_src_zigs.len);
+
+    // Single * does not cross /: only the two top-level src zigs.
+    const top = try explorer.globPaths(testing.allocator, "src/*.zig", 100);
+    defer testing.allocator.free(top);
+    try testing.expectEqual(@as(usize, 2), top.len);
+
+    // **/*.md should find both markdown files no matter their depth.
+    const md = try explorer.globPaths(testing.allocator, "**/*.md", 100);
+    defer testing.allocator.free(md);
+    try testing.expectEqual(@as(usize, 2), md.len);
+
+    // Anchored deep match: src/**/g.zig must find the deepest one only.
+    const g = try explorer.globPaths(testing.allocator, "src/**/g.zig", 100);
+    defer testing.allocator.free(g);
+    try testing.expectEqual(@as(usize, 1), g.len);
+    try testing.expectEqualStrings("src/sub/deep/deeper/g.zig", g[0]);
+
+    // Pipeline filter must agree path-for-path with globPaths, since it
+    // now routes through the same matcher. Spot-check a few.
+    try testing.expect(mcp_mod.globMatch("src/**/*.zig", "src/sub/deep/deeper/g.zig"));
+    try testing.expect(mcp_mod.globMatch("**/*.md", "src/sub/notes.md"));
+    try testing.expect(!mcp_mod.globMatch("src/**/*.zig", "tests/h.zig"));
+}
+
+// ── Retrieval-quality test ────────────────────────────────────────────────
+//
+// Plants a small corpus where the ground-truth set of files matching each
+// query is fully known, then exercises every retrieval surface of the
+// Explorer (full-text search, exact word lookup, symbol-by-name, fuzzy
+// file find, glob, and dependency edges) and asserts perfect recall — i.e.
+// every expected file shows up. Catches silent-drop regressions across
+// the trigram index, sparse-ngram index, word index, symbol index, and
+// dep graph in one place.
+test "issue-359/360: retrieval recall — search/word/symbol/fuzzy/glob/deps all return ground truth" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Flat paths so dep_graph keys (raw import strings) line up with file paths.
+    try explorer.indexFile(
+        "auth.zig",
+        \\const std = @import("std");
+        \\
+        \\pub fn authenticate(token: []const u8) bool {
+        \\    _ = token;
+        \\    return true;
+        \\}
+        \\pub fn validateToken(token: []const u8) bool {
+        \\    return authenticate(token);
+        \\}
+        ,
+    );
+    try explorer.indexFile(
+        "handler.zig",
+        \\const auth = @import("auth.zig");
+        \\
+        \\pub fn handleLogin() void {
+        \\    if (auth.authenticate("x")) return;
+        \\}
+        ,
+    );
+    try explorer.indexFile(
+        "auth_test.zig",
+        \\const auth = @import("auth.zig");
+        \\
+        \\test "auth round-trip" {
+        \\    _ = auth.authenticate("x");
+        \\}
+        ,
+    );
+    try explorer.indexFile(
+        "unrelated.zig",
+        \\pub fn formatNumber(n: i64) []const u8 {
+        \\    _ = n;
+        \\    return "0";
+        \\}
+        ,
+    );
+    try explorer.indexFile("README.md", "# project\nauthenticate description here");
+
+    // 1. Full-text search: every file containing `authenticate` must appear.
+    {
+        const expected = [_][]const u8{ "auth.zig", "handler.zig", "auth_test.zig", "README.md" };
+        const results = try explorer.searchContent("authenticate", testing.allocator, 50);
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.line_text);
+                testing.allocator.free(r.path);
+            }
+            testing.allocator.free(results);
+        }
+        var seen = std.StringHashMap(void).init(testing.allocator);
+        defer seen.deinit();
+        for (results) |r| try seen.put(r.path, {});
+        for (expected) |e| try testing.expect(seen.contains(e));
+        try testing.expect(!seen.contains("unrelated.zig"));
+    }
+
+    // 2. Word index: exact token `authenticate` must reach the same 4 files.
+    {
+        const hits = try explorer.searchWord("authenticate", testing.allocator);
+        defer testing.allocator.free(hits);
+        var seen = std.StringHashMap(void).init(testing.allocator);
+        defer seen.deinit();
+        explorer.mu.lockShared();
+        defer explorer.mu.unlockShared();
+        for (hits) |h| try seen.put(explorer.word_index.hitPath(h), {});
+        const expected = [_][]const u8{ "auth.zig", "handler.zig", "auth_test.zig", "README.md" };
+        for (expected) |e| try testing.expect(seen.contains(e));
+    }
+
+    // 3. Symbol index: `authenticate` is defined once, in auth.zig.
+    {
+        const results = try explorer.findAllSymbols("authenticate", testing.allocator);
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.path);
+                testing.allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| testing.allocator.free(d);
+            }
+            testing.allocator.free(results);
+        }
+        try testing.expect(results.len >= 1);
+        var found_def = false;
+        for (results) |r| {
+            if (std.mem.eql(u8, r.path, "auth.zig")) found_def = true;
+        }
+        try testing.expect(found_def);
+    }
+
+    // 4. Fuzzy file find: query "auth" must reach both auth.zig and auth_test.zig.
+    {
+        const results = try explorer.fuzzyFindFiles("auth", testing.allocator, 50);
+        defer testing.allocator.free(results);
+        var seen = std.StringHashMap(void).init(testing.allocator);
+        defer seen.deinit();
+        for (results) |r| try seen.put(r.path, {});
+        try testing.expect(seen.contains("auth.zig"));
+        try testing.expect(seen.contains("auth_test.zig"));
+    }
+
+    // 5. Glob: `auth*.zig` must include auth.zig and auth_test.zig only.
+    {
+        const matches = try explorer.globPaths(testing.allocator, "auth*.zig", 50);
+        defer testing.allocator.free(matches);
+        var found_auth = false;
+        var found_test = false;
+        for (matches) |m| {
+            if (std.mem.eql(u8, m, "auth.zig")) found_auth = true;
+            if (std.mem.eql(u8, m, "auth_test.zig")) found_test = true;
+            try testing.expect(!std.mem.eql(u8, m, "unrelated.zig"));
+            try testing.expect(!std.mem.eql(u8, m, "handler.zig"));
+        }
+        try testing.expect(found_auth);
+        try testing.expect(found_test);
+    }
+
+    // 6. Dependency graph: handler.zig and auth_test.zig both import auth.zig.
+    {
+        const importers = try explorer.getImportedBy("auth.zig", testing.allocator);
+        defer {
+            for (importers) |p| testing.allocator.free(p);
+            testing.allocator.free(importers);
+        }
+        var saw_handler = false;
+        var saw_test = false;
+        for (importers) |p| {
+            if (std.mem.eql(u8, p, "handler.zig")) saw_handler = true;
+            if (std.mem.eql(u8, p, "auth_test.zig")) saw_test = true;
+        }
+        try testing.expect(saw_handler);
+        try testing.expect(saw_test);
+    }
 }

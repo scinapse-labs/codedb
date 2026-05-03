@@ -327,6 +327,7 @@ fn handleConnection(
             .agent_id = agent_id,
             .op = op,
             .content = content,
+            .if_hash = jsonString(body_obj, "if_hash"),
         };
         if (range_start != null and range_end != null) {
             req.range = .{ @intCast(range_start.?), @intCast(range_end.?) };
@@ -338,7 +339,7 @@ fn handleConnection(
             const err_body = std.fmt.bufPrint(&err_buf, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch return;
             const status = switch (err) {
                 error.InvalidRange, error.MissingContent => "400 Bad Request",
-                error.FileLocked => "409 Conflict",
+                error.FileLocked, error.HashMismatch => "409 Conflict",
                 error.FileNotFound => "404 Not Found",
                 error.AccessDenied => "403 Forbidden",
                 else => "500 Internal Server Error",

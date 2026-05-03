@@ -407,6 +407,78 @@ pub const SymbolLocation = struct {
     line_end: u32,
 };
 
+pub fn matchGlob(pattern: []const u8, path: []const u8) bool {
+    // Fast path: `**/*X` where X is a literal — degenerates to endsWith(X).
+    // Covers the common agent-style pattern `**/*.ext`.
+    if (globIsPureSuffix(pattern)) |suffix| {
+        return std.mem.endsWith(u8, path, suffix);
+    }
+    // Fast path: literal prefix before any wildcard. If the path doesn't
+    // start with that prefix, we can reject without recursing.
+    var lit_end: usize = 0;
+    while (lit_end < pattern.len) : (lit_end += 1) {
+        const c = pattern[lit_end];
+        if (c == '*' or c == '?') break;
+    }
+    if (lit_end > 0) {
+        if (path.len < lit_end) return false;
+        if (!std.mem.startsWith(u8, path, pattern[0..lit_end])) return false;
+        if (lit_end == pattern.len) return path.len == lit_end;
+    }
+    return matchGlobRec(pattern, lit_end, path, lit_end);
+}
+
+/// If `pattern` is exactly `**/*X` for some literal X (no `*`/`?` in X),
+/// returns X. Such patterns are equivalent to `endsWith(X)` because `**` may
+/// absorb everything up to the last `/` and the trailing `*` consumes the
+/// basename. Patterns like `*X` (single star) do NOT qualify because a single
+/// `*` cannot cross `/`.
+fn globIsPureSuffix(pattern: []const u8) ?[]const u8 {
+    if (pattern.len < 4) return null;
+    if (pattern[0] != '*' or pattern[1] != '*' or pattern[2] != '/' or pattern[3] != '*') return null;
+    const tail = pattern[4..];
+    for (tail) |c| if (c == '*' or c == '?') return null;
+    return tail;
+}
+
+fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start: usize) bool {
+    var gi = gi_start;
+    var ti = ti_start;
+    while (gi < pattern.len) {
+        const c = pattern[gi];
+        if (c == '*') {
+            if (gi + 1 < pattern.len and pattern[gi + 1] == '*') {
+                // ** matches across path separators
+                var rest = gi + 2;
+                if (rest < pattern.len and pattern[rest] == '/') rest += 1;
+                if (matchGlobRec(pattern, rest, path, ti)) return true;
+                var k: usize = ti;
+                while (k < path.len) : (k += 1) {
+                    if (matchGlobRec(pattern, rest, path, k + 1)) return true;
+                }
+                return false;
+            } else {
+                // single * does not cross /
+                if (matchGlobRec(pattern, gi + 1, path, ti)) return true;
+                var k: usize = ti;
+                while (k < path.len and path[k] != '/') : (k += 1) {
+                    if (matchGlobRec(pattern, gi + 1, path, k + 1)) return true;
+                }
+                return false;
+            }
+        } else if (c == '?') {
+            if (ti >= path.len or path[ti] == '/') return false;
+            gi += 1;
+            ti += 1;
+        } else {
+            if (ti >= path.len or path[ti] != c) return false;
+            gi += 1;
+            ti += 1;
+        }
+    }
+    return ti == path.len;
+}
+
 pub const Explorer = struct {
     outlines: std.StringHashMap(FileOutline),
     dep_graph: DependencyGraph,
@@ -1750,6 +1822,107 @@ pub const Explorer = struct {
             matches.deinit(allocator);
             return &.{};
         };
+    }
+
+    pub const LsEntry = struct {
+        name: []const u8,
+        is_dir: bool,
+        line_count: u32 = 0,
+        sym_count: u32 = 0,
+        language: Language = .unknown,
+    };
+
+    pub fn globPaths(self: *Explorer, allocator: std.mem.Allocator, pattern: []const u8, max_results: usize) ![][]const u8 {
+        if (pattern.len == 0) return &.{};
+
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        var matches: std.ArrayList([]const u8) = .empty;
+        errdefer matches.deinit(allocator);
+        // Reserve a guess so small/medium glob result sets don't trigger
+        // multiple geometric reallocations.
+        matches.ensureTotalCapacity(allocator, @min(64, self.outlines.count())) catch {};
+
+        var iter = self.outlines.keyIterator();
+        while (iter.next()) |key_ptr| {
+            const path = key_ptr.*;
+            if (matchGlob(pattern, path)) {
+                try matches.append(allocator, path);
+            }
+        }
+
+        std.mem.sort([]const u8, matches.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+
+        if (matches.items.len > max_results) matches.items.len = max_results;
+
+        return matches.toOwnedSlice(allocator);
+    }
+
+    pub fn lsDir(self: *Explorer, allocator: std.mem.Allocator, prefix: []const u8) ![]LsEntry {
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        // Normalize: trim trailing slash. Empty prefix means root.
+        var p = prefix;
+        if (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+
+        var entries: std.ArrayList(LsEntry) = .empty;
+        errdefer entries.deinit(allocator);
+        // Most listings produce a small set; a single up-front allocation
+        // avoids the geometric-realloc dance for typical directories.
+        entries.ensureTotalCapacity(allocator, 32) catch {};
+
+        // Each outline key is unique, so a file `rel` is emitted at most once
+        // by construction. We only need a dedup map for directory names since
+        // multiple paths can share a parent dir.
+        var seen_dirs = std.StringHashMap(void).init(allocator);
+        defer seen_dirs.deinit();
+
+        var iter = self.outlines.iterator();
+        while (iter.next()) |kv| {
+            const path = kv.key_ptr.*;
+
+            var rel: []const u8 = undefined;
+            if (p.len == 0) {
+                rel = path;
+            } else {
+                if (!std.mem.startsWith(u8, path, p)) continue;
+                if (path.len <= p.len + 1 or path[p.len] != '/') continue;
+                rel = path[p.len + 1 ..];
+            }
+            if (rel.len == 0) continue;
+
+            if (std.mem.indexOfScalar(u8, rel, '/')) |sep| {
+                const dir_name = rel[0..sep];
+                if (!seen_dirs.contains(dir_name)) {
+                    try seen_dirs.put(dir_name, {});
+                    try entries.append(allocator, .{ .name = dir_name, .is_dir = true });
+                }
+            } else {
+                const fo = kv.value_ptr.*;
+                try entries.append(allocator, .{
+                    .name = rel,
+                    .is_dir = false,
+                    .line_count = fo.line_count,
+                    .sym_count = @intCast(fo.symbols.items.len),
+                    .language = fo.language,
+                });
+            }
+        }
+
+        std.mem.sort(LsEntry, entries.items, {}, struct {
+            fn lt(_: void, a: LsEntry, b: LsEntry) bool {
+                if (a.is_dir != b.is_dir) return a.is_dir;
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lt);
+
+        return entries.toOwnedSlice(allocator);
     }
 
     pub fn getImportedBy(self: *Explorer, path: []const u8, allocator: std.mem.Allocator) ![]const []const u8 {

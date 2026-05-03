@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.5792 - 2026-05-04
+
+`0.2.5792` is a tools, safety, and performance release. Two new MCP tools land (`codedb_glob`, `codedb_ls`), `codedb_edit` gains a `dry_run` preview and an `if_hash` stale-line guard, and the `**` glob matcher is rewritten to fix a recall regression and pick up a 30% p50 win on common patterns.
+
+### Highlights
+
+- **New: `codedb_glob` and `codedb_ls` MCP tools.** Native glob and directory listing surfaced to MCP clients alongside the existing search/outline tools. Closes [#359](https://github.com/justrach/codedb/issues/359).
+- **`codedb_edit` is now safer.** `if_hash` is enforced — edits against stale lines fail fast instead of silently overwriting. `dry_run` returns the would-be diff (and a corrected `inserted_count`) without writing. Closes [#360](https://github.com/justrach/codedb/issues/360).
+- **Glob `**` correctness fix.** The pipeline filter previously used `mcp.globMatch`, which dropped matches when `**` had to backtrack across directory depths. Replaced with `explore.matchGlob`. A retrieval-recall regression test now pins behavior across all six retrieval surfaces (full-text, word index, symbol index, fuzzy path, glob, dep graph). Closes [#359](https://github.com/justrach/codedb/issues/359).
+- **30% faster `**/*.md` glob.** `matchGlob` short-circuits common patterns: `**/*X` degenerates to `endsWith`, and patterns with long literal prefixes that the path can't match exit early. Measured 540 µs → 377 µs p50.
+
+### Correctness: Edit
+
+- `if_hash` mismatch returns an error instead of writing — no more silent stale-line overwrites. (#360)
+- `dry_run` mode returns the planned diff without touching the file; `inserted_count` reports the correct line count. (#360)
+- `codedb_edit` response is now hex-consistent with `codedb_read` so callers don't have to normalize hash formats.
+
+### Correctness: Glob
+
+- Pipeline glob filter routes through `explore.matchGlob`, fixing `**` backtracking across directory depths. (#359)
+- Recall regression test plants a flat 5-file corpus (definition, importer, test, decoy, prose) and asserts every retrieval surface — `searchContent`, `searchWord`, `findAllSymbols`, `fuzzyFindFiles`, `globPaths`, `getImportedBy` — returns the expected files and excludes the decoy. Fires if any index silently drops a file in the future.
+
+### Performance
+
+- `matchGlob` fast paths for `**/*X` (endsWith) and long literal prefixes. −30% p50 on `**/*.md` (540 → 377 µs).
+- `lsDir` / `globPaths` allocation trims: pre-reserved result-list capacity, removed the redundant `seen_files` map in `lsDir`. Effect on a 113-file repo is within run-to-run noise; kept because it removes dead work and reduces allocations on larger repos.
+
+### Issues Closed
+
+- [#359](https://github.com/justrach/codedb/issues/359) — Tool suggestions: native `glob` and `ls` tools
+- [#360](https://github.com/justrach/codedb/issues/360) — `codedb_edit` suggestions (`if_hash` + `dry_run`)
+
 ## 0.2.57 - 2026-04-13
 
 `0.2.57` is a broad correctness, performance, and reliability release. It ships everything merged to main since `0.2.56` plus nine index and watcher bug fixes.

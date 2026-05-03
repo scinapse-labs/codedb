@@ -464,6 +464,8 @@ pub const Tool = enum {
     codedb_index,
     codedb_find,
     codedb_query,
+    codedb_glob,
+    codedb_ls,
 };
 
 const tools_list =
@@ -476,7 +478,7 @@ const tools_list =
     \\{"name":"codedb_hot","description":"Get the most recently modified files in the codebase, ordered by recency. Useful to see what's been actively worked on.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph queries. Default: which files import the given file (reverse deps). Use direction=depends_on for forward deps. Use transitive=true for full blast radius via BFS traversal. O(1) lookups via bidirectional graph index.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_read","description":"Read file contents. IMPORTANT: Use codedb_outline first to find the line numbers you need, then read only that range with line_start/line_end. Avoid reading entire large files — use compact=true to skip comments and blanks. For understanding file structure, codedb_outline is 4-15x more token-efficient.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"line_start":{"type":"integer","description":"Start line (1-indexed, inclusive). Omit for full file."},"line_end":{"type":"integer","description":"End line (1-indexed, inclusive). Omit to read to EOF."},"if_hash":{"type":"string","description":"Previous content hash. If unchanged, returns short 'unchanged:HASH' response."},"compact":{"type":"boolean","description":"Skip comment and blank lines (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
-    \\{"name":"codedb_edit","description":"Apply a line-based edit to a file. Supports replace (range), insert (after line), and delete (range) operations.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"op":{"type":"string","enum":["replace","insert","delete"],"description":"Edit operation type"},"content":{"type":"string","description":"New content (for replace/insert)"},"range_start":{"type":"integer","description":"Start line number (for replace/delete, 1-indexed)"},"range_end":{"type":"integer","description":"End line number (for replace/delete, 1-indexed)"},"after":{"type":"integer","description":"Insert after this line number (for insert)"}},"required":["path","op"]}},
+    \\{"name":"codedb_edit","description":"Apply a line-based edit to a file. Supports replace (range), insert (after line), and delete (range) operations. Pass if_hash from the most recent codedb_read response to guard against stale-line-number edits — the edit is rejected if the file has changed since you read it. Set dry_run=true to receive a unified-diff-style preview without touching disk.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to edit"},"op":{"type":"string","enum":["replace","insert","delete"],"description":"Edit operation type"},"content":{"type":"string","description":"New content (for replace/insert)"},"range_start":{"type":"integer","description":"Start line number (for replace/delete, 1-indexed)"},"range_end":{"type":"integer","description":"End line number (for replace/delete, 1-indexed)"},"after":{"type":"integer","description":"Insert after this line number (for insert)"},"if_hash":{"type":"string","description":"Hex hash from codedb_read's 'hash:' line. Edit is rejected with HashMismatch if the file has changed since."},"dry_run":{"type":"boolean","description":"If true, return a diff preview without writing. Disk and store are untouched. Default: false."}},"required":["path","op"]}},
     \\{"name":"codedb_changes","description":"Get files that changed since a sequence number. Use with codedb_status to poll for changes.","inputSchema":{"type":"object","properties":{"since":{"type":"integer","description":"Sequence number to get changes since (default: 0)"}},"required":[]}},
     \\{"name":"codedb_status","description":"Get current codedb status: number of indexed files and current sequence number.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_snapshot","description":"Get the full pre-rendered snapshot of the codebase as a single JSON blob. Contains tree, all outlines, symbol index, and dependency graph. Ideal for caching or deploying to edge workers.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
@@ -485,7 +487,9 @@ const tools_list =
     \\{"name":"codedb_projects","description":"List all locally indexed projects on this machine. Shows project paths, data directory hashes, and whether a snapshot exists. Use to discover what codebases are available.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the folder to index (e.g. /Users/you/myproject)"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy file search — finds files by approximate name. Typo-tolerant subsequence matching with word-boundary and filename bonuses. Use when you know roughly what file you're looking for but not the exact path. Much faster than codedb_tree + manual scan.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy search query (e.g. 'authmidlware', 'test_auth', 'main.zig')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
-    \\{"name":"codedb_query","description":"Composable search pipeline — chain multiple operations where each step feeds the next. Replaces multi-tool workflows with a single call. Pipeline ops: find (fuzzy file search), search (content grep), filter (by extension/path glob), deps (expand via dependency graph), outline (get symbols), read (file contents), sort (by score/path), limit (truncate). Each step operates on the file set from the previous step.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}}
+    \\{"name":"codedb_query","description":"Composable search pipeline — chain multiple operations where each step feeds the next. Replaces multi-tool workflows with a single call. Pipeline ops: find (fuzzy file search), search (content grep), filter (by extension/path glob), deps (expand via dependency graph), outline (get symbols), read (file contents), sort (by score/path), limit (truncate). Each step operates on the file set from the previous step.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}},
+    \\{"name":"codedb_glob","description":"Match indexed file paths against a glob pattern. Supports * (does not cross /), ** (matches across /), and ? (single char, not /). Sorted lexicographically. Use this when you know the path shape (e.g. 'src/**/*.zig', 'tests/test_*.py') instead of guessing with codedb_find.","inputSchema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. 'src/**/*.zig', '*.md', 'tests/test_*.py')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 200)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["pattern"]}},
+    \\{"name":"codedb_ls","description":"List immediate children of a directory in the indexed tree. Returns directories first (alphabetically) then files with language and line/symbol counts. Use this to drill down a level at a time when codedb_tree is too verbose.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Directory prefix relative to project root. Omit or pass empty string for root."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}}
     \\]}
 ;
 
@@ -893,6 +897,8 @@ fn dispatch(
         .codedb_index => handleIndex(io, alloc, args, out, cache, default_store, default_explorer, deferred_scan),
         .codedb_find => handleFind(io, alloc, args, out, ctx.explorer),
         .codedb_query => handleQuery(alloc, args, out, ctx.explorer, ctx.store),
+        .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
+        .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
     }
 }
 
@@ -1328,6 +1334,8 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         .agent_id = 1,
         .op = op,
         .content = content,
+        .if_hash = getStr(args, "if_hash"),
+        .dry_run = getBool(args, "dry_run"),
     };
     if (range_start != null and range_end != null) {
         if (range_start.? <= 0 or range_end.? <= 0) {
@@ -1347,11 +1355,26 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     const result = edit_mod.applyEdit(io, alloc, store, agents, explorer, req) catch |err| {
         out.appendSlice(alloc, "error: edit failed: ") catch {};
         out.appendSlice(alloc, @errorName(err)) catch {};
+        if (err == error.HashMismatch) {
+            // Include the file's current hex hash so the agent can re-read with if_hash
+            // to verify it has the latest content, then retry the edit.
+            if (std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024))) |bytes| {
+                defer alloc.free(bytes);
+                const w = cio.listWriter(out, alloc);
+                w.print(" (current hash: {x})", .{std.hash.Wyhash.hash(0, bytes)}) catch {};
+            } else |_| {}
+        }
         return;
     };
+    defer if (result.preview) |p| alloc.free(p);
 
     const w = cio.listWriter(out, alloc);
-    w.print("edit applied: seq={d}, size={d}, hash={d}", .{ result.seq, result.new_size, result.new_hash }) catch {};
+    if (req.dry_run) {
+        w.print("dry_run: would write size={d}, hash:{x}\n", .{ result.new_size, result.new_hash }) catch {};
+        if (result.preview) |p| out.appendSlice(alloc, p) catch {};
+    } else {
+        w.print("edit applied: seq={d}, size={d}, hash:{x}", .{ result.seq, result.new_size, result.new_hash }) catch {};
+    }
 }
 
 fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store) void {
@@ -2110,6 +2133,69 @@ fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     }
 }
 
+fn handleGlob(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const pattern = getStr(args, "pattern") orelse {
+        out.appendSlice(alloc, "error: missing 'pattern'") catch {};
+        return;
+    };
+    if (pattern.len == 0) {
+        out.appendSlice(alloc, "error: empty pattern") catch {};
+        return;
+    }
+
+    const max_results: usize = if (args.get("max_results")) |v| switch (v) {
+        .integer => |i| @intCast(@max(1, @min(i, 5000))),
+        else => 200,
+    } else 200;
+
+    const matches = explorer.globPaths(alloc, pattern, max_results) catch {
+        out.appendSlice(alloc, "error: glob failed") catch {};
+        return;
+    };
+    defer alloc.free(matches);
+
+    if (matches.len == 0) {
+        out.appendSlice(alloc, "no matches") catch {};
+        return;
+    }
+
+    for (matches) |path| {
+        out.appendSlice(alloc, path) catch {};
+        out.appendSlice(alloc, "\n") catch {};
+    }
+}
+
+fn handleLs(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const prefix = getStr(args, "path") orelse "";
+
+    const entries = explorer.lsDir(alloc, prefix) catch {
+        out.appendSlice(alloc, "error: ls failed") catch {};
+        return;
+    };
+    defer alloc.free(entries);
+
+    if (entries.len == 0) {
+        out.appendSlice(alloc, "no entries") catch {};
+        return;
+    }
+
+    for (entries) |e| {
+        if (e.is_dir) {
+            out.appendSlice(alloc, e.name) catch {};
+            out.appendSlice(alloc, "/\n") catch {};
+        } else {
+            out.appendSlice(alloc, e.name) catch {};
+            var buf: [64]u8 = undefined;
+            const meta = std.fmt.bufPrint(&buf, "  ({s}, {d}L, {d} sym)\n", .{
+                @tagName(e.language),
+                e.line_count,
+                e.sym_count,
+            }) catch "\n";
+            out.appendSlice(alloc, meta) catch {};
+        }
+    }
+}
+
 const COMBO_WINDOW_MS: i64 = 5000; // 5 second window between query and file open
 const COMBO_BOOST_PER_HIT: f32 = 5.0; // score boost per historical open
 
@@ -2685,48 +2771,8 @@ fn logFileAccess(io: std.Io, tool: []const u8, file_path: []const u8, latency_ns
     }) catch return;
     appendToWal(io, line);
 }
-fn globMatch(pattern: []const u8, path: []const u8) bool {
-    var pi: usize = 0;
-    var gi: usize = 0;
-    var star_g: ?usize = null;
-    var star_p: usize = 0;
-
-    while (pi < path.len) {
-        if (gi < pattern.len and (pattern[gi] == path[pi] or (pattern[gi] == '?' and path[pi] != '/'))) {
-            gi += 1;
-            pi += 1;
-        } else if (gi < pattern.len and pattern[gi] == '*') {
-            // Check for ** (matches across path separators)
-            if (gi + 1 < pattern.len and pattern[gi + 1] == '*') {
-                // ** matches everything including /
-                star_g = gi;
-                star_p = pi;
-                gi += 2;
-                if (gi < pattern.len and pattern[gi] == '/') gi += 1; // skip trailing /
-            } else {
-                // * matches everything except /
-                star_g = gi;
-                star_p = pi;
-                gi += 1;
-            }
-        } else if (star_g != null) {
-            gi = star_g.? + 1;
-            if (gi < pattern.len and pattern[gi - 1] == '*' and pattern[gi] == '*') {
-                gi += 1;
-                if (gi < pattern.len and pattern[gi] == '/') gi += 1;
-            }
-            star_p += 1;
-            pi = star_p;
-            // Single * must not cross /
-            if (pattern[star_g.?] == '*' and (star_g.? + 1 >= pattern.len or pattern[star_g.? + 1] != '*')) {
-                if (pi > 0 and path[pi - 1] == '/') return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    while (gi < pattern.len and pattern[gi] == '*') : (gi += 1) {}
-    return gi == pattern.len;
+pub fn globMatch(pattern: []const u8, path: []const u8) bool {
+    return explore_mod.matchGlob(pattern, path);
 }
 
 pub fn isPathSafe(path: []const u8) bool {
