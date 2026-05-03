@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.5794 - 2026-05-04
+
+`0.2.5794` extends [#356](https://github.com/justrach/codedb/issues/356) phase 2 — the `received keys: [...]` diagnostic now lands on every single-tool handler with a required argument. Tiny release; entirely an ergonomics polish on top of `0.2.5793`.
+
+### Reliability ([#356](https://github.com/justrach/codedb/issues/356) phase 2)
+
+The `received keys: [...]` self-diagnose hint is now wired into:
+
+- `codedb_outline` — missing `'path'`
+- `codedb_symbol` — missing `'name'`
+- `codedb_search` — missing `'query'`
+- `codedb_word` — missing `'word'`
+- `codedb_deps` — missing `'path'`
+- `codedb_read` — missing `'path'`
+
+Combined with phase 1 (`codedb_query` pipeline steps and `codedb_bundle` ops), every read-path tool now surfaces the keys it actually received when a required argument is missing. Callers can self-diagnose typos like `file_path` vs `path` without retrying blind. `codedb_edit` deliberately keeps the bare error — write operations should fail loudly without hinting at alternatives.
+
 ## 0.2.5793 - 2026-05-04
 
 `0.2.5793` is a search recall, ranking, and reliability release on top of `0.2.5792`. All three items from [#363](https://github.com/justrach/codedb/issues/363) plus phase 1 of [#356](https://github.com/justrach/codedb/issues/356) are resolved.
