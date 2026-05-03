@@ -925,6 +925,9 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
     } orelse {
         out.appendSlice(alloc, "error: file not indexed: ") catch {};
         out.appendSlice(alloc, path) catch {};
+        // Issue #356-2: fuzzy path fallback — surface top matches so the
+        // caller can self-correct without a separate codedb_find round-trip.
+        appendFuzzyPathSuggestions(alloc, out, explorer, path);
         return;
     };
     defer outline.deinit();
@@ -1463,6 +1466,44 @@ fn appendBundleArgKeysDiagnostic(
         out.appendSlice(alloc, entry.key_ptr.*) catch return;
     }
     out.appendSlice(alloc, "]") catch return;
+}
+
+/// Append up to 3 fuzzy-matched indexed paths so callers can recover from a
+/// non-indexed-path error without a separate codedb_find round-trip.
+/// See issue #356.
+fn appendFuzzyPathSuggestions(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    explorer: *Explorer,
+    bad_path: []const u8,
+) void {
+    const matches = explorer.fuzzyFindFiles(bad_path, alloc, 3) catch return;
+    defer alloc.free(matches);
+    if (matches.len == 0) return;
+    out.appendSlice(alloc, "\ndid you mean:\n") catch return;
+    for (matches) |m| {
+        out.appendSlice(alloc, "  ") catch return;
+        out.appendSlice(alloc, m.path) catch return;
+        out.appendSlice(alloc, "\n") catch return;
+    }
+}
+
+/// Mark a codedb_query pipeline as having failed at a given step, append the
+/// `received keys: [...]` diagnostic when a missing-arg error fired, and
+/// emit a `--- partial ---` tail naming the failing step. Prior-step output
+/// in `out` is preserved unchanged. See issue #356.
+fn finishQueryWithFailure(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    step_i: usize,
+    reason: []const u8,
+    step_args: ?*const std.json.ObjectMap,
+) void {
+    if (step_args) |sa| {
+        appendBundleArgKeysDiagnostic(alloc, out, sa);
+    }
+    const w = cio.listWriter(out, alloc);
+    w.print("\n--- partial ---\nfailed_at: {d}\nreason: {s}\n", .{ step_i, reason }) catch {};
 }
 
 fn handleBundle(
@@ -2345,12 +2386,14 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             if (getStr(step, "word") != null)   break :blk "word";
             if (getStr(step, "name") != null)   break :blk "symbol";
             w.print("error: step {d} missing 'op'\n", .{step_i}) catch {};
+            finishQueryWithFailure(alloc, out, step_i, "missing 'op'", step);
             return;
         };
 
         if (std.mem.eql(u8, op, "find")) {
             const query = getStr(step, "query") orelse {
                 w.print("error: find needs 'query'\n", .{}) catch {};
+                finishQueryWithFailure(alloc, out, step_i, "find needs 'query'", step);
                 return;
             };
             const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
@@ -2385,6 +2428,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
         } else if (std.mem.eql(u8, op, "search")) {
             const query = getStr(step, "query") orelse {
                 w.print("error: search needs 'query'\n", .{}) catch {};
+                finishQueryWithFailure(alloc, out, step_i, "search needs 'query'", step);
                 return;
             };
             const max: usize = if (getInt(step, "max_results")) |n| @intCast(@max(1, @min(n, 200))) else 50;
@@ -2634,6 +2678,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
         } else if (std.mem.eql(u8, op, "word")) {
             const word = getStr(step, "word") orelse {
                 w.print("error: word needs 'word'\n", .{}) catch {};
+                finishQueryWithFailure(alloc, out, step_i, "word needs 'word'", step);
                 return;
             };
             const hits = explorer.searchWord(word, alloc) catch {
@@ -2686,6 +2731,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
         } else if (std.mem.eql(u8, op, "symbol")) {
             const name = getStr(step, "name") orelse {
                 w.print("error: symbol needs 'name'\n", .{}) catch {};
+                finishQueryWithFailure(alloc, out, step_i, "symbol needs 'name'", step);
                 return;
             };
             const results = explorer.findAllSymbols(name, alloc) catch {

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.5793 - 2026-05-04
+
+`0.2.5793` is a search recall, ranking, and reliability release on top of `0.2.5792`. All three items from [#363](https://github.com/justrach/codedb/issues/363) plus phase 1 of [#356](https://github.com/justrach/codedb/issues/356) are resolved.
+
+### Search and ranking ([#363](https://github.com/justrach/codedb/issues/363))
+
+- **`codedb_search` recall: source-file matches no longer dropped when doc files dominate the word index.** A Sonnet 4.6 sub-agent driving the live MCP reproduced [#363](https://github.com/justrach/codedb/issues/363) item a: querying `searchContent` against this repo returned doc files (CHANGELOG.md, architecture.md, etc.) but missed `src/explore.zig` itself. Root cause: Tier 0 of `searchContent` (`explore.zig:1511`) iterates word-index hits in posting-list order and saturates the result quota with hits from heavily-mentioning files before reaching source files indexed later. Fix: per-file cap of `max(1, max_results / 5)` in Tier 0 so a single hot file can't crowd out the rest. Closes [#363](https://github.com/justrach/codedb/issues/363) (item a).
+- **Fuzzy find: exact basename match now dominates ranking.** Querying `cli.rs` against a multi-crate workspace previously returned four unrelated `lib.rs` files ahead of the actual `crates/forge_main/src/cli.rs`. The compounding factors were the special-entry-point bonus (which gave `lib.rs` / `main.go` / `index.ts` a +5% boost regardless of query) and path-length normalization rewarding shorter parent paths. Fix: when the query case-insensitively equals the filename, apply a 4× multiplier — fzf-style "exact match always wins." Closes [#363](https://github.com/justrach/codedb/issues/363) (item b).
+
+### Query reliability and ergonomics ([#356](https://github.com/justrach/codedb/issues/356) phase 1)
+
+The "Agent Context Planner" framing was dropped — codedb stays a tool, agents stay in charge of composition. Three small reliability improvements land:
+
+- **`codedb_query`: partial results when a step fails.** The pipeline previously bailed on the first error and discarded successful prior-step output. Now the prior-step output is preserved and a structured `--- partial ---` tail names the failing step + reason. Agents can recover from a single bad step instead of starting over.
+- **`codedb_outline`: fuzzy path fallback.** A non-indexed path used to return a bare `error: file not indexed`. Now appends up to 3 fuzzy-matched indexed paths under a `did you mean:` header, so an agent that mistypes can self-correct without a separate `codedb_find` round-trip.
+- **`codedb_query`: received-keys diagnostic on missing-arg errors.** Mirrors the [#357](https://github.com/justrach/codedb/issues/357) `codedb_bundle` diagnostic. When a step fails with `error: search needs 'query'` but the step actually has a `q` key instead, callers see `received keys: [op, q]` so they can tell whether codedb dropped the field or the client sent it under the wrong name. Wired through `op`-detection plus `find`, `search`, `word`, and `symbol` step error paths.
+
+### Cosmetic
+
+- **`codedb --version` and `codedb_status` now report the correct version.** The `0.2.5792` release shipped with `src/release_info.zig` at `"0.2.579"` while `build.zig.zon` was at `"0.2.5792"` — so binaries built from that source tree self-reported as the older version. Both are now synced to `0.2.5793`.
+
+### Carried over from 0.2.5792
+
+The `received keys: [...]` diagnostic that landed in [#357](https://github.com/justrach/codedb/issues/357) (PR [#362](https://github.com/justrach/codedb/pull/362), shipped in 0.2.5792) addresses [#363](https://github.com/justrach/codedb/issues/363) item c — bundled-op argument errors now surface the keys actually received so callers can self-diagnose.
+
 ## 0.2.5792 - 2026-05-04
 
 `0.2.5792` is a tools, safety, and performance release. Two new MCP tools land (`codedb_glob`, `codedb_ls`), `codedb_edit` gains a `dry_run` preview and an `if_hash` stale-line guard, and the `**` glob matcher is rewritten to fix a recall regression and pick up a 30% p50 win on common patterns.

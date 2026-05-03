@@ -1509,11 +1509,21 @@ pub const Explorer = struct {
         defer searched.deinit();
 
         // Tier 0: word index direct lookup — O(1) hash lookup, no content scan.
+        // Issue #363a: a per-file cap forces diversity so a single hot doc
+        // file (CHANGELOG.md, architecture.md, etc.) can't saturate the quota
+        // and crowd out source-file matches that come later in the posting
+        // list. Cap = max(1, max_results / 5).
         const word_hits = self.word_index.search(query);
         if (word_hits.len > 0 and word_hits.len <= max_results * 2) {
+            const tier0_per_file_cap: usize = @max(1, max_results / 5);
+            var tier0_per_file = std.StringHashMap(usize).init(allocator);
+            defer tier0_per_file.deinit();
             for (word_hits) |hit| {
                 const hit_path = self.word_index.hitPath(hit);
                 if (hit_path.len == 0) continue;
+                const gop = tier0_per_file.getOrPut(hit_path) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                if (gop.value_ptr.* >= tier0_per_file_cap) continue;
                 const ref = self.readContentForSearch(hit_path, allocator) orelse continue;
                 defer ref.deinit();
                 const line_text = extractLineByNumber(ref.data, hit.line_num) orelse continue;
@@ -1527,6 +1537,7 @@ pub const Explorer = struct {
                     .line_num = hit.line_num,
                     .line_text = duped_text,
                 });
+                gop.value_ptr.* += 1;
                 searched.put(hit_path, {}) catch {};
                 if (result_list.items.len >= max_results) return result_list.toOwnedSlice(allocator);
             }
@@ -4946,6 +4957,15 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
     // Special entry point bonus (like fff: main.go, index.ts, lib.rs rank higher)
     const fname = getFilename(path);
     if (isSpecialEntryPoint(fname)) best_score += best_score * 0.05;
+
+    // Issue #363b: an exact basename match must rank above fuzzy matches in
+    // the same tree. Without this, a query of `cli.rs` against a workspace
+    // containing several `lib.rs` files returned the `lib.rs` files first
+    // because the special-entry-point bonus + length normalization outweighed
+    // the imperfect fuzzy alignment of `cli.rs` against `lib.rs`.
+    if (std.ascii.eqlIgnoreCase(query, fname)) {
+        best_score *= 4.0;
+    }
 
     // Normalize by path length (shorter paths rank higher)
     const len_factor = @sqrt(@as(f32, @floatFromInt(path.len)));
