@@ -8085,3 +8085,75 @@ test "issue-359/360: retrieval recall — search/word/symbol/fuzzy/glob/deps all
         try testing.expect(saw_test);
     }
 }
+
+test "issue-357: bundle preserves nested 'arguments' for codedb_outline" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+    try explorer.indexFile("src/lib.zig", "pub fn helper() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const bundle_json =
+        \\{"ops":[
+        \\  {"tool":"codedb_outline","arguments":{"path":"src/main.zig"}},
+        \\  {"tool":"codedb_outline","arguments":{"path":"src/lib.zig"}}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bundle_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // Nested-args bundle path must preserve 'path' for every op — no missing-arg errors.
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path' argument") == null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/lib.zig") != null);
+}
+
+test "issue-357: bundle surfaces received keys when an op is missing required path" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    // Bundle with a wrong key name ('file_path' instead of 'path'). The op must
+    // fail (path is missing), but the bundle wrapper must surface the keys it
+    // received so the caller can tell whether codedb dropped the arg or the
+    // client sent it under the wrong name.
+    const bundle_json =
+        \\{"ops":[{"tool":"codedb_outline","arguments":{"file_path":"src/main.zig"}}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bundle_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // The error itself must still appear (legitimate — path is missing).
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path' argument") != null);
+    // And the bundle must surface what the op actually contained, naming the
+    // bad key so the caller can self-diagnose.
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "file_path") != null);
+}
