@@ -1322,6 +1322,52 @@ test "issue-360: edit response reports hex hash matching codedb_read" {
     try testing.expectEqual(expected_hash, result.new_hash);
 }
 
+test "issue-360: edit dry_run returns diff preview and leaves file untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-dry.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "alpha\nbeta\ngamma\n";
+    var file = try tmp.dir.createFile(io, "edit-dry.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-360-dry-agent");
+
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 2, 2 },
+        .content = "BETA",
+        .dry_run = true,
+    });
+    defer if (result.preview) |p| testing.allocator.free(p);
+
+    // File on disk is untouched.
+    const after_bytes = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after_bytes);
+    try testing.expectEqualStrings(original, after_bytes);
+
+    // Store unchanged.
+    try testing.expectEqual(@as(u64, 0), store.currentSeq());
+
+    // seq=0 indicates not committed; new_hash is the would-be hash.
+    try testing.expectEqual(@as(u64, 0), result.seq);
+
+    // Preview shows both the removed and the added line.
+    try testing.expect(result.preview != null);
+    const preview = result.preview.?;
+    try testing.expect(std.mem.indexOf(u8, preview, "-beta") != null);
+    try testing.expect(std.mem.indexOf(u8, preview, "+BETA") != null);
+}
+
 test "issue-35: edits immediately update explorer and snapshot output" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
