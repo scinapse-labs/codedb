@@ -8157,3 +8157,27 @@ test "issue-357: bundle surfaces received keys when an op is missing required pa
     try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "file_path") != null);
 }
+
+test "issue-363b: fuzzyFindFiles ranks exact basename match above unrelated lib.rs" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Reproducer from #363: indexing the codegraff workspace, querying 'cli.rs'
+    // returned four `lib.rs` files before the actual `crates/forge_main/src/cli.rs`.
+    // Path layout matches the user's report.
+    try explorer.indexFile("crates/forge_ci/src/lib.rs", "pub fn ci() {}\n");
+    try explorer.indexFile("crates/forge_fs/src/lib.rs", "pub fn fs() {}\n");
+    try explorer.indexFile("crates/forge_app/src/lib.rs", "pub fn app_lib() {}\n");
+    try explorer.indexFile("crates/forge_api/src/lib.rs", "pub fn api() {}\n");
+    try explorer.indexFile(
+        "crates/forge_main/src/cli.rs",
+        "pub fn parse_args() -> Args {\n    Args {}\n}\n",
+    );
+
+    const matches = try explorer.fuzzyFindFiles("cli.rs", testing.allocator, 5);
+    defer testing.allocator.free(matches);
+
+    try testing.expect(matches.len > 0);
+    // Exact-basename match should be #1, not buried below unrelated lib.rs files.
+    try testing.expectEqualStrings("crates/forge_main/src/cli.rs", matches[0].path);
+}
