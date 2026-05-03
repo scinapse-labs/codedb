@@ -916,6 +916,7 @@ fn handleTree(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *Expl
 fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const compact = getBool(args, "compact");
@@ -949,6 +950,7 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
 fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const name = getStr(args, "name") orelse {
         out.appendSlice(alloc, "error: missing 'name' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const include_body = getBool(args, "body");
@@ -983,6 +985,7 @@ fn handleSymbol(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
 fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const query = getStr(args, "query") orelse {
         out.appendSlice(alloc, "error: missing 'query' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 10000))) else 50;
@@ -1120,6 +1123,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
 fn handleWord(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const word = getStr(args, "word") orelse {
         out.appendSlice(alloc, "error: missing 'word' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const hits = explorer.searchWord(word, alloc) catch {
@@ -1157,6 +1161,7 @@ fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *st
 fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const direction = getStr(args, "direction") orelse "imported_by";
@@ -1233,6 +1238,7 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
 fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     if (!isPathSafe(path)) {
