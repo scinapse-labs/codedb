@@ -8181,3 +8181,60 @@ test "issue-363b: fuzzyFindFiles ranks exact basename match above unrelated lib.
     // Exact-basename match should be #1, not buried below unrelated lib.rs files.
     try testing.expectEqualStrings("crates/forge_main/src/cli.rs", matches[0].path);
 }
+test "issue-363a: searchContent surfaces source-file matches even when doc files dominate the word index" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // To hit Tier 0 of searchContent (explore.zig:1511-1535) the gate
+    // `word_hits.len <= max_results * 2` must hold. We pick small numbers:
+    // 4 docs × 4 mentions = 16 hits, then 2 source-file hits = 18 total, with
+    // max_results=10 → 18 ≤ 20 ✓ → Tier 0 runs.
+    var path_buf: [64]u8 = undefined;
+    var content_buf: [1024]u8 = undefined;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        const path = try std.fmt.bufPrint(&path_buf, "docs/notes_{d}.md", .{i});
+        const content = try std.fmt.bufPrint(&content_buf,
+            "## Notes {d}\n\n" ++
+                "The searchContent function is documented here.\n" ++
+                "We discuss searchContent at length.\n" ++
+                "Note that searchContent is multi-tier.\n" ++
+                "Performance: searchContent is fast.\n",
+            .{i},
+        );
+        try explorer.indexFile(path, content);
+    }
+
+    // Index the source file LAST so its word-index hits land at the END of
+    // the posting list. Pre-fix, Tier 0 fills the result_list with doc hits
+    // and returns before reaching source-file hits.
+    try explorer.indexFile(
+        "src/explore.zig",
+        "pub fn searchContent(self: *Explorer, query: []const u8) !void {\n" ++
+            "    // searchContent is the multi-tier text search entrypoint.\n" ++
+            "    _ = self;\n" ++
+            "    _ = query;\n" ++
+            "}\n",
+    );
+
+    const results = try explorer.searchContent("searchContent", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    var found_source = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "src/explore.zig")) {
+            found_source = true;
+            break;
+        }
+    }
+    // The source file MUST appear — it's the canonical match for the
+    // identifier. Pre-fix, doc-file hits saturated the 10-result quota in
+    // Tier 0 and src/explore.zig was dropped.
+    try testing.expect(found_source);
+}
