@@ -7735,3 +7735,92 @@ test "issue-346: root_policy rejects dangerous ambient cwd roots" {
     try testing.expect(!root_policy.isIndexableRoot("/opt"));
     try testing.expect(!root_policy.isIndexableRoot("/opt/homebrew"));
 }
+
+test "issue-359: globPaths matches files by glob pattern" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/mcp.zig", "pub fn a() void {}");
+    try explorer.indexFile("src/explore.zig", "pub fn b() void {}");
+    try explorer.indexFile("src/sub/inner.zig", "pub fn c() void {}");
+    try explorer.indexFile("tests/test_main.py", "def t(): pass");
+    try explorer.indexFile("README.md", "# readme");
+
+    // ** matches across path separators
+    const zigs = try explorer.globPaths(testing.allocator, "src/**/*.zig", 100);
+    defer testing.allocator.free(zigs);
+    try testing.expectEqual(@as(usize, 3), zigs.len);
+
+    // single * does not cross path separators
+    const top_zigs = try explorer.globPaths(testing.allocator, "src/*.zig", 100);
+    defer testing.allocator.free(top_zigs);
+    try testing.expectEqual(@as(usize, 2), top_zigs.len);
+
+    // top-level extension match
+    const md = try explorer.globPaths(testing.allocator, "*.md", 100);
+    defer testing.allocator.free(md);
+    try testing.expectEqual(@as(usize, 1), md.len);
+    try testing.expectEqualStrings("README.md", md[0]);
+
+    // results are sorted
+    const all_zigs = try explorer.globPaths(testing.allocator, "**/*.zig", 100);
+    defer testing.allocator.free(all_zigs);
+    try testing.expect(all_zigs.len >= 2);
+    var i: usize = 1;
+    while (i < all_zigs.len) : (i += 1) {
+        try testing.expect(std.mem.order(u8, all_zigs[i - 1], all_zigs[i]) == .lt);
+    }
+}
+
+test "issue-359: lsDir returns immediate children with file metadata" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile("src/mcp.zig", "pub fn a() void {}");
+    try explorer.indexFile("src/explore.zig", "pub fn b() void {}");
+    try explorer.indexFile("src/sub/inner.zig", "pub fn c() void {}");
+    try explorer.indexFile("tests/test_main.py", "def t(): pass");
+    try explorer.indexFile("README.md", "# readme");
+
+    // Top-level: 1 file (README.md) + 2 dirs (src/, tests/)
+    const top = try explorer.lsDir(testing.allocator, "");
+    defer testing.allocator.free(top);
+    try testing.expectEqual(@as(usize, 3), top.len);
+
+    var saw_readme = false;
+    var saw_src_dir = false;
+    var saw_tests_dir = false;
+    for (top) |e| {
+        if (std.mem.eql(u8, e.name, "README.md")) {
+            try testing.expect(!e.is_dir);
+            saw_readme = true;
+        }
+        if (std.mem.eql(u8, e.name, "src")) {
+            try testing.expect(e.is_dir);
+            saw_src_dir = true;
+        }
+        if (std.mem.eql(u8, e.name, "tests")) {
+            try testing.expect(e.is_dir);
+            saw_tests_dir = true;
+        }
+    }
+    try testing.expect(saw_readme and saw_src_dir and saw_tests_dir);
+
+    // Inside src/: 2 files (mcp.zig, explore.zig) + 1 dir (sub/)
+    const src_children = try explorer.lsDir(testing.allocator, "src");
+    defer testing.allocator.free(src_children);
+    try testing.expectEqual(@as(usize, 3), src_children.len);
+
+    var saw_sub_dir = false;
+    var file_count: usize = 0;
+    for (src_children) |e| {
+        if (e.is_dir) {
+            if (std.mem.eql(u8, e.name, "sub")) saw_sub_dir = true;
+        } else {
+            file_count += 1;
+            try testing.expect(e.line_count >= 1);
+        }
+    }
+    try testing.expect(saw_sub_dir);
+    try testing.expectEqual(@as(usize, 2), file_count);
+}
