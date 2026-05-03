@@ -4947,6 +4947,15 @@ pub fn fuzzyScore(query: []const u8, path: []const u8) ?f32 {
     const fname = getFilename(path);
     if (isSpecialEntryPoint(fname)) best_score += best_score * 0.05;
 
+    // Issue #363b: an exact basename match must rank above fuzzy matches in
+    // the same tree. Without this, a query of `cli.rs` against a workspace
+    // containing several `lib.rs` files returned the `lib.rs` files first
+    // because the special-entry-point bonus + length normalization outweighed
+    // the imperfect fuzzy alignment of `cli.rs` against `lib.rs`.
+    if (std.ascii.eqlIgnoreCase(query, fname)) {
+        best_score *= 4.0;
+    }
+
     // Normalize by path length (shorter paths rank higher)
     const len_factor = @sqrt(@as(f32, @floatFromInt(path.len)));
     return best_score / len_factor;
