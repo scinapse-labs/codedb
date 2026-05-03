@@ -7840,3 +7840,52 @@ test "issue-359: mcp.globMatch backtracks across **/* boundary" {
     try testing.expect(mcp_mod.globMatch("src/*.zig", "src/mcp.zig"));
     try testing.expect(!mcp_mod.globMatch("docs/*.md", "src/mcp.zig"));
 }
+
+test "issue-359: globPaths recall — every matching path survives at every depth" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Plant files at varying depths under src/, plus a few outside it.
+    const planted = [_][]const u8{
+        "src/a.zig",
+        "src/b.zig",
+        "src/sub/c.zig",
+        "src/sub/d.zig",
+        "src/sub/deep/e.zig",
+        "src/sub/deep/f.zig",
+        "src/sub/deep/deeper/g.zig",
+        "tests/h.zig",
+        "src/notes.md",
+        "src/sub/notes.md",
+    };
+    for (planted) |p| try explorer.indexFile(p, "pub fn x() void {}");
+
+    // src/**/*.zig must reach every depth — this is the case the old
+    // iterative matcher silently dropped (single star slot lost the
+    // outer ** position when the inner *.zig star ran).
+    const all_src_zigs = try explorer.globPaths(testing.allocator, "src/**/*.zig", 100);
+    defer testing.allocator.free(all_src_zigs);
+    try testing.expectEqual(@as(usize, 7), all_src_zigs.len);
+
+    // Single * does not cross /: only the two top-level src zigs.
+    const top = try explorer.globPaths(testing.allocator, "src/*.zig", 100);
+    defer testing.allocator.free(top);
+    try testing.expectEqual(@as(usize, 2), top.len);
+
+    // **/*.md should find both markdown files no matter their depth.
+    const md = try explorer.globPaths(testing.allocator, "**/*.md", 100);
+    defer testing.allocator.free(md);
+    try testing.expectEqual(@as(usize, 2), md.len);
+
+    // Anchored deep match: src/**/g.zig must find the deepest one only.
+    const g = try explorer.globPaths(testing.allocator, "src/**/g.zig", 100);
+    defer testing.allocator.free(g);
+    try testing.expectEqual(@as(usize, 1), g.len);
+    try testing.expectEqualStrings("src/sub/deep/deeper/g.zig", g[0]);
+
+    // Pipeline filter must agree path-for-path with globPaths, since it
+    // now routes through the same matcher. Spot-check a few.
+    try testing.expect(mcp_mod.globMatch("src/**/*.zig", "src/sub/deep/deeper/g.zig"));
+    try testing.expect(mcp_mod.globMatch("**/*.md", "src/sub/notes.md"));
+    try testing.expect(!mcp_mod.globMatch("src/**/*.zig", "tests/h.zig"));
+}
