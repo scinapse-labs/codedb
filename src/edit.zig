@@ -239,7 +239,7 @@ fn buildPreview(
 
     // Added lines from after (replace + insert)
     if (req.op == .replace or req.op == .insert) {
-        const inserted_count: usize = removed + added_total;
+        const inserted_count: usize = added_total;
         var k: usize = a_start;
         const stop = @min(a_start + inserted_count, after_lines.items.len + 1);
         while (k < stop) : (k += 1) {
