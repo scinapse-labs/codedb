@@ -1840,6 +1840,9 @@ pub const Explorer = struct {
 
         var matches: std.ArrayList([]const u8) = .empty;
         errdefer matches.deinit(allocator);
+        // Reserve a guess so small/medium glob result sets don't trigger
+        // multiple geometric reallocations.
+        matches.ensureTotalCapacity(allocator, @min(64, self.outlines.count())) catch {};
 
         var iter = self.outlines.keyIterator();
         while (iter.next()) |key_ptr| {
@@ -1870,11 +1873,15 @@ pub const Explorer = struct {
 
         var entries: std.ArrayList(LsEntry) = .empty;
         errdefer entries.deinit(allocator);
+        // Most listings produce a small set; a single up-front allocation
+        // avoids the geometric-realloc dance for typical directories.
+        entries.ensureTotalCapacity(allocator, 32) catch {};
 
+        // Each outline key is unique, so a file `rel` is emitted at most once
+        // by construction. We only need a dedup map for directory names since
+        // multiple paths can share a parent dir.
         var seen_dirs = std.StringHashMap(void).init(allocator);
         defer seen_dirs.deinit();
-        var seen_files = std.StringHashMap(void).init(allocator);
-        defer seen_files.deinit();
 
         var iter = self.outlines.iterator();
         while (iter.next()) |kv| {
@@ -1897,17 +1904,14 @@ pub const Explorer = struct {
                     try entries.append(allocator, .{ .name = dir_name, .is_dir = true });
                 }
             } else {
-                if (!seen_files.contains(rel)) {
-                    try seen_files.put(rel, {});
-                    const fo = kv.value_ptr.*;
-                    try entries.append(allocator, .{
-                        .name = rel,
-                        .is_dir = false,
-                        .line_count = fo.line_count,
-                        .sym_count = @intCast(fo.symbols.items.len),
-                        .language = fo.language,
-                    });
-                }
+                const fo = kv.value_ptr.*;
+                try entries.append(allocator, .{
+                    .name = rel,
+                    .is_dir = false,
+                    .line_count = fo.line_count,
+                    .sym_count = @intCast(fo.symbols.items.len),
+                    .language = fo.language,
+                });
             }
         }
 

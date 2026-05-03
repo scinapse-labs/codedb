@@ -7935,3 +7935,153 @@ test "issue-359: globPaths recall — every matching path survives at every dept
     try testing.expect(mcp_mod.globMatch("**/*.md", "src/sub/notes.md"));
     try testing.expect(!mcp_mod.globMatch("src/**/*.zig", "tests/h.zig"));
 }
+
+// ── Retrieval-quality test ────────────────────────────────────────────────
+//
+// Plants a small corpus where the ground-truth set of files matching each
+// query is fully known, then exercises every retrieval surface of the
+// Explorer (full-text search, exact word lookup, symbol-by-name, fuzzy
+// file find, glob, and dependency edges) and asserts perfect recall — i.e.
+// every expected file shows up. Catches silent-drop regressions across
+// the trigram index, sparse-ngram index, word index, symbol index, and
+// dep graph in one place.
+test "issue-359/360: retrieval recall — search/word/symbol/fuzzy/glob/deps all return ground truth" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    // Flat paths so dep_graph keys (raw import strings) line up with file paths.
+    try explorer.indexFile(
+        "auth.zig",
+        \\const std = @import("std");
+        \\
+        \\pub fn authenticate(token: []const u8) bool {
+        \\    _ = token;
+        \\    return true;
+        \\}
+        \\pub fn validateToken(token: []const u8) bool {
+        \\    return authenticate(token);
+        \\}
+        ,
+    );
+    try explorer.indexFile(
+        "handler.zig",
+        \\const auth = @import("auth.zig");
+        \\
+        \\pub fn handleLogin() void {
+        \\    if (auth.authenticate("x")) return;
+        \\}
+        ,
+    );
+    try explorer.indexFile(
+        "auth_test.zig",
+        \\const auth = @import("auth.zig");
+        \\
+        \\test "auth round-trip" {
+        \\    _ = auth.authenticate("x");
+        \\}
+        ,
+    );
+    try explorer.indexFile(
+        "unrelated.zig",
+        \\pub fn formatNumber(n: i64) []const u8 {
+        \\    _ = n;
+        \\    return "0";
+        \\}
+        ,
+    );
+    try explorer.indexFile("README.md", "# project\nauthenticate description here");
+
+    // 1. Full-text search: every file containing `authenticate` must appear.
+    {
+        const expected = [_][]const u8{ "auth.zig", "handler.zig", "auth_test.zig", "README.md" };
+        const results = try explorer.searchContent("authenticate", testing.allocator, 50);
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.line_text);
+                testing.allocator.free(r.path);
+            }
+            testing.allocator.free(results);
+        }
+        var seen = std.StringHashMap(void).init(testing.allocator);
+        defer seen.deinit();
+        for (results) |r| try seen.put(r.path, {});
+        for (expected) |e| try testing.expect(seen.contains(e));
+        try testing.expect(!seen.contains("unrelated.zig"));
+    }
+
+    // 2. Word index: exact token `authenticate` must reach the same 4 files.
+    {
+        const hits = try explorer.searchWord("authenticate", testing.allocator);
+        defer testing.allocator.free(hits);
+        var seen = std.StringHashMap(void).init(testing.allocator);
+        defer seen.deinit();
+        explorer.mu.lockShared();
+        defer explorer.mu.unlockShared();
+        for (hits) |h| try seen.put(explorer.word_index.hitPath(h), {});
+        const expected = [_][]const u8{ "auth.zig", "handler.zig", "auth_test.zig", "README.md" };
+        for (expected) |e| try testing.expect(seen.contains(e));
+    }
+
+    // 3. Symbol index: `authenticate` is defined once, in auth.zig.
+    {
+        const results = try explorer.findAllSymbols("authenticate", testing.allocator);
+        defer {
+            for (results) |r| {
+                testing.allocator.free(r.path);
+                testing.allocator.free(r.symbol.name);
+                if (r.symbol.detail) |d| testing.allocator.free(d);
+            }
+            testing.allocator.free(results);
+        }
+        try testing.expect(results.len >= 1);
+        var found_def = false;
+        for (results) |r| {
+            if (std.mem.eql(u8, r.path, "auth.zig")) found_def = true;
+        }
+        try testing.expect(found_def);
+    }
+
+    // 4. Fuzzy file find: query "auth" must reach both auth.zig and auth_test.zig.
+    {
+        const results = try explorer.fuzzyFindFiles("auth", testing.allocator, 50);
+        defer testing.allocator.free(results);
+        var seen = std.StringHashMap(void).init(testing.allocator);
+        defer seen.deinit();
+        for (results) |r| try seen.put(r.path, {});
+        try testing.expect(seen.contains("auth.zig"));
+        try testing.expect(seen.contains("auth_test.zig"));
+    }
+
+    // 5. Glob: `auth*.zig` must include auth.zig and auth_test.zig only.
+    {
+        const matches = try explorer.globPaths(testing.allocator, "auth*.zig", 50);
+        defer testing.allocator.free(matches);
+        var found_auth = false;
+        var found_test = false;
+        for (matches) |m| {
+            if (std.mem.eql(u8, m, "auth.zig")) found_auth = true;
+            if (std.mem.eql(u8, m, "auth_test.zig")) found_test = true;
+            try testing.expect(!std.mem.eql(u8, m, "unrelated.zig"));
+            try testing.expect(!std.mem.eql(u8, m, "handler.zig"));
+        }
+        try testing.expect(found_auth);
+        try testing.expect(found_test);
+    }
+
+    // 6. Dependency graph: handler.zig and auth_test.zig both import auth.zig.
+    {
+        const importers = try explorer.getImportedBy("auth.zig", testing.allocator);
+        defer {
+            for (importers) |p| testing.allocator.free(p);
+            testing.allocator.free(importers);
+        }
+        var saw_handler = false;
+        var saw_test = false;
+        for (importers) |p| {
+            if (std.mem.eql(u8, p, "handler.zig")) saw_handler = true;
+            if (std.mem.eql(u8, p, "auth_test.zig")) saw_test = true;
+        }
+        try testing.expect(saw_handler);
+        try testing.expect(saw_test);
+    }
+}
