@@ -7824,3 +7824,19 @@ test "issue-359: lsDir returns immediate children with file metadata" {
     try testing.expect(saw_sub_dir);
     try testing.expectEqual(@as(usize, 2), file_count);
 }
+
+test "issue-359: mcp.globMatch backtracks across **/* boundary" {
+    // Pipeline filter (codedb_query) calls mcp.globMatch on each path. The
+    // iterative version forgot the outer ** position when it entered the
+    // inner *.zig star, so paths like src/sub/inner.zig were rejected by
+    // src/**/*.zig even though they should match.
+    try testing.expect(mcp_mod.globMatch("src/**/*.zig", "src/sub/inner.zig"));
+    try testing.expect(mcp_mod.globMatch("src/**/*.zig", "src/a/b/c.zig"));
+
+    // Single * still must not cross /.
+    try testing.expect(!mcp_mod.globMatch("src/*.zig", "src/sub/inner.zig"));
+
+    // Plain prefix matches still work.
+    try testing.expect(mcp_mod.globMatch("src/*.zig", "src/mcp.zig"));
+    try testing.expect(!mcp_mod.globMatch("docs/*.md", "src/mcp.zig"));
+}

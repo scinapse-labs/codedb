@@ -2764,7 +2764,7 @@ fn logFileAccess(io: std.Io, tool: []const u8, file_path: []const u8, latency_ns
     }) catch return;
     appendToWal(io, line);
 }
-fn globMatch(pattern: []const u8, path: []const u8) bool {
+pub fn globMatch(pattern: []const u8, path: []const u8) bool {
     var pi: usize = 0;
     var gi: usize = 0;
     var star_g: ?usize = null;
