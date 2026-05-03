@@ -2765,47 +2765,7 @@ fn logFileAccess(io: std.Io, tool: []const u8, file_path: []const u8, latency_ns
     appendToWal(io, line);
 }
 pub fn globMatch(pattern: []const u8, path: []const u8) bool {
-    var pi: usize = 0;
-    var gi: usize = 0;
-    var star_g: ?usize = null;
-    var star_p: usize = 0;
-
-    while (pi < path.len) {
-        if (gi < pattern.len and (pattern[gi] == path[pi] or (pattern[gi] == '?' and path[pi] != '/'))) {
-            gi += 1;
-            pi += 1;
-        } else if (gi < pattern.len and pattern[gi] == '*') {
-            // Check for ** (matches across path separators)
-            if (gi + 1 < pattern.len and pattern[gi + 1] == '*') {
-                // ** matches everything including /
-                star_g = gi;
-                star_p = pi;
-                gi += 2;
-                if (gi < pattern.len and pattern[gi] == '/') gi += 1; // skip trailing /
-            } else {
-                // * matches everything except /
-                star_g = gi;
-                star_p = pi;
-                gi += 1;
-            }
-        } else if (star_g != null) {
-            gi = star_g.? + 1;
-            if (gi < pattern.len and pattern[gi - 1] == '*' and pattern[gi] == '*') {
-                gi += 1;
-                if (gi < pattern.len and pattern[gi] == '/') gi += 1;
-            }
-            star_p += 1;
-            pi = star_p;
-            // Single * must not cross /
-            if (pattern[star_g.?] == '*' and (star_g.? + 1 >= pattern.len or pattern[star_g.? + 1] != '*')) {
-                if (pi > 0 and path[pi - 1] == '/') return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    while (gi < pattern.len and pattern[gi] == '*') : (gi += 1) {}
-    return gi == pattern.len;
+    return explore_mod.matchGlob(pattern, path);
 }
 
 pub fn isPathSafe(path: []const u8) bool {
