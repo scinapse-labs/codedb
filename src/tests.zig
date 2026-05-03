@@ -1255,6 +1255,40 @@ test "edit: range_start beyond file is invalid" {
     }));
 }
 
+test "issue-360: edit rejects mismatched if_hash and leaves file untouched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-if-hash.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "line 1\nline 2\nline 3\n";
+    var file = try tmp.dir.createFile(io, "edit-if-hash.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-360-agent");
+
+    // A hash value that cannot match any real file content (caller saw a stale read)
+    try testing.expectError(error.HashMismatch, edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "stale-line edit",
+        .if_hash = "deadbeef",
+    }));
+
+    // File on disk must be unchanged after the rejected edit
+    const after_bytes = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after_bytes);
+    try testing.expectEqualStrings(original, after_bytes);
+}
+
 test "issue-35: edits immediately update explorer and snapshot output" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -12,6 +12,7 @@ pub const EditRequest = struct {
     range: ?[2]usize = null,
     after: ?usize = null,
     content: ?[]const u8 = null,
+    if_hash: ?[]const u8 = null,
 };
 
 pub const EditResult = struct {
