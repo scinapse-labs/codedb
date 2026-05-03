@@ -8346,3 +8346,173 @@ test "issue-356-3: codedb_query surfaces received keys on missing-arg errors" {
     try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "q") != null);
 }
+
+test "issue-356-p2: codedb_outline missing path surfaces received keys" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"file_path":"src/main.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_outline, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path'") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "file_path") != null);
+}
+
+test "issue-356-p2: codedb_symbol missing name surfaces received keys" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"symbol":"main"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_symbol, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'name'") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "symbol") != null);
+}
+
+test "issue-356-p2: codedb_search missing query surfaces received keys" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"q":"main"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'query'") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
+}
+
+test "issue-356-p2: codedb_word missing word surfaces received keys" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"w":"main"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_word, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'word'") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
+}
+
+test "issue-356-p2: codedb_read missing path surfaces received keys" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"file":"src/main.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_read, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path'") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
+}
+
+test "issue-356-p2: codedb_deps missing path surfaces received keys" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"target":"src/main.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_deps, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path'") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
+}
