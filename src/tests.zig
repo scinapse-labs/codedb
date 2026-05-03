@@ -8238,3 +8238,111 @@ test "issue-363a: searchContent surfaces source-file matches even when doc files
     // Tier 0 and src/explore.zig was dropped.
     try testing.expect(found_source);
 }
+
+test "issue-356-1: codedb_query returns partial results when a step fails" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+    try explorer.indexFile("src/lib.zig", "pub fn helper() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    // Pipeline: step 0 (find) succeeds, step 1 (search) is missing 'query'.
+    // Pre-fix: bails on step 1, dropping step 0's output entirely.
+    // Post-fix: returns step 0's matched files + a "--- partial ---" tail
+    // naming the failing step.
+    const pipe_json =
+        \\{"pipeline":[
+        \\  {"op":"find","query":"main"},
+        \\  {"op":"search"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, pipe_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_query, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // Step 0's output (file matches) must survive even though step 1 failed.
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    // The partial-results tail must name the failing step so callers can
+    // recover instead of guessing what went wrong.
+    try testing.expect(std.mem.indexOf(u8, out.items, "--- partial ---") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "failed_at: 1") != null);
+}
+
+test "issue-356-2: codedb_outline suggests fuzzy alternatives for non-indexed paths" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+    try explorer.indexFile("src/mcp.zig", "pub fn mcp() void {}\n");
+    try explorer.indexFile("src/explore.zig", "pub fn explore() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    // Outline a path that doesn't index — typo on 'main.zig'.
+    const args_json =
+        \\{"path":"src/man.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_outline, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // Pre-fix: bare 'error: file not indexed' with no recovery hint.
+    // Post-fix: append fuzzy suggestions so the agent can self-correct.
+    try testing.expect(std.mem.indexOf(u8, out.items, "did you mean") != null);
+    // src/main.zig is the closest fuzzy match for src/man.zig.
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+}
+
+test "issue-356-3: codedb_query surfaces received keys on missing-arg errors" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    // Single-step pipeline: search step missing 'query' but provided 'q'
+    // (common typo). The error should name the keys actually received so
+    // the caller can self-diagnose, mirroring the #357 bundle diagnostic.
+    const pipe_json =
+        \\{"pipeline":[{"op":"search","q":"main"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, pipe_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_query, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // The legitimate missing-arg error must still appear.
+    try testing.expect(std.mem.indexOf(u8, out.items, "search needs 'query'") != null);
+    // And the diagnostic must surface what the step actually contained.
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "q") != null);
+}
