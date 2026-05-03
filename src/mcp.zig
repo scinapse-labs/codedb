@@ -1444,6 +1444,27 @@ fn handleSnapshot(alloc: std.mem.Allocator, out: *std.ArrayList(u8), explorer: *
     cache.putAndAppend(alloc, out, seq, snap);
 }
 
+
+/// When a bundled op produces a missing-arg error, append a `received keys`
+/// line listing the keys actually present in the op's args. Helps callers
+/// tell whether codedb dropped a field or the client sent it under the
+/// wrong name. See issue #357.
+fn appendBundleArgKeysDiagnostic(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    args: *const std.json.ObjectMap,
+) void {
+    out.appendSlice(alloc, "\nreceived keys: [") catch return;
+    var it = args.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (!first) out.appendSlice(alloc, ", ") catch return;
+        first = false;
+        out.appendSlice(alloc, entry.key_ptr.*) catch return;
+    }
+    out.appendSlice(alloc, "]") catch return;
+}
+
 fn handleBundle(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -1537,6 +1558,12 @@ fn handleBundle(
 
         w.print("--- [{d}] {s} ---\n", .{ i, tool_name }) catch {};
         out.appendSlice(alloc, sub_out.items) catch {};
+        // Issue #357: when a bundled op fails with a missing-arg error, surface
+        // the keys it actually received so callers can tell whether codedb
+        // dropped the arg or the client sent it under the wrong name.
+        if (std.mem.startsWith(u8, sub_out.items, "error: missing")) {
+            appendBundleArgKeysDiagnostic(alloc, out, sub_args);
+        }
         w.writeAll("\n") catch {};
 
         // Per-op activity refresh — see top of this fn.
