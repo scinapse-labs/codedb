@@ -36,6 +36,13 @@ pub fn applyEdit(
     const source = try std.Io.Dir.cwd().readFileAlloc(io, req.path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(source);
 
+    if (req.if_hash) |expected_hex| {
+        const actual = std.hash.Wyhash.hash(0, source);
+        var hash_buf: [16]u8 = undefined;
+        const actual_hex = std.fmt.bufPrint(&hash_buf, "{x}", .{actual}) catch return error.HashMismatch;
+        if (!std.mem.eql(u8, expected_hex, actual_hex)) return error.HashMismatch;
+    }
+
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(allocator);
     var iter = std.mem.splitScalar(u8, source, '\n');
