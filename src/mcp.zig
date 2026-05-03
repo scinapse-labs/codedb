@@ -1348,11 +1348,20 @@ fn handleEdit(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     const result = edit_mod.applyEdit(io, alloc, store, agents, explorer, req) catch |err| {
         out.appendSlice(alloc, "error: edit failed: ") catch {};
         out.appendSlice(alloc, @errorName(err)) catch {};
+        if (err == error.HashMismatch) {
+            // Include the file's current hex hash so the agent can re-read with if_hash
+            // to verify it has the latest content, then retry the edit.
+            if (std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024))) |bytes| {
+                defer alloc.free(bytes);
+                const w = cio.listWriter(out, alloc);
+                w.print(" (current hash: {x})", .{std.hash.Wyhash.hash(0, bytes)}) catch {};
+            } else |_| {}
+        }
         return;
     };
 
     const w = cio.listWriter(out, alloc);
-    w.print("edit applied: seq={d}, size={d}, hash={d}", .{ result.seq, result.new_size, result.new_hash }) catch {};
+    w.print("edit applied: seq={d}, size={d}, hash:{x}", .{ result.seq, result.new_size, result.new_hash }) catch {};
 }
 
 fn handleChanges(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store) void {

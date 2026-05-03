@@ -1289,6 +1289,39 @@ test "issue-360: edit rejects mismatched if_hash and leaves file untouched" {
     try testing.expectEqualStrings(original, after_bytes);
 }
 
+test "issue-360: edit response reports hex hash matching codedb_read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-hex.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "alpha\nbeta\ngamma\n";
+    var file = try tmp.dir.createFile(io, "edit-hex.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-360-hex-agent");
+
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 2, 2 },
+        .content = "BETA",
+    });
+
+    // Hash returned matches Wyhash of the new content, hex-formatted same as codedb_read
+    const new_bytes = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(new_bytes);
+    const expected_hash = std.hash.Wyhash.hash(0, new_bytes);
+    try testing.expectEqual(expected_hash, result.new_hash);
+}
+
 test "issue-35: edits immediately update explorer and snapshot output" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
