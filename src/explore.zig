@@ -1509,11 +1509,21 @@ pub const Explorer = struct {
         defer searched.deinit();
 
         // Tier 0: word index direct lookup — O(1) hash lookup, no content scan.
+        // Issue #363a: a per-file cap forces diversity so a single hot doc
+        // file (CHANGELOG.md, architecture.md, etc.) can't saturate the quota
+        // and crowd out source-file matches that come later in the posting
+        // list. Cap = max(1, max_results / 5).
         const word_hits = self.word_index.search(query);
         if (word_hits.len > 0 and word_hits.len <= max_results * 2) {
+            const tier0_per_file_cap: usize = @max(1, max_results / 5);
+            var tier0_per_file = std.StringHashMap(usize).init(allocator);
+            defer tier0_per_file.deinit();
             for (word_hits) |hit| {
                 const hit_path = self.word_index.hitPath(hit);
                 if (hit_path.len == 0) continue;
+                const gop = tier0_per_file.getOrPut(hit_path) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                if (gop.value_ptr.* >= tier0_per_file_cap) continue;
                 const ref = self.readContentForSearch(hit_path, allocator) orelse continue;
                 defer ref.deinit();
                 const line_text = extractLineByNumber(ref.data, hit.line_num) orelse continue;
@@ -1527,6 +1537,7 @@ pub const Explorer = struct {
                     .line_num = hit.line_num,
                     .line_text = duped_text,
                 });
+                gop.value_ptr.* += 1;
                 searched.put(hit_path, {}) catch {};
                 if (result_list.items.len >= max_results) return result_list.toOwnedSlice(allocator);
             }
