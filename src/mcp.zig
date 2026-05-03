@@ -929,6 +929,11 @@ fn handleOutline(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
         // Issue #356-2: fuzzy path fallback — surface top matches so the
         // caller can self-correct without a separate codedb_find round-trip.
         appendFuzzyPathSuggestions(alloc, out, explorer, path);
+        // Issue #356-p3: stale-index recovery hint. The most common cause of
+        // 'not indexed' once you've ruled out a typo is a freshly-added file
+        // the watcher hasn't seen yet — pointing at codedb_index makes the
+        // recovery action explicit.
+        out.appendSlice(alloc, "\nhint: try codedb_index if the file was added recently\n") catch {};
         return;
     };
     defer outline.deinit();
@@ -1261,6 +1266,10 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         break :blk std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(10 * 1024 * 1024)) catch {
             out.appendSlice(alloc, "error: failed to read file: ") catch {};
             out.appendSlice(alloc, path) catch {};
+            // Issue #356-p3: fuzzy fallback so a mistyped path is recoverable
+            // without a separate codedb_find round-trip — same shape as
+            // codedb_outline already does.
+            appendFuzzyPathSuggestions(alloc, out, explorer, path);
             return;
         };
     };
@@ -2379,6 +2388,12 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
     var have_set = false;
     const w = cio.listWriter(out, alloc);
 
+    // Issue #356-p3: per-stage summary so long pipelines are debuggable
+    // without re-parsing the unstructured per-step output above the tail.
+    const StageInfo = struct { op: []const u8, files_out: usize };
+    var stages: std.ArrayList(StageInfo) = .empty;
+    defer stages.deinit(alloc);
+
     for (pipeline, 0..) |step_val, step_i| {
         if (step_val != .object) {
             w.print("error: step {d} must be object\n", .{step_i}) catch {};
@@ -2780,11 +2795,23 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
             w.print("error: unknown op '{s}'\n", .{op}) catch {};
             return;
         }
+        // Issue #356-p3: track each successfully-completed step.
+        stages.append(alloc, .{ .op = op, .files_out = file_set.items.len }) catch {};
     }
 
     if (out.items.len == 0 and have_set) {
         w.print("{d} files:\n", .{file_set.items.len}) catch {};
         for (file_set.items) |path| w.print("  {s}\n", .{path}) catch {};
+    }
+
+    // Issue #356-p3: per-stage summary tail. Lists each completed step's op
+    // and outgoing file count so callers can audit a multi-step pipeline at
+    // a glance without re-parsing the unstructured output above.
+    if (stages.items.len > 0) {
+        w.print("\n--- stages ---\n", .{}) catch {};
+        for (stages.items, 0..) |s, i| {
+            w.print("{d}: {s} ({d} files)\n", .{ i, s.op, s.files_out }) catch {};
+        }
     }
 }
 

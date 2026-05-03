@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.5795 - 2026-05-04
+
+`0.2.5795` closes out [#356](https://github.com/justrach/codedb/issues/356) with phase 3 — three small ergonomics polishes that complete the rewritten reliability scope.
+
+### Reliability ([#356](https://github.com/justrach/codedb/issues/356) phase 3)
+
+- **`codedb_outline`: stale-index recovery hint.** When a path isn't indexed, the response already gets fuzzy suggestions (phase 1). It now also includes `hint: try codedb_index if the file was added recently` so agents know how to recover from a freshly-added file the watcher hasn't seen yet — no more relying on tribal knowledge of the operator command.
+- **`codedb_read`: fuzzy path fallback on read failure.** `codedb_outline` already surfaces `did you mean:` suggestions when its path doesn't index; `codedb_read` now does the same when its disk read fails. A mistyped path is recoverable in one shot without a separate `codedb_find` round-trip.
+- **`codedb_query`: per-stage summary tail.** Successful pipelines now emit a structured `--- stages ---` block listing each step's op and outgoing file count. Long pipelines become legible at a glance without parsing the unstructured per-step output above it.
+
+With this release, [#356](https://github.com/justrach/codedb/issues/356) is closed:
+- ✅ Phase 1 — pipeline partial results, outline fuzzy fallback, query received-keys diagnostic (0.2.5793)
+- ✅ Phase 2 — received-keys diagnostic across all single-tool handlers (0.2.5794)
+- ✅ Phase 3 — stale-index hint, read fuzzy fallback, query per-stage summary (0.2.5795)
+
 ## 0.2.5794 - 2026-05-04
 
 `0.2.5794` extends [#356](https://github.com/justrach/codedb/issues/356) phase 2 — the `received keys: [...]` diagnostic now lands on every single-tool handler with a required argument. Tiny release; entirely an ergonomics polish on top of `0.2.5793`.
