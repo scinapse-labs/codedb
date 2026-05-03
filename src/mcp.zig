@@ -464,6 +464,8 @@ pub const Tool = enum {
     codedb_index,
     codedb_find,
     codedb_query,
+    codedb_glob,
+    codedb_ls,
 };
 
 const tools_list =
@@ -485,7 +487,9 @@ const tools_list =
     \\{"name":"codedb_projects","description":"List all locally indexed projects on this machine. Shows project paths, data directory hashes, and whether a snapshot exists. Use to discover what codebases are available.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the folder to index (e.g. /Users/you/myproject)"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy file search — finds files by approximate name. Typo-tolerant subsequence matching with word-boundary and filename bonuses. Use when you know roughly what file you're looking for but not the exact path. Much faster than codedb_tree + manual scan.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy search query (e.g. 'authmidlware', 'test_auth', 'main.zig')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
-    \\{"name":"codedb_query","description":"Composable search pipeline — chain multiple operations where each step feeds the next. Replaces multi-tool workflows with a single call. Pipeline ops: find (fuzzy file search), search (content grep), filter (by extension/path glob), deps (expand via dependency graph), outline (get symbols), read (file contents), sort (by score/path), limit (truncate). Each step operates on the file set from the previous step.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}}
+    \\{"name":"codedb_query","description":"Composable search pipeline — chain multiple operations where each step feeds the next. Replaces multi-tool workflows with a single call. Pipeline ops: find (fuzzy file search), search (content grep), filter (by extension/path glob), deps (expand via dependency graph), outline (get symbols), read (file contents), sort (by score/path), limit (truncate). Each step operates on the file set from the previous step.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}},
+    \\{"name":"codedb_glob","description":"Match indexed file paths against a glob pattern. Supports * (does not cross /), ** (matches across /), and ? (single char, not /). Sorted lexicographically. Use this when you know the path shape (e.g. 'src/**/*.zig', 'tests/test_*.py') instead of guessing with codedb_find.","inputSchema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. 'src/**/*.zig', '*.md', 'tests/test_*.py')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 200)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["pattern"]}},
+    \\{"name":"codedb_ls","description":"List immediate children of a directory in the indexed tree. Returns directories first (alphabetically) then files with language and line/symbol counts. Use this to drill down a level at a time when codedb_tree is too verbose.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Directory prefix relative to project root. Omit or pass empty string for root."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}}
     \\]}
 ;
 
@@ -893,6 +897,8 @@ fn dispatch(
         .codedb_index => handleIndex(io, alloc, args, out, cache, default_store, default_explorer, deferred_scan),
         .codedb_find => handleFind(io, alloc, args, out, ctx.explorer),
         .codedb_query => handleQuery(alloc, args, out, ctx.explorer, ctx.store),
+        .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
+        .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
     }
 }
 
@@ -2117,6 +2123,69 @@ fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
         var score_buf: [32]u8 = undefined;
         const score_str = std.fmt.bufPrint(&score_buf, " (score: {d:.2})\n", .{m.score}) catch continue;
         out.appendSlice(alloc, score_str) catch {};
+    }
+}
+
+fn handleGlob(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const pattern = getStr(args, "pattern") orelse {
+        out.appendSlice(alloc, "error: missing 'pattern'") catch {};
+        return;
+    };
+    if (pattern.len == 0) {
+        out.appendSlice(alloc, "error: empty pattern") catch {};
+        return;
+    }
+
+    const max_results: usize = if (args.get("max_results")) |v| switch (v) {
+        .integer => |i| @intCast(@max(1, @min(i, 5000))),
+        else => 200,
+    } else 200;
+
+    const matches = explorer.globPaths(alloc, pattern, max_results) catch {
+        out.appendSlice(alloc, "error: glob failed") catch {};
+        return;
+    };
+    defer alloc.free(matches);
+
+    if (matches.len == 0) {
+        out.appendSlice(alloc, "no matches") catch {};
+        return;
+    }
+
+    for (matches) |path| {
+        out.appendSlice(alloc, path) catch {};
+        out.appendSlice(alloc, "\n") catch {};
+    }
+}
+
+fn handleLs(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
+    const prefix = getStr(args, "path") orelse "";
+
+    const entries = explorer.lsDir(alloc, prefix) catch {
+        out.appendSlice(alloc, "error: ls failed") catch {};
+        return;
+    };
+    defer alloc.free(entries);
+
+    if (entries.len == 0) {
+        out.appendSlice(alloc, "no entries") catch {};
+        return;
+    }
+
+    for (entries) |e| {
+        if (e.is_dir) {
+            out.appendSlice(alloc, e.name) catch {};
+            out.appendSlice(alloc, "/\n") catch {};
+        } else {
+            out.appendSlice(alloc, e.name) catch {};
+            var buf: [64]u8 = undefined;
+            const meta = std.fmt.bufPrint(&buf, "  ({s}, {d}L, {d} sym)\n", .{
+                @tagName(e.language),
+                e.line_count,
+                e.sym_count,
+            }) catch "\n";
+            out.appendSlice(alloc, meta) catch {};
+        }
     }
 }
 
