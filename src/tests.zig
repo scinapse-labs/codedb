@@ -8516,3 +8516,123 @@ test "issue-356-p2: codedb_deps missing path surfaces received keys" {
     try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path'") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "received keys") != null);
 }
+
+test "issue-356-p3: codedb_query emits per-stage summary tail on success" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+    try explorer.indexFile("src/lib.zig", "pub fn helper() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    // Two-step pipeline that succeeds. Phase 3 emits a summary tail so
+    // callers can see which step did what without re-parsing the
+    // unstructured per-step output above it.
+    const pipe_json =
+        \\{"pipeline":[
+        \\  {"op":"find","query":"main"},
+        \\  {"op":"sort","by":"path"}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, pipe_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_query, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // Stage summary appears at the end of a successful pipeline.
+    try testing.expect(std.mem.indexOf(u8, out.items, "--- stages ---") != null);
+    // Lists each step with op and outgoing file count.
+    try testing.expect(std.mem.indexOf(u8, out.items, "0: find") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "1: sort") != null);
+}
+
+test "issue-356-p3: codedb_outline includes actionable hint when parser fails" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    // Outline a path that's NOT indexed (no setRoot, so disk read won't
+    // help either). The "file not indexed" error already gets fuzzy
+    // suggestions from phase 1. This test pins that the hint format is
+    // actionable — specifically that a 'try codedb_index' suggestion
+    // appears so users know how to recover from a stale index.
+    const args_json =
+        \\{"path":"src/notindexed.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_outline, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "file not indexed") != null);
+    // Phase 3 adds a 'codedb_index' hint so callers know how to recover
+    // from a stale index in addition to the 'did you mean' suggestions.
+    try testing.expect(std.mem.indexOf(u8, out.items, "codedb_index") != null);
+}
+
+test "issue-356-p3: codedb_read appends fuzzy suggestions when path is unreadable" {
+    const tmp_io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tmp_io, "src");
+    try tmp.dir.writeFile(tmp_io, .{
+        .sub_path = "src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+
+    var project_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const project_path_len = try tmp.dir.realPathFile(tmp_io, ".", &project_path_buf);
+    const project_path = project_path_buf[0..project_path_len];
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    explorer.setRoot(tmp_io, project_path);
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+    try explorer.indexFile("src/lib.zig", "pub fn helper() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, project_path);
+    defer bench_ctx.deinit();
+
+    // Read a non-indexed, non-existent path. Pre-fix: bare 'failed to read file'.
+    // Post-fix: append fuzzy suggestions like outline already does.
+    const args_json =
+        \\{"path":"src/man.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_read, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "failed to read file") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "did you mean") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+}
