@@ -48,11 +48,13 @@ pub const Store = struct {
         if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| {
             std.Io.Dir.cwd().createDirPath(io, path[0..sep]) catch {};
         }
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+        // Truncate on open: in-memory index is empty at process start and nothing
+        // replays this file, so any pre-existing bytes are unreachable orphans
+        // (see #367 — raw edit content would otherwise leak across sessions).
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
         self.data_log = file;
         self.io = io;
-        const sz = try file.length(io);
-        self.data_log_pos = sz;
+        self.data_log_pos = 0;
     }
 
     pub fn recordSnapshot(self: *Store, path: []const u8, size: u64, hash: u64) !u64 {
