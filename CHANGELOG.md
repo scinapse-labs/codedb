@@ -2,13 +2,17 @@
 
 ## 0.2.5795 - 2026-05-04
 
-`0.2.5795` closes out [#356](https://github.com/justrach/codedb/issues/356) with phase 3 — three small ergonomics polishes that complete the rewritten reliability scope.
+`0.2.5795` closes out [#356](https://github.com/justrach/codedb/issues/356) with phase 3 — three small ergonomics polishes that complete the rewritten reliability scope — plus a privacy/disk-leak fix for [#367](https://github.com/justrach/codedb/issues/367).
 
 ### Reliability ([#356](https://github.com/justrach/codedb/issues/356) phase 3)
 
 - **`codedb_outline`: stale-index recovery hint.** When a path isn't indexed, the response already gets fuzzy suggestions (phase 1). It now also includes `hint: try codedb_index if the file was added recently` so agents know how to recover from a freshly-added file the watcher hasn't seen yet — no more relying on tribal knowledge of the operator command.
 - **`codedb_read`: fuzzy path fallback on read failure.** `codedb_outline` already surfaces `did you mean:` suggestions when its path doesn't index; `codedb_read` now does the same when its disk read fails. A mistyped path is recoverable in one shot without a separate `codedb_find` round-trip.
 - **`codedb_query`: per-stage summary tail.** Successful pipelines now emit a structured `--- stages ---` block listing each step's op and outgoing file count. Long pipelines become legible at a glance without parsing the unstructured per-step output above it.
+
+### Storage ([#367](https://github.com/justrach/codedb/issues/367))
+
+- **`data.log`: truncate on open.** Previously, `Store.openDataLog` opened the file with `truncate=false` and seeded the write cursor to the existing length, while `Store.init` returned an empty in-memory index and nothing replayed the log on load. Net effect: every prior session's raw `codedb_edit` content (potentially including secrets/PII pasted into a `content` arg) accumulated forever as unreachable orphan bytes in a file that looks like a log but isn't read by anyone. The log is now truncated on every process start, since the in-memory index is always empty at that point and the on-disk bytes are unreachable.
 
 With this release, [#356](https://github.com/justrach/codedb/issues/356) is closed:
 - ✅ Phase 1 — pipeline partial results, outline fuzzy fallback, query received-keys diagnostic (0.2.5793)
