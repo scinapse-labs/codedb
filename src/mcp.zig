@@ -485,7 +485,7 @@ const tools_list =
     \\{"name":"codedb_bundle","description":"Batch multiple queries in one call. Max 20 ops. WARNING: Avoid bundling multiple codedb_read calls on large files — use codedb_outline + codedb_symbol instead. Bundle outline+symbol+search, not full file reads. Total response is not size-capped, so large bundles can exceed token limits.","inputSchema":{"type":"object","properties":{"ops":{"type":"array","items":{"type":"object","properties":{"tool":{"type":"string","description":"Tool name (e.g. codedb_outline, codedb_symbol, codedb_read)"},"arguments":{"type":"object","description":"Tool arguments"}},"required":["tool"]},"description":"Array of tool calls to execute"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["ops"]}},
     \\{"name":"codedb_remote","description":"Query indexed public repos through api.wiki.codes, the only remote backend. Use action=actions first when unsure what a slug supports. Use tree with expand=false for a compact directory summary, or expand=true with limit/offset/prefix for paged file lists. Use read with path and optional lines='10-60' for file slices. Search, symbol, outline, deps, score, cves, commits, branches, and dep-history expose code and artifact metadata without cloning.","inputSchema":{"type":"object","properties":{"repo":{"type":"string","description":"GitHub repo in owner/repo format (e.g. vercel/next.js) or a raw wiki slug such as chromium."},"action":{"type":"string","enum":["tree","outline","search","read","actions","symbol","policy","deps","score","cves","commits","branches","dep-history"],"description":"What to query from api.wiki.codes: actions, tree, search, outline, read, symbol, policy, deps, score, cves, commits, branches, dep-history."},"query":{"type":"string","description":"Action-specific argument. search: text query. symbol: identifier name. outline: file path."},"path":{"type":"string","description":"For action=read: the file path to fetch."},"lines":{"type":"string","description":"For action=read: line range like '10-60' (1-indexed, inclusive). Omit for full file."},"limit":{"type":"integer","description":"For search/tree/deps/commits/branches/dep-history: cap the number of items returned (server may enforce its own ceiling)."},"offset":{"type":"integer","description":"For tree/deps/commits/branches/dep-history: skip the first N items (pagination)."},"prefix":{"type":"string","description":"For tree: only return paths starting with this prefix (e.g. 'src/')."},"expand":{"type":"boolean","description":"For tree: when true, return the full file list. When false returns a compact directory summary when supported."},"since":{"type":"string","description":"For commits/dep-history: ISO timestamp or commit SHA to start from."},"scope":{"type":"string","enum":["runtime","all"],"description":"For score/cves only. Defaults to runtime; use all to include dev/tooling dependencies."},"backend":{"type":"string","enum":["wiki"],"description":"Deprecated compatibility field. Only 'wiki' is accepted; requests always use api.wiki.codes."}},"required":["repo","action"]}},
     \\{"name":"codedb_projects","description":"List all locally indexed projects on this machine. Shows project paths, data directory hashes, and whether a snapshot exists. Use to discover what codebases are available.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the folder to index (e.g. /Users/you/myproject)"}},"required":["path"]}},
+    \\{"name":"codedb_index","description":"Index a local folder on this machine. Scans all source files, builds outlines/trigrams/word indexes, and creates a codedb.snapshot in the target directory. Path must be a directory, not a file. After indexing, the folder is queryable via the project param on any tool.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the FOLDER (not a file) to index, e.g. /Users/you/myproject"}},"required":["path"]}},
     \\{"name":"codedb_find","description":"Fuzzy file search — finds files by approximate name. Typo-tolerant subsequence matching with word-boundary and filename bonuses. Use when you know roughly what file you're looking for but not the exact path. Much faster than codedb_tree + manual scan.","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Fuzzy search query (e.g. 'authmidlware', 'test_auth', 'main.zig')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_query","description":"Composable search pipeline — chain multiple operations where each step feeds the next. Replaces multi-tool workflows with a single call. Pipeline ops: find (fuzzy file search), search (content grep), filter (by extension/path glob), deps (expand via dependency graph), outline (get symbols), read (file contents), sort (by score/path), limit (truncate). Each step operates on the file set from the previous step.","inputSchema":{"type":"object","properties":{"pipeline":{"type":"array","items":{"type":"object"},"description":"Array of pipeline steps. Each step has 'op' (find/search/filter/deps/outline/read/sort/limit) and op-specific params. Steps execute in order, each filtering/transforming the file set from the previous step. deps op: {\"op\":\"deps\",\"direction\":\"imported_by|depends_on\",\"transitive\":true,\"max_depth\":3}"},"project":{"type":"string","description":"Optional absolute path to a different project"}},"required":["pipeline"]}},
     \\{"name":"codedb_glob","description":"Match indexed file paths against a glob pattern. Supports * (does not cross /), ** (matches across /), and ? (single char, not /). Sorted lexicographically. Use this when you know the path shape (e.g. 'src/**/*.zig', 'tests/test_*.py') instead of guessing with codedb_find.","inputSchema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. 'src/**/*.zig', '*.md', 'tests/test_*.py')"},"max_results":{"type":"integer","description":"Maximum results to return (default: 200)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["pattern"]}},
@@ -900,6 +900,30 @@ fn dispatch(
         .codedb_glob => handleGlob(alloc, args, out, ctx.explorer),
         .codedb_ls => handleLs(alloc, args, out, ctx.explorer),
     }
+    appendScanProgressHint(alloc, out, tool);
+}
+
+/// Bug 2: when the initial scan is still running, search/outline/word
+/// responses come back as "0 results" or "file not indexed" — agents read
+/// these as authoritative. Append a one-line note so the caller knows the
+/// result might be incomplete and that retrying is reasonable.
+fn appendScanProgressHint(alloc: std.mem.Allocator, out: *std.ArrayList(u8), tool: Tool) void {
+    const state = getScanState();
+    if (state == .ready) return;
+    // Only inject for tools whose output depends on the scanned index.
+    switch (tool) {
+        .codedb_search, .codedb_word, .codedb_outline, .codedb_symbol, .codedb_find, .codedb_glob, .codedb_tree, .codedb_ls, .codedb_deps => {},
+        else => return,
+    }
+    const looks_empty =
+        std.mem.indexOf(u8, out.items, "0 results for ") != null or
+        std.mem.indexOf(u8, out.items, "0 hits for ") != null or
+        std.mem.indexOf(u8, out.items, "no results for: ") != null;
+    const looks_unindexed = std.mem.indexOf(u8, out.items, "file not indexed") != null;
+    if (!(looks_empty or looks_unindexed)) return;
+    out.appendSlice(alloc, "\nnote: scan still in progress (state=") catch return;
+    out.appendSlice(alloc, state.name()) catch return;
+    out.appendSlice(alloc, "); results may be incomplete — retry shortly") catch return;
 }
 
 // ── Tool handlers ───────────────────────────────────────────────────────────
@@ -993,6 +1017,20 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
+    // Bug 7: validate args explicitly. Pre-fix: empty query / non-positive
+    // max_results all returned "0 results" and the agent thought the search
+    // ran with nothing matching, when really the call was malformed.
+    if (query.len == 0) {
+        out.appendSlice(alloc, "error: empty query — pass a non-empty 'query' string") catch {};
+        return;
+    }
+    if (getInt(args, "max_results")) |n| {
+        if (n <= 0) {
+            const w_err = cio.listWriter(out, alloc);
+            w_err.print("error: max_results ({d}) must be >= 1", .{n}) catch {};
+            return;
+        }
+    }
     const max_results: usize = if (getInt(args, "max_results")) |n| @intCast(@max(1, @min(n, 10000))) else 50;
     const scope = getBool(args, "scope");
     const compact = getBool(args, "compact");
@@ -1299,6 +1337,17 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     };
     defer alloc.free(content);
 
+    // Bug 5: detect binary content (NUL byte in first 8KB) and stub the
+    // response — dumping raw bytes corrupts JSON consumers and leaks tokens
+    // for files that are never useful to a model.
+    const probe_len = @min(content.len, 8 * 1024);
+    if (std.mem.indexOfScalar(u8, content[0..probe_len], 0) != null) {
+        const w0 = cio.listWriter(out, alloc);
+        const hash_b = std.hash.Wyhash.hash(0, content);
+        w0.print("binary file: {d} bytes  hash:{x}\n", .{ content.len, hash_b }) catch {};
+        return;
+    }
+
     // Content-hash ETag
     const hash = std.hash.Wyhash.hash(0, content);
     var hash_buf: [16]u8 = undefined;
@@ -1317,6 +1366,29 @@ fn handleRead(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
     const line_end_raw = getInt(args, "line_end");
     const compact = getBool(args, "compact");
     const has_range = line_start_raw != null or line_end_raw != null;
+
+    // Bug 6: validate line range explicitly. Pre-fix: invalid ranges silently
+    // returned an empty body (just the hash line) — agents read that as "file
+    // is empty in that range" instead of "you passed nonsense".
+    if (line_start_raw) |ls| {
+        if (ls < 1) {
+            out.appendSlice(alloc, "error: line_start must be >= 1") catch {};
+            return;
+        }
+    }
+    if (line_end_raw) |le| {
+        if (le < 1) {
+            out.appendSlice(alloc, "error: line_end must be >= 1") catch {};
+            return;
+        }
+    }
+    if (line_start_raw != null and line_end_raw != null) {
+        if (line_start_raw.? > line_end_raw.?) {
+            const w_err = cio.listWriter(out, alloc);
+            w_err.print("error: line_start ({d}) > line_end ({d})", .{ line_start_raw.?, line_end_raw.? }) catch {};
+            return;
+        }
+    }
 
     // Always prepend hash
     const w = cio.listWriter(out, alloc);
@@ -1582,29 +1654,39 @@ fn handleBundle(
     // include slow sub-ops, many ops, and remote fetches, so each completed
     // sub-op updates the same timestamp. See #278.
     last_activity.store(cio.milliTimestamp(), .release);
+    // Bug 11: track per-op outcome so the top-level envelope can flip
+    // isError=true when no op succeeded — agents reading the previous
+    // success-with-per-op-errors shape took it as "the call ran fine".
+    var ok_count: usize = 0;
+    var fail_count: usize = 0;
     for (ops, 0..) |op, i| {
         if (op != .object) {
             w.print("--- [{d}] error ---\nop must be an object\n", .{i}) catch {};
+            fail_count += 1;
             continue;
         }
         const op_obj = &op.object;
         const tool_name = getStr(op_obj, "tool") orelse {
             w.print("--- [{d}] error ---\nmissing 'tool' field\n", .{i}) catch {};
+            fail_count += 1;
             continue;
         };
 
         const tool = std.meta.stringToEnum(Tool, tool_name) orelse {
             w.print("--- [{d}] {s} ---\nerror: unknown tool\n", .{ i, tool_name }) catch {};
+            fail_count += 1;
             continue;
         };
 
         // Reject recursive bundle and write operations
         if (tool == .codedb_bundle) {
             w.print("--- [{d}] {s} ---\nerror: recursive bundle not allowed\n", .{ i, tool_name }) catch {};
+            fail_count += 1;
             continue;
         }
         if (tool == .codedb_edit) {
             w.print("--- [{d}] {s} ---\nerror: write operations not allowed in bundle\n", .{ i, tool_name }) catch {};
+            fail_count += 1;
             continue;
         }
 
@@ -1616,6 +1698,7 @@ fn handleBundle(
         if (op_obj.get("arguments")) |arguments_val| {
             if (arguments_val != .object) {
                 w.print("--- [{d}] {s} ---\nerror: arguments must be object\n", .{ i, tool_name }) catch {};
+                fail_count += 1;
                 continue;
             }
             sub_args_val = arguments_val;
@@ -1634,6 +1717,7 @@ fn handleBundle(
         // Check size BEFORE appending to prevent blowout
         if (out.items.len + sub_out.items.len > 200 * 1024) {
             w.print("--- [{d}] {s} ---\nTRUNCATED: adding this result would exceed 200KB. Use codedb_outline + targeted reads instead of full file reads.\n", .{ i, tool_name }) catch {};
+            fail_count += 1;
             break;
         }
 
@@ -1645,10 +1729,23 @@ fn handleBundle(
         if (std.mem.startsWith(u8, sub_out.items, "error: missing")) {
             appendBundleArgKeysDiagnostic(alloc, out, sub_args);
         }
+        if (std.mem.startsWith(u8, sub_out.items, "error:")) {
+            fail_count += 1;
+        } else {
+            ok_count += 1;
+        }
         w.writeAll("\n") catch {};
 
         // Per-op activity refresh — see top of this fn.
         last_activity.store(cio.milliTimestamp(), .release);
+    }
+    // Bug 11: if every op errored, surface that at the envelope level so the
+    // outer isError flag flips. Pre-fix the response was "isError:false" with
+    // per-op errors buried in the body — agents read it as success.
+    if (ok_count == 0 and fail_count > 0) {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "error: all {d} bundle op(s) failed\n", .{fail_count}) catch "error: all bundle ops failed\n";
+        out.insertSlice(alloc, 0, prefix) catch {};
     }
 }
 

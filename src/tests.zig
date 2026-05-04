@@ -8731,3 +8731,191 @@ test "issue-recall: codedb_search supports path_glob filter" {
     try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "CHANGELOG.md") == null);
 }
+
+test "issue-bug2: tool calls during scan-in-progress hint at scan state" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const prev_state = mcp_mod.getScanState();
+    defer mcp_mod.setScanState(prev_state);
+    mcp_mod.setScanState(.walking);
+
+    const args_json =
+        \\{"query":"some_unknown_symbol_that_will_not_match"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "0 results") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "scan still in progress") != null);
+}
+
+test "issue-bug5: codedb_read returns binary stub instead of dumping bytes" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp_dir.dir.realPathFile(io, ".", &dir_buf);
+    const dir_path = dir_buf[0..dir_path_len];
+
+    const bin_rel = "blob.bin";
+    const bin_full = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir_path, bin_rel });
+    defer testing.allocator.free(bin_full);
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, bin_full, .{ .truncate = true });
+        defer f.close(io);
+        const payload = [_]u8{ 'a', 'b', 0, 'c', 'd', 0, 'e' };
+        try f.writePositionalAll(io, &payload, 0);
+    }
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    explorer.setRoot(io, dir_path);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, dir_path);
+    defer bench_ctx.deinit();
+
+    const args_json = try std.fmt.allocPrint(testing.allocator,
+        "{{\"path\":\"{s}\"}}", .{bin_rel});
+    defer testing.allocator.free(args_json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_read, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "binary file") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, &[_]u8{0}) == null);
+}
+
+test "issue-bug6: codedb_read errors when line_start > line_end" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp_dir.dir.realPathFile(io, ".", &dir_buf);
+    const dir_path = dir_buf[0..dir_path_len];
+
+    const rel = "small.txt";
+    const full = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ dir_path, rel });
+    defer testing.allocator.free(full);
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, full, .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, "alpha\nbeta\ngamma\n", 0);
+    }
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    explorer.setRoot(io, dir_path);
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, dir_path);
+    defer bench_ctx.deinit();
+
+    const args_json = try std.fmt.allocPrint(testing.allocator,
+        "{{\"path\":\"{s}\",\"line_start\":100,\"line_end\":10}}", .{rel});
+    defer testing.allocator.free(args_json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_read, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
+    try testing.expect(std.mem.indexOf(u8, out.items, "line_start") != null);
+}
+
+test "issue-bug7: codedb_search rejects empty query" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":""}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
+    try testing.expect(std.mem.indexOf(u8, out.items, "empty") != null);
+}
+
+test "issue-bug7: codedb_search rejects negative max_results" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"foo","max_results":-3}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
+    try testing.expect(std.mem.indexOf(u8, out.items, "max_results") != null);
+}
+
+test "issue-bug11: codedb_bundle marks isError when all ops fail" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"ops":[{"tool":"codedb_outline"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.startsWith(u8, out.items, "error:"));
+}
