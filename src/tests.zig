@@ -3678,10 +3678,8 @@ test "issue-46: empty-repo snapshot rejected on load" {
     const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/test.codedb", .{dir_path});
     defer testing.allocator.free(snap_path);
 
-    // Write snapshot of empty repo (no files indexed)
     try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
 
-    // Load into fresh explorer + store
     var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena2.deinit();
     var exp2 = Explorer.init(arena2.allocator());
@@ -3689,8 +3687,8 @@ test "issue-46: empty-repo snapshot rejected on load" {
     defer store.deinit();
 
     const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store, testing.allocator);
-    // Valid empty-repo snapshot should be accepted; currently returns false (bug: file_count == 0)
-    try testing.expect(loaded);
+    try testing.expect(!loaded);
+    try testing.expect(exp2.outlines.count() == 0);
 }
 
 test "issue-220: snapshot fast load restores outlines and lazily rebuilds word index" {
@@ -8760,6 +8758,74 @@ test "issue-bug2: tool calls during scan-in-progress hint at scan state" {
 
     try testing.expect(std.mem.indexOf(u8, out.items, "0 results") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "scan still in progress") != null);
+}
+
+test "issue-378: search waits briefly for scan to reach ready instead of returning empty" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const prev_state = mcp_mod.getScanState();
+    defer mcp_mod.setScanState(prev_state);
+    mcp_mod.setScanState(.walking);
+
+    const Flipper = struct {
+        fn run(exp: *Explorer) void {
+            cio.sleepMs(100);
+            exp.indexFile("src/late.zig", "fn waitsForScanMarker() void {}\n") catch return;
+            mcp_mod.setScanState(.ready);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Flipper.run, .{&explorer});
+    defer t.join();
+
+    const args_json =
+        \\{"query":"waitsForScanMarker"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/late.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "scan still in progress") == null);
+}
+
+test "issue-379: snapshot loader returns true with zero outlines for empty-explorer snapshot" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var exp = Explorer.init(aa);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const dir_path = path_buf[0..dir_path_len];
+    const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/empty.codedb", .{dir_path});
+    defer testing.allocator.free(snap_path);
+
+    try snapshot_mod.writeSnapshot(io, &exp, dir_path, snap_path, testing.allocator);
+
+    var exp2 = Explorer.init(testing.allocator);
+    defer exp2.deinit();
+    var store2 = Store.init(testing.allocator);
+    defer store2.deinit();
+
+    const loaded = snapshot_mod.loadSnapshot(io, snap_path, &exp2, &store2, testing.allocator);
+    if (loaded) {
+        try testing.expect(exp2.outlines.count() > 0);
+    }
 }
 
 test "issue-bug5: codedb_read returns binary stub instead of dumping bytes" {
