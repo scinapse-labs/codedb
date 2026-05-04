@@ -14,6 +14,10 @@
 
 - **`data.log`: truncate on open.** Previously, `Store.openDataLog` opened the file with `truncate=false` and seeded the write cursor to the existing length, while `Store.init` returned an empty in-memory index and nothing replayed the log on load. Net effect: every prior session's raw `codedb_edit` content (potentially including secrets/PII pasted into a `content` arg) accumulated forever as unreachable orphan bytes in a file that looks like a log but isn't read by anyone. The log is now truncated on every process start, since the in-memory index is always empty at that point and the on-disk bytes are unreachable.
 
+### DX
+
+- **TTY summary surfaces received-keys diagnostic.** The `received keys: [...]` hint from #356 phase 1+2 only landed in `content[1]` of the MCP envelope, but many clients only render `content[0]` (the colored single-line summary). Missing-arg errors now append a compact `(received: [...])` tail to the summary too, so the diagnostic is visible regardless of how many blocks the client renders.
+
 With this release, [#356](https://github.com/justrach/codedb/issues/356) is closed:
 - ✅ Phase 1 — pipeline partial results, outline fuzzy fallback, query received-keys diagnostic (0.2.5793)
 - ✅ Phase 2 — received-keys diagnostic across all single-tool handlers (0.2.5794)
