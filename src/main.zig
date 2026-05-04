@@ -108,6 +108,20 @@ fn mainImpl() !void {
         std.process.exit(1);
     }
 
+    // CODEDB_ROOT env var lets clients (Claude Code MCP, shell scripts) pin
+    // the root without needing to pass a positional arg. Treated as explicit
+    // so the MCP scan kicks off at startup instead of waiting for a roots
+    // handshake — without this, every fresh `codedb mcp` call against a
+    // client that doesn't send roots/list_changed sees an empty index.
+    if (std.mem.eql(u8, cmd, "mcp") and std.mem.eql(u8, root, ".")) {
+        if (cio.posixGetenv("CODEDB_ROOT")) |env_root| {
+            if (env_root.len > 0) {
+                root = env_root;
+                root_is_explicit = true;
+            }
+        }
+    }
+
     // MCP stdio reserves stdout for JSON-RPC — route status/error output to
     // stderr so startup/failure paths don't corrupt the protocol stream.
     // See #304.

@@ -7650,7 +7650,7 @@ test "issue-292: codedb_search guidance hints regex=true on metachar query" {
     defer parsed.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, false, &buf);
+    mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, "", false, &buf);
     try testing.expect(std.mem.indexOf(u8, buf.items, "regex=true") != null);
 }
 
@@ -7660,7 +7660,7 @@ test "issue-292: codedb_search guidance does not warn when regex=true is set" {
     defer parsed.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, false, &buf);
+    mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, "", false, &buf);
     try testing.expect(std.mem.indexOf(u8, buf.items, "regex=true") == null);
 }
 
@@ -7670,7 +7670,7 @@ test "issue-290: codedb_search guidance does not warn on plain hyphen" {
     defer parsed.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, false, &buf);
+    mcp_mod.mcpGenerateGuidance(testing.allocator, "codedb_search", &parsed.value.object, "", false, &buf);
     try testing.expect(std.mem.indexOf(u8, buf.items, "regex=true") == null);
 }
 

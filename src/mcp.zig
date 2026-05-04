@@ -415,7 +415,7 @@ pub const BenchContext = struct {
 
         var guidance: std.ArrayList(u8) = .empty;
         defer guidance.deinit(alloc);
-        mcpGenerateGuidance(alloc, name, args, is_error, &guidance);
+        mcpGenerateGuidance(alloc, name, args, out.items, is_error, &guidance);
 
         var result: std.ArrayList(u8) = .empty;
         defer result.deinit(alloc);
@@ -823,7 +823,7 @@ fn handleCall(
     // Block 3: Guidance hints
     var guidance: std.ArrayList(u8) = .empty;
     defer guidance.deinit(alloc);
-    mcpGenerateGuidance(alloc, name, args, is_error, &guidance);
+    mcpGenerateGuidance(alloc, name, args, out.items, is_error, &guidance);
 
     // Assemble 3-block MCP content envelope
     var result: std.ArrayList(u8) = .empty;
@@ -1249,6 +1249,13 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     }
     if (results.len == 0) {
         w.writeAll("  (none)\n") catch {};
+        // Bug 4: if the path isn't indexed at all, agents read "(none)" as
+        // "file exists but no callers" — which is wrong. Append fuzzy
+        // suggestions so a typo is recoverable in one shot.
+        explorer.mu.lockShared();
+        const known = explorer.outlines.contains(path);
+        explorer.mu.unlockShared();
+        if (!known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
     } else {
         for (results) |dep| {
             w.print("  {s}\n", .{dep}) catch {};
@@ -1551,6 +1558,7 @@ fn handleBundle(
 ) void {
     const ops_val = args.get("ops") orelse {
         out.appendSlice(alloc, "error: missing 'ops' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const ops = switch (ops_val) {
@@ -2062,6 +2070,7 @@ fn handleIndex(
 ) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path'") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
 
@@ -2176,6 +2185,7 @@ fn handleIndex(
 fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const query = getStr(args, "query") orelse {
         out.appendSlice(alloc, "error: missing 'query'") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     if (query.len == 0) {
@@ -2236,6 +2246,7 @@ fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
 fn handleGlob(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const pattern = getStr(args, "pattern") orelse {
         out.appendSlice(alloc, "error: missing 'pattern'") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     if (pattern.len == 0) {
@@ -2386,6 +2397,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
     _ = store;
     const pipeline_val = args.get("pipeline") orelse {
         out.appendSlice(alloc, "error: missing 'pipeline' array") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const pipeline = switch (pipeline_val) {
@@ -3212,6 +3224,7 @@ pub fn mcpGenerateGuidance(
     alloc: std.mem.Allocator,
     tool_name: []const u8,
     args: *const std.json.ObjectMap,
+    output: []const u8,
     is_error: bool,
     buf: *std.ArrayList(u8),
 ) void {
@@ -3228,7 +3241,14 @@ pub fn mcpGenerateGuidance(
     } else if (eql(tool_name, "codedb_outline")) {
         buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> to read a function body" ++ MCP_RESET) catch {};
     } else if (eql(tool_name, "codedb_symbol")) {
-        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_edit to modify this symbol" ++ MCP_RESET) catch {};
+        // Bug 8: don't tell the agent to "edit this symbol" when the lookup
+        // returned 0 results — there's nothing to edit. Hint at codedb_search
+        // instead so they can broaden the lookup.
+        if (std.mem.startsWith(u8, output, "no results for:")) {
+            buf.appendSlice(alloc, MCP_DIM ++ "hint: try codedb_search query=<name> to find references — symbol not defined" ++ MCP_RESET) catch {};
+        } else {
+            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_edit to modify this symbol" ++ MCP_RESET) catch {};
+        }
     } else if (eql(tool_name, "codedb_search")) {
         const has_regex_meta = blk: {
             if (getBool(args, "regex")) break :blk false;
