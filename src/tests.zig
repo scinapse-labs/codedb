@@ -8677,3 +8677,28 @@ test "issue-367: openDataLog truncates orphan bytes from prior session" {
     try testing.expectEqual(diff.len, read_len);
     try testing.expectEqualStrings(diff, buf[0..diff.len]);
 }
+
+test "issue-367-dx: tty summary surfaces received keys on missing-arg error" {
+    const args_json =
+        \\{"file_path":"src/main.zig","weird_key":"x"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    const raw_output = "error: missing 'path' argument\nreceived keys: [file_path, weird_key]";
+
+    var summary: std.ArrayList(u8) = .empty;
+    defer summary.deinit(testing.allocator);
+
+    mcp_mod.mcpGenerateSummary(
+        testing.allocator,
+        "codedb_outline",
+        &parsed.value.object,
+        raw_output,
+        true,
+        &summary,
+    );
+
+    try testing.expect(std.mem.indexOf(u8, summary.items, "received") != null);
+    try testing.expect(std.mem.indexOf(u8, summary.items, "file_path") != null);
+}

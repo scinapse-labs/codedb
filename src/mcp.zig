@@ -3065,7 +3065,7 @@ fn mcpAppendPath(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), path: []cons
     buf.appendSlice(alloc, MCP_RESET) catch {};
 }
 
-fn mcpGenerateSummary(
+pub fn mcpGenerateSummary(
     alloc: std.mem.Allocator,
     tool_name: []const u8,
     args: *const std.json.ObjectMap,
@@ -3085,6 +3085,16 @@ fn mcpGenerateSummary(
         buf.appendSlice(alloc, MCP_DASH ++ MCP_RED) catch {};
         buf.appendSlice(alloc, msg[0..end]) catch {};
         buf.appendSlice(alloc, MCP_RESET) catch {};
+        // Issue #367-dx: surface the received-keys diagnostic inline so clients
+        // that only render content[0] (the TTY summary block) still see it.
+        if (std.mem.indexOf(u8, output, "received keys: [")) |s| {
+            const kstart = s + "received keys: [".len;
+            if (std.mem.indexOfScalarPos(u8, output, kstart, ']')) |kend| {
+                buf.appendSlice(alloc, "  " ++ MCP_DIM ++ "(received: [") catch {};
+                buf.appendSlice(alloc, output[kstart..kend]) catch {};
+                buf.appendSlice(alloc, "])" ++ MCP_RESET) catch {};
+            }
+        }
         return;
     }
 
