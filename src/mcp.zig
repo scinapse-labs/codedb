@@ -415,7 +415,7 @@ pub const BenchContext = struct {
 
         var guidance: std.ArrayList(u8) = .empty;
         defer guidance.deinit(alloc);
-        mcpGenerateGuidance(alloc, name, args, is_error, &guidance);
+        mcpGenerateGuidance(alloc, name, args, out.items, is_error, &guidance);
 
         var result: std.ArrayList(u8) = .empty;
         defer result.deinit(alloc);
@@ -473,7 +473,7 @@ const tools_list =
     \\{"name":"codedb_tree","description":"Get the full file tree of the indexed codebase with language detection, line counts, and symbol counts per file. Use this first to understand the project structure.","inputSchema":{"type":"object","properties":{"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_outline","description":"START HERE. Get the structural outline of a file: all functions, structs, enums, imports, constants with line numbers. Returns 4-15x fewer tokens than reading the raw file. Always use this before codedb_read to understand file structure first.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to project root"},"compact":{"type":"boolean","description":"Condensed format without detail comments (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
     \\{"name":"codedb_symbol","description":"Find where a symbol is defined across the codebase. Returns file, line, and kind (function/struct/import). Use body=true to include source code. Much more precise than search — finds definitions, not just text matches.","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name to search for (exact match)"},"body":{"type":"boolean","description":"Include source body for each symbol (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["name"]}},
-    \\{"name":"codedb_search","description":"Full-text search across all indexed files. Returns matching lines with file paths and line numbers. Start with max_results=10 for broad queries. Use scope=true to see the enclosing function/struct for each match. For single identifiers, prefer codedb_word (O(1) lookup) or codedb_symbol (definitions only).","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50, start with 10 for broad queries)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
+    \\{"name":"codedb_search","description":"Full-text search across all indexed files. Returns matching lines with file paths and line numbers. Start with max_results=10 for broad queries. Use scope=true to see the enclosing function/struct for each match. Use path_glob='*.zig' to scope to one language and avoid markdown-dominated results. For single identifiers, prefer codedb_word (O(1) lookup) or codedb_symbol (definitions only).","inputSchema":{"type":"object","properties":{"query":{"type":"string","description":"Text to search for (substring match, or regex if regex=true)"},"max_results":{"type":"integer","description":"Maximum results to return (default: 50, start with 10 for broad queries)"},"scope":{"type":"boolean","description":"Annotate results with enclosing symbol scope (default: false)"},"compact":{"type":"boolean","description":"Skip comment and blank lines in results (default: false)"},"regex":{"type":"boolean","description":"Treat query as regex pattern (default: false)"},"path_glob":{"type":"string","description":"Filter results to paths matching this glob, e.g. '*.zig' or 'src/**/*.zig'. Bare patterns like '*.zig' are auto-promoted to '**/*.zig' to match nested files."},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["query"]}},
     \\{"name":"codedb_word","description":"O(1) word lookup using inverted index. Finds all occurrences of an exact word (identifier) across the codebase. Much faster than search for single-word queries.","inputSchema":{"type":"object","properties":{"word":{"type":"string","description":"Exact word/identifier to look up"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["word"]}},
     \\{"name":"codedb_hot","description":"Get the most recently modified files in the codebase, ordered by recency. Useful to see what's been actively worked on.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","description":"Number of files to return (default: 10)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":[]}},
     \\{"name":"codedb_deps","description":"Dependency graph queries. Default: which files import the given file (reverse deps). Use direction=depends_on for forward deps. Use transitive=true for full blast radius via BFS traversal. O(1) lookups via bidirectional graph index.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"File path to check dependencies for"},"direction":{"type":"string","enum":["imported_by","depends_on"],"description":"imported_by (default): who imports this file. depends_on: what this file imports."},"transitive":{"type":"boolean","description":"Follow dependency chain transitively (default: false)"},"max_depth":{"type":"integer","description":"Max traversal depth for transitive queries (default: unlimited)"},"project":{"type":"string","description":"Optional absolute path to a different project (must have codedb.snapshot)"}},"required":["path"]}},
@@ -823,7 +823,7 @@ fn handleCall(
     // Block 3: Guidance hints
     var guidance: std.ArrayList(u8) = .empty;
     defer guidance.deinit(alloc);
-    mcpGenerateGuidance(alloc, name, args, is_error, &guidance);
+    mcpGenerateGuidance(alloc, name, args, out.items, is_error, &guidance);
 
     // Assemble 3-block MCP content envelope
     var result: std.ArrayList(u8) = .empty;
@@ -997,6 +997,19 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
     const scope = getBool(args, "scope");
     const compact = getBool(args, "compact");
     const is_regex = getBool(args, "regex");
+    const path_glob_raw = getStr(args, "path_glob");
+    // Auto-promote basename-only patterns ('*.zig') to '**/*.zig' so they match
+    // nested files. Without this the matcher rejects 'src/main.zig' because
+    // '*' doesn't cross '/' (see explore.zig:matchGlob). Issue surfaced by the
+    // recall eval — agents reach for '*.zig' first.
+    var pg_buf: [256]u8 = undefined;
+    const path_glob: ?[]const u8 = if (path_glob_raw) |g| blk: {
+        if (std.mem.indexOfScalar(u8, g, '/') == null and g.len + 3 < pg_buf.len) {
+            const promoted = std.fmt.bufPrint(&pg_buf, "**/{s}", .{g}) catch break :blk g;
+            break :blk promoted;
+        }
+        break :blk g;
+    } else null;
 
     if (scope and is_regex) {
         const results = explorer.searchContentRegexWithScope(query, alloc, max_results) catch {
@@ -1015,6 +1028,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ results.len, query }) catch {};
         for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
             if (r.scope_name) |sn| {
                 w.print("  {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
@@ -1041,6 +1055,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         const w = cio.listWriter(out, alloc);
         w.print("{d} results for '{s}':\n", .{ results.len, query }) catch {};
         for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
             if (r.scope_name) |sn| {
                 w.print("  {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
@@ -1070,6 +1085,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         const max_per_file: u8 = 5;
         var shown: usize = 0;
         for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
             const gop = file_counts.getOrPut(r.path) catch continue;
             if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -1106,6 +1122,7 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
         const max_per_file: u8 = 5;
         var shown: usize = 0;
         for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
             const gop = file_counts.getOrPut(r.path) catch continue;
             if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -1232,6 +1249,13 @@ fn handleDeps(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *s
     }
     if (results.len == 0) {
         w.writeAll("  (none)\n") catch {};
+        // Bug 4: if the path isn't indexed at all, agents read "(none)" as
+        // "file exists but no callers" — which is wrong. Append fuzzy
+        // suggestions so a typo is recoverable in one shot.
+        explorer.mu.lockShared();
+        const known = explorer.outlines.contains(path);
+        explorer.mu.unlockShared();
+        if (!known) appendFuzzyPathSuggestions(alloc, out, explorer, path);
     } else {
         for (results) |dep| {
             w.print("  {s}\n", .{dep}) catch {};
@@ -1534,6 +1558,7 @@ fn handleBundle(
 ) void {
     const ops_val = args.get("ops") orelse {
         out.appendSlice(alloc, "error: missing 'ops' argument") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const ops = switch (ops_val) {
@@ -2045,6 +2070,7 @@ fn handleIndex(
 ) void {
     const path = getStr(args, "path") orelse {
         out.appendSlice(alloc, "error: missing 'path'") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
 
@@ -2159,6 +2185,7 @@ fn handleIndex(
 fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const query = getStr(args, "query") orelse {
         out.appendSlice(alloc, "error: missing 'query'") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     if (query.len == 0) {
@@ -2219,6 +2246,7 @@ fn handleFind(io: std.Io, alloc: std.mem.Allocator, args: *const std.json.Object
 fn handleGlob(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), explorer: *Explorer) void {
     const pattern = getStr(args, "pattern") orelse {
         out.appendSlice(alloc, "error: missing 'pattern'") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     if (pattern.len == 0) {
@@ -2369,6 +2397,7 @@ fn handleQuery(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *
     _ = store;
     const pipeline_val = args.get("pipeline") orelse {
         out.appendSlice(alloc, "error: missing 'pipeline' array") catch {};
+        appendBundleArgKeysDiagnostic(alloc, out, args);
         return;
     };
     const pipeline = switch (pipeline_val) {
@@ -3195,6 +3224,7 @@ pub fn mcpGenerateGuidance(
     alloc: std.mem.Allocator,
     tool_name: []const u8,
     args: *const std.json.ObjectMap,
+    output: []const u8,
     is_error: bool,
     buf: *std.ArrayList(u8),
 ) void {
@@ -3211,7 +3241,14 @@ pub fn mcpGenerateGuidance(
     } else if (eql(tool_name, "codedb_outline")) {
         buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_symbol name=<fn> to read a function body" ++ MCP_RESET) catch {};
     } else if (eql(tool_name, "codedb_symbol")) {
-        buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_edit to modify this symbol" ++ MCP_RESET) catch {};
+        // Bug 8: don't tell the agent to "edit this symbol" when the lookup
+        // returned 0 results — there's nothing to edit. Hint at codedb_search
+        // instead so they can broaden the lookup.
+        if (std.mem.startsWith(u8, output, "no results for:")) {
+            buf.appendSlice(alloc, MCP_DIM ++ "hint: try codedb_search query=<name> to find references — symbol not defined" ++ MCP_RESET) catch {};
+        } else {
+            buf.appendSlice(alloc, MCP_DIM ++ MCP_ARROW ++ "next: codedb_edit to modify this symbol" ++ MCP_RESET) catch {};
+        }
     } else if (eql(tool_name, "codedb_search")) {
         const has_regex_meta = blk: {
             if (getBool(args, "regex")) break :blk false;
