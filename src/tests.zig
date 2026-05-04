@@ -8636,3 +8636,44 @@ test "issue-356-p3: codedb_read appends fuzzy suggestions when path is unreadabl
     try testing.expect(std.mem.indexOf(u8, out.items, "did you mean") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
 }
+
+test "issue-367: openDataLog truncates orphan bytes from prior session" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path_len = try tmp_dir.dir.realPathFile(io, ".", &dir_buf);
+    const dir_path = dir_buf[0..dir_path_len];
+
+    const log_path = try std.fmt.allocPrint(testing.allocator, "{s}/data.log", .{dir_path});
+    defer testing.allocator.free(log_path);
+
+    const orphan = "ORPHAN_SECRET_TOKEN_FROM_PRIOR_SESSION";
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, log_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, orphan, 0);
+    }
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    try store.openDataLog(io, log_path);
+
+    const f = try std.Io.Dir.cwd().openFile(io, log_path, .{});
+    defer f.close(io);
+    const len = try f.length(io);
+    try testing.expectEqual(@as(u64, 0), len);
+    try testing.expectEqual(@as(u64, 0), store.data_log_pos);
+
+    const diff = "fresh diff";
+    _ = try store.recordEdit("foo.zig", 1, .replace, 0xABCD, diff.len, diff);
+
+    var buf: [128]u8 = undefined;
+    const f2 = try std.Io.Dir.cwd().openFile(io, log_path, .{});
+    defer f2.close(io);
+    const new_len = try f2.length(io);
+    try testing.expectEqual(@as(u64, diff.len), new_len);
+    const read_len = try f2.readPositionalAll(io, buf[0..diff.len], 0);
+    try testing.expectEqual(diff.len, read_len);
+    try testing.expectEqualStrings(diff, buf[0..diff.len]);
+}
