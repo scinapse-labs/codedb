@@ -8702,3 +8702,32 @@ test "issue-367-dx: tty summary surfaces received keys on missing-arg error" {
     try testing.expect(std.mem.indexOf(u8, summary.items, "received") != null);
     try testing.expect(std.mem.indexOf(u8, summary.items, "file_path") != null);
 }
+
+test "issue-recall: codedb_search supports path_glob filter" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "received keys foo\n");
+    try explorer.indexFile("CHANGELOG.md", "received keys diagnostic\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"received keys","path_glob":"*.zig"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "CHANGELOG.md") == null);
+}
