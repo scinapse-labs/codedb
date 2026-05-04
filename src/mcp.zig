@@ -3065,7 +3065,7 @@ fn mcpAppendPath(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), path: []cons
     buf.appendSlice(alloc, MCP_RESET) catch {};
 }
 
-fn mcpGenerateSummary(
+pub fn mcpGenerateSummary(
     alloc: std.mem.Allocator,
     tool_name: []const u8,
     args: *const std.json.ObjectMap,
