@@ -8833,6 +8833,67 @@ test "issue-recall: codedb_search supports path_glob filter" {
     try testing.expect(std.mem.indexOf(u8, out.items, "CHANGELOG.md") == null);
 }
 
+test "issue-422: search header count must reflect post-filter visible results" {
+    // From the issue: a query whose ONLY match would be displayed instead
+    // shows `1 results` then `(0 shown, 1 truncated)` — every match hidden
+    // behind a misleading header. Root cause: the header reports the
+    // unfiltered `results.len` from the explorer, but path_glob/compact
+    // filters can drop items before they reach the renderer, so a "result"
+    // that was filtered is mis-labeled as "truncated".
+    //
+    // Repro shape mirrors the reporter's call: scope=true, compact=true,
+    // path_glob limited to a subtree. The match ITSELF is in-glob and not a
+    // comment — the bug is purely in the bookkeeping.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    // Two files: one in the path_glob subtree (the real match), one outside
+    // it (a decoy that the explorer would also return for the substring).
+    // Without the fix the header counts both, then the renderer drops the
+    // out-of-glob one and (because of unrelated bookkeeping) reports the
+    // in-glob one as "truncated" too.
+    try explorer.indexFile(
+        "crates/forge_api/src/forge_api.rs",
+        "// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\n// header\npub struct ForgeAPI<S, F> {\n",
+    );
+    // Decoy match outside the glob — explorer will return it, the renderer
+    // must NOT count it toward "truncated".
+    try explorer.indexFile("docs/forge_api.md", "struct ForgeAPI is documented here\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const args_json =
+        \\{"query":"struct ForgeAPI","max_results":20,"scope":true,"compact":true,"regex":false,"path_glob":"crates/**/*.rs"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_search, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // The actionable hit must be visible (path + line number).
+    try testing.expect(std.mem.indexOf(u8, out.items, "crates/forge_api/src/forge_api.rs") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, ":24:") != null);
+    // Out-of-glob decoy must be excluded from the rendered output.
+    try testing.expect(std.mem.indexOf(u8, out.items, "docs/forge_api.md") == null);
+    // The misleading "(N shown, M truncated)" footer must NOT fire when M
+    // is just the count of glob-filtered or compact-filtered items. Those
+    // weren't truncated — they were filtered out, and saying "truncated"
+    // implies the user could recover them by raising max_results.
+    try testing.expect(std.mem.indexOf(u8, out.items, " truncated)") == null);
+    // Header count must reflect post-filter visible matches (1), not the
+    // raw explorer count (2). Otherwise users see a misleading "2 results"
+    // when only 1 matched their glob.
+    try testing.expect(std.mem.indexOf(u8, out.items, "1 results for 'struct ForgeAPI'") != null);
+}
+
 test "issue-bug2: tool calls during scan-in-progress hint at scan state" {
     var explorer = Explorer.init(testing.allocator);
     defer explorer.deinit();

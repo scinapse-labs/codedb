@@ -1112,8 +1112,17 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             alloc.free(results);
         }
 
+        // Issue #422: count post-filter results so the header reflects what
+        // the user actually sees, not the pre-filter explorer count.
+        var visible_total: usize = 0;
+        for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+            if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+            visible_total += 1;
+        }
+
         const w = cio.listWriter(out, alloc);
-        w.print("{d} results for '{s}':\n", .{ results.len, query }) catch {};
+        w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
         for (results) |r| {
             if (path_glob) |g| if (!globMatch(g, r.path)) continue;
             if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
@@ -1139,8 +1148,18 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             alloc.free(results);
         }
 
+        // Issue #422: count post-filter results so the header reflects what
+        // the user actually sees, and so the "truncated" footer only fires
+        // for per-file-cap truncation — not for glob/compact filtering.
+        var visible_total: usize = 0;
+        for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+            if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+            visible_total += 1;
+        }
+
         const w = cio.listWriter(out, alloc);
-        w.print("{d} results for '{s}':\n", .{ results.len, query }) catch {};
+        w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
         var file_counts = std.StringHashMap(u8).init(alloc);
         defer file_counts.deinit();
         const max_per_file: u8 = 5;
@@ -1166,8 +1185,8 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             }
             shown += 1;
         }
-        if (shown < results.len) {
-            w.print("({d} shown, {d} truncated)\n", .{ shown, results.len - shown }) catch {};
+        if (shown < visible_total) {
+            w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else if (is_regex) {
         const results = explorer.searchContentRegex(query, alloc, max_results) catch {
@@ -1182,8 +1201,17 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             alloc.free(results);
         }
 
+        // Issue #422: header reflects post-filter count; "truncated" footer
+        // only fires for per-file-cap, not for glob/compact filtering.
+        var visible_total: usize = 0;
+        for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+            if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+            visible_total += 1;
+        }
+
         const w = cio.listWriter(out, alloc);
-        w.print("{d} results for '{s}':\n", .{ results.len, query }) catch {};
+        w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
         var file_counts = std.StringHashMap(u8).init(alloc);
         defer file_counts.deinit();
         const max_per_file: u8 = 5;
@@ -1203,8 +1231,8 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
             shown += 1;
         }
-        if (shown < results.len) {
-            w.print("({d} shown, {d} truncated)\n", .{ shown, results.len - shown }) catch {};
+        if (shown < visible_total) {
+            w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     } else {
         const results = explorer.searchContent(query, alloc, max_results) catch {
@@ -1219,8 +1247,17 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             alloc.free(results);
         }
 
+        // Issue #422: header reflects post-filter count; "truncated" footer
+        // only fires for per-file-cap, not for glob/compact filtering.
+        var visible_total: usize = 0;
+        for (results) |r| {
+            if (path_glob) |g| if (!globMatch(g, r.path)) continue;
+            if (compact and explore_mod.isCommentOrBlank(r.line_text, explore_mod.detectLanguage(r.path))) continue;
+            visible_total += 1;
+        }
+
         const w = cio.listWriter(out, alloc);
-        w.print("{d} results for '{s}':\n", .{ results.len, query }) catch {};
+        w.print("{d} results for '{s}':\n", .{ visible_total, query }) catch {};
         var file_counts = std.StringHashMap(u8).init(alloc);
         defer file_counts.deinit();
         const max_per_file: u8 = 5;
@@ -1240,8 +1277,8 @@ fn handleSearch(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: 
             w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
             shown += 1;
         }
-        if (shown < results.len) {
-            w.print("({d} shown, {d} truncated)\n", .{ shown, results.len - shown }) catch {};
+        if (shown < visible_total) {
+            w.print("({d} shown, {d} truncated by per-file cap)\n", .{ shown, visible_total - shown }) catch {};
         }
     }
 }
