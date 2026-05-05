@@ -8222,6 +8222,43 @@ test "issue-357: bundle surfaces received keys when an op is missing required pa
     try testing.expect(std.mem.indexOf(u8, out.items, "file_path") != null);
 }
 
+test "issue-422: bundle emits 'received keys' exactly once per failing op" {
+    // Regression: handler (handleSearch etc) appends the diagnostic, AND the
+    // bundle dispatch loop also appends it — caller saw the line twice in a
+    // row. Must appear exactly once per failing op.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const bundle_json =
+        \\{"ops":[{"tool":"codedb_search","arguments":{}}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bundle_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, out.items, idx, "received keys:")) |pos| {
+        count += 1;
+        idx = pos + 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
 test "issue-363b: fuzzyFindFiles ranks exact basename match above unrelated lib.rs" {
     var explorer = Explorer.init(testing.allocator);
     defer explorer.deinit();
