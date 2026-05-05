@@ -38,6 +38,11 @@ const mcp_mod = @import("mcp.zig");
 const main_mod = @import("main.zig");
 const nuke_mod = @import("nuke.zig");
 const update_mod = @import("update.zig");
+const Config = @import("config.zig").Config;
+// Pull in config.zig's own unit tests (parse/load) under the main runner.
+comptime {
+    _ = @import("config.zig");
+}
 const snapshot_mod = @import("snapshot.zig");
 const telemetry_mod = @import("telemetry.zig");
 const release_info = @import("release_info.zig");
@@ -10270,4 +10275,70 @@ test "bm25-persistence: writeToDisk/readFromDisk preserves total_tokens and doc_
     try testing.expectEqual(pre_low_len, wi2.docLength(low_id_orig));
     try testing.expectEqual(pre_high_len, wi2.docLength(high_id_orig));
     try testing.expectEqual(pre_total, wi2.total_tokens);
+}
+
+test "issue-101: Store.max_versions is configurable (caps per-file history)" {
+    // Default cap is 100. After setting max_versions = 3, writing 5 versions
+    // of the same file must leave exactly 3 in-memory.
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+
+    store.max_versions = 3;
+
+    _ = try store.recordSnapshot("foo.zig", 10, 0x111);
+    _ = try store.recordSnapshot("foo.zig", 20, 0x222);
+    _ = try store.recordSnapshot("foo.zig", 30, 0x333);
+    _ = try store.recordSnapshot("foo.zig", 40, 0x444);
+    _ = try store.recordSnapshot("foo.zig", 50, 0x555);
+
+    const entry = store.files.get("foo.zig") orelse return error.MissingFile;
+    try testing.expectEqual(@as(usize, 3), entry.versions.items.len);
+    // Oldest two dropped — newest survives.
+    try testing.expectEqual(@as(u64, 0x555), entry.versions.items[2].hash);
+}
+
+test "issue-102: Explorer.content_cache_limit is configurable (caps cached files)" {
+    // Default limit is 1000. After setting content_cache_limit = 2, indexing
+    // 5 files must leave at most 2 in the content cache.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    explorer.content_cache_limit = 2;
+
+    try explorer.indexFile("a.zig", "pub fn a() void {}\n");
+    try explorer.indexFile("b.zig", "pub fn b() void {}\n");
+    try explorer.indexFile("c.zig", "pub fn c() void {}\n");
+    try explorer.indexFile("d.zig", "pub fn d() void {}\n");
+    try explorer.indexFile("e.zig", "pub fn e() void {}\n");
+
+    // All 5 outlines are indexed...
+    try testing.expectEqual(@as(usize, 5), explorer.outlines.count());
+    // ...but the content cache is capped at the configured limit. The
+    // implementation stops caching once outlines.count() > limit.
+    try testing.expect(explorer.contents.count() <= 2);
+}
+
+test "issue-101+102: Config.parse wires into Store.max_versions and Explorer.content_cache_limit" {
+    // End-to-end: parse a .codedbrc body, apply to Store + Explorer,
+    // verify both fields pick up the configured values.
+    const body =
+        \\# test config
+        \\max_versions = 7
+        \\max_cached = 42
+        \\
+    ;
+    const cfg = try Config.parse(body);
+    try testing.expectEqual(@as(usize, 7), cfg.max_versions);
+    try testing.expectEqual(@as(u32, 42), cfg.max_cached);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    store.max_versions = cfg.max_versions;
+
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    explorer.content_cache_limit = cfg.max_cached;
+
+    try testing.expectEqual(@as(usize, 7), store.max_versions);
+    try testing.expectEqual(@as(u32, 42), explorer.content_cache_limit);
 }

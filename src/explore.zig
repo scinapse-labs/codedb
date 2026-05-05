@@ -500,6 +500,10 @@ pub const Explorer = struct {
     mu: cio.RwLock = .{},
     root_dir: ?std.Io.Dir = null,
     io: ?std.Io = null,
+    /// Max files kept in the in-memory content cache. Configurable via
+    /// .codedbrc (#102). Beyond this threshold, readContentForSearch falls
+    /// back to disk reads.
+    content_cache_limit: u32 = 1000,
 
     pub fn setRoot(self: *Explorer, io: std.Io, root_path: []const u8) void {
         self.io = io;
@@ -633,7 +637,8 @@ pub const Explorer = struct {
         // Only cache file content when under the threshold — caps peak RSS.
         // Beyond this, readContentForSearch falls back to disk reads.
         // Indexes (word, trigram) use the `content` parameter directly, not the cache.
-        const content_cache_limit: u32 = 1000;
+        // User-configurable via .codedbrc (#102).
+        const content_cache_limit: u32 = self.content_cache_limit;
         const should_cache = self.outlines.count() <= content_cache_limit;
         var prior_content: ?[]const u8 = null;
         if (should_cache) {

@@ -706,7 +706,7 @@ fn insertRestoredFile(
     outline_gop.key_ptr.* = path;
     outline_gop.value_ptr.* = restored_outline;
 
-    const content_cache_limit: u32 = 1000;
+    const content_cache_limit: u32 = explorer.content_cache_limit;
     const should_cache = explorer.outlines.count() <= content_cache_limit;
     if (should_cache) {
         const content_gop = try explorer.contents.getOrPut(path);
