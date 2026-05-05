@@ -1758,6 +1758,22 @@ fn appendBundleArgKeysDiagnostic(
         out.appendSlice(alloc, entry.key_ptr.*) catch return;
     }
     out.appendSlice(alloc, "]") catch return;
+    // Issue #424: if the args we saw contain ONLY administrative keys
+    // (`tool`, `arguments`) — or are empty entirely — there were no real
+    // sub-op fields at all. That's almost always a client wrapper bug.
+    // Suggest the inline shape so the caller can route around it.
+    var has_real_arg = false;
+    var it2 = args.iterator();
+    while (it2.next()) |entry| {
+        const k = entry.key_ptr.*;
+        if (!std.mem.eql(u8, k, "tool") and !std.mem.eql(u8, k, "arguments")) {
+            has_real_arg = true;
+            break;
+        }
+    }
+    if (!has_real_arg) {
+        out.appendSlice(alloc, "\nhint: no sub-op args reached the handler — your client may be stripping fields. Try inline shape: {\"tool\":\"...\",\"path\":\"...\"} (no `arguments` wrapper)") catch return;
+    }
 }
 
 /// Append up to 3 fuzzy-matched indexed paths so callers can recover from a
@@ -1842,7 +1858,7 @@ fn handleBundle(
     var fail_count: usize = 0;
     for (ops, 0..) |op, i| {
         if (op != .object) {
-            w.print("--- [{d}] error ---\nop must be an object\n", .{i}) catch {};
+            w.print("--- [{d}] error ---\nerror: op must be an object\n", .{i}) catch {};
             fail_count += 1;
             continue;
         }
@@ -1851,7 +1867,7 @@ fn handleBundle(
             if (op_obj.get("tool")) |_| {
                 w.print("--- [{d}] error ---\nerror: 'tool' must be a string\n", .{i}) catch {};
             } else {
-                w.print("--- [{d}] error ---\nmissing 'tool' field\n", .{i}) catch {};
+                w.print("--- [{d}] error ---\nerror: missing 'tool' field\n", .{i}) catch {};
             }
             fail_count += 1;
             continue;
@@ -1878,6 +1894,10 @@ fn handleBundle(
         // Extract arguments. Two supported formats:
         //   1) {"tool":"outline", "arguments":{"path":"..."}}  — MCP tools/call style
         //   2) {"tool":"outline", "path":"..."}                 — inline args
+        // Issue #424: if `arguments` is present but empty (`{}`), fall
+        // through to inline-args mode. Some buggy client wrappers emit
+        // empty `arguments` alongside inline args; treating the empty
+        // object as authoritative would silently drop the real args.
         var sub_args_val: std.json.Value = undefined;
         var sub_args_ptr: ?*const std.json.ObjectMap = null;
         if (op_obj.get("arguments")) |arguments_val| {
@@ -1886,8 +1906,13 @@ fn handleBundle(
                 fail_count += 1;
                 continue;
             }
-            sub_args_val = arguments_val;
-            sub_args_ptr = &sub_args_val.object;
+            if (arguments_val.object.count() == 0) {
+                // Empty `arguments` — try inline args at the op level.
+                sub_args_ptr = op_obj;
+            } else {
+                sub_args_val = arguments_val;
+                sub_args_ptr = &sub_args_val.object;
+            }
         } else {
             // No "arguments" key — use op_obj directly (inline arg format)
             sub_args_ptr = op_obj;

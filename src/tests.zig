@@ -10342,3 +10342,112 @@ test "issue-101+102: Config.parse wires into Store.max_versions and Explorer.con
     try testing.expectEqual(@as(usize, 7), store.max_versions);
     try testing.expectEqual(@as(u32, 42), explorer.content_cache_limit);
 }
+
+test "issue-424-B: bundle falls through to inline args when arguments is empty object" {
+    // Forge-style buggy clients sometimes send `arguments: {}` AND put the
+    // real args inline at the op level. The dispatcher currently sees the
+    // empty `arguments` and stops looking — resulting in a misleading
+    // "missing 'path'" with `received keys: []` even though `path` is
+    // sitting right there in the op.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const bundle_json =
+        \\{"ops":[{"tool":"codedb_outline","arguments":{},"path":"src/main.zig"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bundle_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // Should succeed: path was discoverable inline even though `arguments` was empty.
+    try testing.expect(std.mem.indexOf(u8, out.items, "src/main.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path'") == null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys: []") == null);
+}
+
+test "issue-424-D: received-keys diagnostic hints at inline-args workaround when empty" {
+    // When a sub-op fails with truly-empty args, the diagnostic should
+    // point users at the inline-args fallback so a broken client wrapper
+    // can be routed around without a server change.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+    try explorer.indexFile("src/main.zig", "pub fn main() void {}\n");
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    const bundle_json =
+        \\{"ops":[{"tool":"codedb_outline","arguments":{}}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bundle_json, .{});
+    defer parsed.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed.value.object, &out, &store, &explorer, &agents);
+
+    // Original error stays.
+    try testing.expect(std.mem.indexOf(u8, out.items, "missing 'path'") != null);
+    // The diagnostic should fire (received-keys line present) and surface
+    // the inline-shape hint, since no real sub-op args were observed.
+    try testing.expect(std.mem.indexOf(u8, out.items, "received keys:") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "inline shape") != null);
+}
+
+test "issue-424-A: bundle envelope errors carry the 'error:' prefix consistently" {
+    // Pre-fix the bundle dispatcher emits 'op must be an object' and
+    // 'missing 'tool' field' WITHOUT the 'error:' prefix that per-tool
+    // handlers and TTY-summary parsing both expect. Normalize.
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    _ = try agents.register("__filesystem__");
+
+    var bench_ctx = mcp_mod.BenchContext.init(testing.allocator, ".");
+    defer bench_ctx.deinit();
+
+    // Op is a string, not an object.
+    const bad_shape =
+        \\{"ops":["not-an-object"]}
+    ;
+    const parsed1 = try std.json.parseFromSlice(std.json.Value, testing.allocator, bad_shape, .{});
+    defer parsed1.deinit();
+    var out1: std.ArrayList(u8) = .empty;
+    defer out1.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed1.value.object, &out1, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, out1.items, "error: op must be an object") != null);
+
+    // Op missing 'tool' field.
+    const no_tool =
+        \\{"ops":[{"arguments":{}}]}
+    ;
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, no_tool, .{});
+    defer parsed2.deinit();
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(testing.allocator);
+    bench_ctx.runDispatch(io, testing.allocator, .codedb_bundle, &parsed2.value.object, &out2, &store, &explorer, &agents);
+    try testing.expect(std.mem.indexOf(u8, out2.items, "error: missing 'tool'") != null);
+}
