@@ -8222,7 +8222,7 @@ test "issue-357: bundle surfaces received keys when an op is missing required pa
     try testing.expect(std.mem.indexOf(u8, out.items, "file_path") != null);
 }
 
-test "issue-422: bundle emits 'received keys' exactly once per failing op" {
+test "issue-423: bundle emits 'received keys' exactly once per failing op" {
     // Regression: handler (handleSearch etc) appends the diagnostic, AND the
     // bundle dispatch loop also appends it — caller saw the line twice in a
     // row. Must appear exactly once per failing op.

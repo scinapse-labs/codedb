@@ -1879,7 +1879,7 @@ fn handleBundle(
 
         w.print("--- [{d}] {s} ---\n", .{ i, tool_name }) catch {};
         out.appendSlice(alloc, sub_out.items) catch {};
-        // Issue #357 / #422: per-tool handlers already append the
+        // Issue #357 / #423: per-tool handlers already append the
         // `received keys` diagnostic on missing-arg errors, so the bundle
         // wrapper does NOT re-append it. Doing so emits the line twice.
         if (std.mem.startsWith(u8, sub_out.items, "error:")) {
