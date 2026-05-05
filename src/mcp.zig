@@ -3106,7 +3106,7 @@ const getInt = mcpj.getInt;
 pub const getBool = mcpj.getBool;
 const eql = mcpj.eql;
 
-fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
+pub fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Value) void {
     if (id) |v| switch (v) {
         .integer => |n| {
             var tmp: [20]u8 = undefined;
@@ -3117,6 +3117,14 @@ fn appendId(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), id: ?std.json.Val
             buf.append(alloc, '"') catch return;
             mcpj.writeEscaped(alloc, buf, s);
             buf.append(alloc, '"') catch return;
+        },
+        .float => |f| {
+            var tmp: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch return;
+            buf.appendSlice(alloc, s) catch return;
+        },
+        .number_string => |s| {
+            buf.appendSlice(alloc, s) catch return;
         },
         else => buf.appendSlice(alloc, "null") catch return,
     } else {
