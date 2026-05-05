@@ -9443,3 +9443,125 @@ test "issue-409: snapshot .env prefix filter wrongly excludes .envoy/.environmen
     try testing.expect(exp2.outlines.contains("a.zig"));
     try testing.expect(exp2.outlines.contains(".envoy.json"));
 }
+
+test "issue-401: insert with after=null is a no-op but consumes seq and writes file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-401.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    const original = "line 1\nline 2\nline 3\n";
+    var file = try tmp.dir.createFile(io, "edit-401.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-401-agent");
+
+    // insert without after must not silently succeed and must not consume a seq.
+    const res = edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .insert,
+        .after = null,
+        .content = "INJECT\n",
+    });
+    // Either explicit error, or — at minimum — must not increment the store seq
+    // for an operation that did nothing.
+    if (res) |ok| {
+        _ = ok;
+        try testing.expectEqual(@as(u64, 0), store.currentSeq());
+    } else |_| {
+        try testing.expectEqual(@as(u64, 0), store.currentSeq());
+    }
+}
+
+test "issue-404: applyEdit corrupts CRLF line endings into mixed LF/CRLF" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-404.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    // Windows-style CRLF original
+    const original = "alpha\r\nbeta\r\ngamma\r\n";
+    var file = try tmp.dir.createFile(io, "edit-404.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-404-agent");
+
+    // Replace line 1 with new content (no trailing newline in replacement).
+    _ = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "ALPHA",
+    });
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after);
+
+    // The original file used CRLF line endings. After a single-line replace
+    // the file must still be a valid CRLF file: every '\n' must be preceded
+    // by '\r'. Currently splitScalar on '\n' leaves the '\r' attached to the
+    // *unchanged* lines (e.g. "beta\r"), and the rejoin uses bare "\n", so
+    // the new line 1 lacks its CR while the surviving line 2 still has it —
+    // mixed line endings.
+    var i: usize = 0;
+    while (i < after.len) : (i += 1) {
+        if (after[i] == '\n') {
+            try testing.expect(i > 0);
+            try testing.expectEqual(@as(u8, '\r'), after[i - 1]);
+        }
+    }
+}
+
+test "issue-409: replacing whole file with empty content leaves a stray newline" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/edit-409.txt", .{tmp.sub_path});
+    defer testing.allocator.free(rel_path);
+
+    // Single-line file with trailing newline.
+    const original = "abc\n";
+    var file = try tmp.dir.createFile(io, "edit-409.txt", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, original);
+
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var agents = AgentRegistry.init(testing.allocator);
+    defer agents.deinit();
+    const agent_id = try agents.register("issue-409-agent");
+
+    // Replace the only line with empty content. The caller's intent is "make
+    // this file empty" — content has zero bytes.
+    const result = try edit_mod.applyEdit(io, testing.allocator, &store, &agents, null, .{
+        .path = rel_path,
+        .agent_id = agent_id,
+        .op = .replace,
+        .range = .{ 1, 1 },
+        .content = "",
+    });
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, rel_path, testing.allocator, .limited(10 * 1024));
+    defer testing.allocator.free(after);
+
+    // Expectation: the file is empty. Currently the file ends up as "\n"
+    // because applyEdit unconditionally restores the trailing newline that
+    // existed in the source, even after the replacement reduced the file
+    // to a single empty line.
+    try testing.expectEqual(@as(usize, 0), after.len);
+    try testing.expectEqual(@as(u64, 0), result.new_size);
+}
