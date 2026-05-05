@@ -164,6 +164,13 @@ fn mainImpl() !void {
         });
         std.process.exit(1);
     };
+    // For `codedb mcp` from cwd, always go through deferred mode: we need the
+    // initialize handshake first to know whether the client is going to send
+    // workspace roots. If we eager-load here we'd race the client's roots/list
+    // reply and silently ignore an editor's actual workspace path. The trigger
+    // path is fast (snapshot load happens in-process when the trigger fires),
+    // and clients that don't advertise the roots capability fire the trigger
+    // immediately on notifications/initialized — see handleSession.
     const mcp_deferred_root = std.mem.eql(u8, cmd, "mcp") and std.mem.eql(u8, root, ".") and !root_is_explicit;
     if (!mcp_deferred_root and !root_policy.isIndexableRoot(abs_root)) {
         out.p("{s}\xe2\x9c\x97{s} refusing to index temporary root: {s}{s}{s}\n", .{
@@ -598,6 +605,11 @@ fn mainImpl() !void {
         std.log.info("codedb: {d} files indexed, listening on :{d}", .{ store.currentSeq(), port });
         try server.serve(io, allocator, &store, &agents, &explorer, queue, port);
     } else if (std.mem.eql(u8, cmd, "mcp")) {
+        // Background auto-update check (no-op when CODEDB_NO_AUTO_UPDATE is set
+        // or when the last check was within the last 24h). Detached thread, so
+        // this doesn't block server startup.
+        update_mod.maybeAutoUpdate(io, allocator);
+
         var agents = AgentRegistry.init(allocator);
         defer agents.deinit();
         _ = try agents.register("__filesystem__");
@@ -646,6 +658,7 @@ fn mainImpl() !void {
                 .telem = &telem,
                 .queue = queue,
                 .startup_t0 = startup_t0,
+                .fallback_cwd = abs_root,
                 .triggerFn = triggerScanFromRoots,
             };
             deferred.scan_done.* = std.atomic.Value(bool).init(false);
@@ -1141,8 +1154,18 @@ fn triggerScanFromRoots(ctx: *mcp_server.DeferredScan, abs_root: []const u8) voi
 }
 
 fn watcherDeferredLoop(ctx: *mcp_server.DeferredScan) void {
+    const t0 = cio.milliTimestamp();
+    const fallback_after_ms: i64 = 3000;
+    var fallback_attempted = false;
     while (!ctx.scan_done.load(.acquire) and !ctx.shutdown.load(.acquire)) {
         cio.sleepMs(50);
+        if (!fallback_attempted and cio.milliTimestamp() - t0 >= fallback_after_ms) {
+            fallback_attempted = true;
+            // Client never sent indexable roots — fall back to cwd so the
+            // server doesn't sit in loading_snapshot forever.
+            const empty_roots: []const mcp_server.Root = &.{};
+            _ = mcp_server.triggerDeferredScanWithFallback(ctx, empty_roots, ctx.fallback_cwd);
+        }
     }
     if (ctx.shutdown.load(.acquire)) return;
     watcher.incrementalLoop(ctx.io, ctx.store, ctx.explorer, ctx.queue, ctx.resolved_root, ctx.shutdown, ctx.scan_done);
