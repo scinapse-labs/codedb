@@ -9310,3 +9310,30 @@ test "issue-411: tryLock grants new locks to a crashed agent" {
     const got = try agents.tryLock(id, "post-crash.zig", 60_000);
     try testing.expect(got == false);
 }
+
+test "issue-406: root_policy blocks /private/etc (macOS realpath of /etc)" {
+    const root_policy = @import("root_policy.zig");
+    // /etc is in the system_prefixes deny list, but on macOS /etc is a symlink
+    // to /private/etc. Callers feed isIndexableRoot a path resolved by
+    // realPathFile (see handleIndex in src/mcp.zig), which turns "/etc" into
+    // "/private/etc" — and then this textual prefix check accepts it. The
+    // canonical form must be blocked too, otherwise the deny list is bypassed
+    // by the very normalization step the callers depend on.
+    try testing.expect(!root_policy.isIndexableRoot("/private/etc"));
+    try testing.expect(!root_policy.isIndexableRoot("/private/etc/ssh"));
+}
+
+test "issue-407: root_policy blocks /var and its non-folders subtree" {
+    const root_policy = @import("root_policy.zig");
+    // The system_prefixes list explicitly blocks /var/folders and /var/tmp,
+    // but not /var itself or /var/log, /var/lib, /var/db, /var/spool, etc.
+    // On Linux those hold logs, mail, and package state; on macOS realPathFile
+    // turns /var into /private/var (also unblocked). Accidentally pointing
+    // the indexer at /var/log on a server pulls in GBs of secrets and is
+    // never a valid "project root".
+    try testing.expect(!root_policy.isIndexableRoot("/var"));
+    try testing.expect(!root_policy.isIndexableRoot("/var/log"));
+    try testing.expect(!root_policy.isIndexableRoot("/var/lib"));
+    try testing.expect(!root_policy.isIndexableRoot("/private/var"));
+    try testing.expect(!root_policy.isIndexableRoot("/private/var/log"));
+}
