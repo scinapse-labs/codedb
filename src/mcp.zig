@@ -1351,19 +1351,7 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
 
     var shown: usize = 0;
     for (results) |r| {
-        var is_def = false;
-        for (defs) |d| {
-            if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
-                is_def = true;
-                break;
-            }
-        }
-        if (!is_def) shown += 1;
-    }
-
-    const w = cio.listWriter(out, alloc);
-    w.print("{d} call sites for '{s}':\n", .{ shown, name }) catch {};
-    for (results) |r| {
+        if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
         var is_def = false;
         for (defs) |d| {
             if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
@@ -1372,6 +1360,23 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
             }
         }
         if (is_def) continue;
+        if (!hasWholeWordMatch(r.line_text, name)) continue;
+        shown += 1;
+    }
+
+    const w = cio.listWriter(out, alloc);
+    w.print("{d} call sites for '{s}':\n", .{ shown, name }) catch {};
+    for (results) |r| {
+        if (!langHasCallSites(explore_mod.detectLanguage(r.path))) continue;
+        var is_def = false;
+        for (defs) |d| {
+            if (r.line_num == d.symbol.line_start and std.mem.eql(u8, r.path, d.path)) {
+                is_def = true;
+                break;
+            }
+        }
+        if (is_def) continue;
+        if (!hasWholeWordMatch(r.line_text, name)) continue;
         if (r.scope_name) |sn| {
             w.print("  {s}:{d}: {s}  [in {s} ({s}, L{d}-L{d})]\n", .{
                 r.path, r.line_num, r.line_text, sn, @tagName(r.scope_kind.?), r.scope_start, r.scope_end,
@@ -1380,6 +1385,40 @@ fn handleCallers(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out:
             w.print("  {s}:{d}: {s}\n", .{ r.path, r.line_num, r.line_text }) catch {};
         }
     }
+}
+
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or
+        c == '_';
+}
+
+/// Returns true iff `needle` appears in `haystack` with non-identifier
+/// characters (or string boundary) on both sides — i.e. as a whole-word
+/// identifier match, not as a substring inside a longer identifier.
+fn hasWholeWordMatch(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, search_from, needle)) |pos| {
+        const before_ok = pos == 0 or !isIdentChar(haystack[pos - 1]);
+        const after_idx = pos + needle.len;
+        const after_ok = after_idx >= haystack.len or !isIdentChar(haystack[after_idx]);
+        if (before_ok and after_ok) return true;
+        search_from = pos + 1;
+    }
+    return false;
+}
+
+/// Languages where the concept of a "call site" is meaningful. Excludes
+/// data formats (json, yaml), markup/styling (markdown, css, scss),
+/// declarative schemas (protobuf), and unknown files — callers found
+/// inside these are mentions in prose or config, not real invocations.
+fn langHasCallSites(lang: explore_mod.Language) bool {
+    return switch (lang) {
+        .markdown, .json, .yaml, .css, .scss, .protobuf, .unknown => false,
+        else => true,
+    };
 }
 
 fn handleHot(alloc: std.mem.Allocator, args: *const std.json.ObjectMap, out: *std.ArrayList(u8), store: *Store, explorer: *Explorer) void {

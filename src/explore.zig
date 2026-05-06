@@ -156,6 +156,17 @@ pub fn detectLanguage(path: []const u8) Language {
     return .unknown;
 }
 
+/// Returns true for languages whose content is primarily prose / data /
+/// markup rather than executable code. Used to deprioritise these files in
+/// content search so a CHANGELOG.md or design doc cannot starve a canonical
+/// source-file match (issue #430).
+pub fn isDocLanguage(lang: Language) bool {
+    return switch (lang) {
+        .markdown, .json, .yaml, .unknown => true,
+        else => false,
+    };
+}
+
 pub const SymbolResult = struct {
     path: []const u8,
     symbol: Symbol,
@@ -1522,36 +1533,45 @@ pub const Explorer = struct {
         // file (CHANGELOG.md, architecture.md, etc.) can't saturate the quota
         // and crowd out source-file matches that come later in the posting
         // list. Cap = max(1, max_results / 5).
+        // Issue #430: process code-language hits FIRST, then doc-language
+        // hits. With max_results=50 the per-file cap is 10, so 5 markdown
+        // files with 10+ mentions each can fill result_list before the
+        // canonical source file's posting-list entries are reached.
         const word_hits = self.word_index.search(query);
         if (word_hits.len > 0 and word_hits.len <= max_results * 2) {
             const tier0_per_file_cap: usize = @max(1, max_results / 5);
             var tier0_per_file = std.StringHashMap(usize).init(allocator);
             defer tier0_per_file.deinit();
-            for (word_hits) |hit| {
-                const hit_path = self.word_index.hitPath(hit);
-                if (hit_path.len == 0) continue;
-                const gop = tier0_per_file.getOrPut(hit_path) catch continue;
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                if (gop.value_ptr.* >= tier0_per_file_cap) continue;
-                const ref = self.readContentForSearch(hit_path, allocator) orelse continue;
-                defer ref.deinit();
-                const line_text = extractLineByNumber(ref.data, hit.line_num) orelse continue;
-                if (indexOfCaseInsensitive(line_text, query) == null) continue;
-                const duped_text = try allocator.dupe(u8, line_text);
-                errdefer allocator.free(duped_text);
-                const duped_path = try allocator.dupe(u8, hit_path);
-                errdefer allocator.free(duped_path);
-                try result_list.append(allocator, .{
-                    .path = duped_path,
-                    .line_num = hit.line_num,
-                    .line_text = duped_text,
-                });
-                gop.value_ptr.* += 1;
-                searched.put(hit_path, {}) catch {};
-                if (result_list.items.len >= max_results) return result_list.toOwnedSlice(allocator);
+            const passes = [_]bool{ false, true }; // pass 0 = code, pass 1 = doc
+            for (passes) |is_doc_pass| {
+                if (result_list.items.len >= max_results) break;
+                for (word_hits) |hit| {
+                    const hit_path = self.word_index.hitPath(hit);
+                    if (hit_path.len == 0) continue;
+                    if (isDocLanguage(detectLanguage(hit_path)) != is_doc_pass) continue;
+                    const gop = tier0_per_file.getOrPut(hit_path) catch continue;
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    if (gop.value_ptr.* >= tier0_per_file_cap) continue;
+                    const ref = self.readContentForSearch(hit_path, allocator) orelse continue;
+                    defer ref.deinit();
+                    const line_text = extractLineByNumber(ref.data, hit.line_num) orelse continue;
+                    if (indexOfCaseInsensitive(line_text, query) == null) continue;
+                    const duped_text = try allocator.dupe(u8, line_text);
+                    errdefer allocator.free(duped_text);
+                    const duped_path = try allocator.dupe(u8, hit_path);
+                    errdefer allocator.free(duped_path);
+                    try result_list.append(allocator, .{
+                        .path = duped_path,
+                        .line_num = hit.line_num,
+                        .line_text = duped_text,
+                    });
+                    gop.value_ptr.* += 1;
+                    searched.put(hit_path, {}) catch {};
+                    if (result_list.items.len >= max_results) return self.rerankAndFinalize(&result_list, query, allocator);
+                }
             }
             if (result_list.items.len >= max_results)
-                return result_list.toOwnedSlice(allocator);
+                return self.rerankAndFinalize(&result_list, query, allocator);
         }
 
         // Tier 0.5: prefix expansion — find all indexed keys that begin with the query.
@@ -1587,15 +1607,34 @@ pub const Explorer = struct {
         // Tier 1: trigram candidates — fast path, skips files already found by Tier 0.
         if (candidate_paths) |cp| {
             if (cp.len > 0) {
+                // Issue #427: rank candidates by per-file word-index hit count
+                // (desc) so the definition-dense file scans first; fall back to
+                // file content length (asc) so small files still come before
+                // unrelated large files at the same hit count. Pre-fix the
+                // sort key was content length alone, which buried the canonical
+                // file behind unrelated short files when max_per_file was 1.
+                var hits_per_file = std.StringHashMap(u32).init(allocator);
+                defer hits_per_file.deinit();
+                for (word_hits) |hit| {
+                    const hp = self.word_index.hitPath(hit);
+                    if (hp.len == 0) continue;
+                    const gop_h = try hits_per_file.getOrPut(hp);
+                    if (!gop_h.found_existing) gop_h.value_ptr.* = 0;
+                    gop_h.value_ptr.* += 1;
+                }
                 const SortCtx = struct {
                     contents: *const std.StringHashMap([]const u8),
+                    counts: *const std.StringHashMap(u32),
                     pub fn lessThan(ctx: @This(), a: []const u8, b: []const u8) bool {
+                        const a_count = ctx.counts.get(a) orelse 0;
+                        const b_count = ctx.counts.get(b) orelse 0;
+                        if (a_count != b_count) return a_count > b_count;
                         const a_len = if (ctx.contents.get(a)) |c| c.len else std.math.maxInt(usize);
                         const b_len = if (ctx.contents.get(b)) |c| c.len else std.math.maxInt(usize);
                         return a_len < b_len;
                     }
                 };
-                std.mem.sort([]const u8, @constCast(cp), SortCtx{ .contents = &self.contents }, SortCtx.lessThan);
+                std.mem.sort([]const u8, @constCast(cp), SortCtx{ .contents = &self.contents, .counts = &hits_per_file }, SortCtx.lessThan);
 
                 const estimated_total = cp.len + self.skip_trigram_files.count();
                 const max_per_file = @max(@as(usize, 1), max_results / @max(@as(usize, 1), estimated_total));
@@ -1605,7 +1644,7 @@ pub const Explorer = struct {
                     defer ref.deinit();
                     try searchInContent(path, ref.data, query, allocator, max_per_file, max_results, &result_list);
                     if (result_list.items.len >= max_results)
-                        return result_list.toOwnedSlice(allocator);
+                        return self.rerankAndFinalize(&result_list, query, allocator);
                 }
             }
         }
@@ -1675,12 +1714,23 @@ pub const Explorer = struct {
                 if (result_list.items.len >= max_results) break;
             }
         }
+        return self.rerankAndFinalize(&result_list, query, allocator);
+    }
 
-        // Frequency scoring: count query occurrences per line, then stable-sort by
-        // (score desc, path asc, line_num asc) so high-density hits surface first.
+    /// Run the multi-signal rerank in place, then transfer ownership of
+    /// result_list to the caller. Centralised so every searchContent return
+    /// path (Tier 0 / Tier 1 early-return on max_results, fall-through to
+    /// final return) gets the same ranking — pre-fix only the fall-through
+    /// path applied multi-signal scoring.
+    fn rerankAndFinalize(
+        self: *const Explorer,
+        result_list: *std.ArrayList(SearchResult),
+        query: []const u8,
+        allocator: std.mem.Allocator,
+    ) ![]const SearchResult {
         if (result_list.items.len > 1) {
             for (result_list.items) |*r| {
-                r.score = countOccurrences(r.line_text, query);
+                r.score = self.rerankSignalScore(r.*, query);
             }
             std.sort.block(SearchResult, result_list.items, {}, struct {
                 pub fn lessThan(_: void, a: SearchResult, b: SearchResult) bool {
@@ -1691,8 +1741,45 @@ pub const Explorer = struct {
                 }
             }.lessThan);
         }
-
         return result_list.toOwnedSlice(allocator);
+    }
+
+    /// Compose the rerank signals for one search hit (issue #429).
+    fn rerankSignalScore(self: *const Explorer, r: SearchResult, query: []const u8) f32 {
+        var score: f32 = countOccurrences(r.line_text, query);
+
+        if (self.outlines.get(r.path)) |outline| {
+            for (outline.symbols.items) |sym| {
+                if (sym.line_start == r.line_num and std.mem.eql(u8, sym.name, query)) {
+                    score += 5.0;
+                    break;
+                }
+            }
+        }
+
+        const basename = std.fs.path.basename(r.path);
+        const stem_end = std.mem.indexOfScalar(u8, basename, '.') orelse basename.len;
+        const stem = basename[0..stem_end];
+        if (asciiEqlIgnoreCase(stem, query)) {
+            score += 15.0;
+        } else if (asciiContainsIgnoreCase(stem, query)) {
+            score += 8.0;
+        }
+        // Path-segment match boost: query matches a directory segment in
+        // the path (e.g. query="parser" boosts src/parser/foo.zig). Weaker
+        // than basename match because the file's own name is a stronger
+        // intent signal than the directory it lives in. Skip when basename
+        // already matched to avoid double-counting.
+        if (!asciiContainsIgnoreCase(stem, query) and pathHasSegmentIgnoreCase(r.path, query)) {
+            score += 6.0;
+        }
+
+        if (pathHasSegment(r.path, "tests") or pathHasSegment(r.path, "test")) score *= 0.6;
+        if (pathHasSegment(r.path, "examples") or pathHasSegment(r.path, "example")) score *= 0.6;
+        if (pathHasSegment(r.path, "vendor") or pathHasSegment(r.path, "node_modules") or
+            pathHasSegment(r.path, "third_party")) score *= 0.4;
+
+        return score;
     }
 
     /// BM25-ranked content search. Tokenizes the query the same way the word
@@ -3873,6 +3960,10 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
 
 fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
     if (query.len == 0 or content.len == 0) return;
+    // Issue #431: bail when the query is longer than the file. Without this
+    // guard, `content.len - query.len + 1` below underflows usize → integer
+    // overflow panic in Debug, SIGBUS in ReleaseFast.
+    if (query.len > content.len) return;
     result_list.ensureTotalCapacity(allocator, result_list.items.len + @min(max_per_file, 16)) catch {};
     const first_lower: u8 = if (query[0] >= 'A' and query[0] <= 'Z') query[0] + 32 else query[0];
     const first_upper: u8 = if (query[0] >= 'a' and query[0] <= 'z') query[0] - 32 else query[0];
@@ -4401,6 +4492,42 @@ fn countOccurrences(text: []const u8, needle: []const u8) f32 {
         } else break;
     }
     return count;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    outer: while (i + needle.len <= haystack.len) : (i += 1) {
+        for (needle, 0..) |nc, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) continue :outer;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn pathHasSegment(path: []const u8, segment: []const u8) bool {
+    var iter = std.mem.tokenizeAny(u8, path, "/\\");
+    while (iter.next()) |seg| {
+        if (std.mem.eql(u8, seg, segment)) return true;
+    }
+    return false;
+}
+
+fn pathHasSegmentIgnoreCase(path: []const u8, segment: []const u8) bool {
+    var iter = std.mem.tokenizeAny(u8, path, "/\\");
+    while (iter.next()) |seg| {
+        if (asciiEqlIgnoreCase(seg, segment)) return true;
+    }
+    return false;
 }
 fn startsWith(haystack: []const u8, needle: []const u8) bool {
     return std.mem.startsWith(u8, haystack, needle);
