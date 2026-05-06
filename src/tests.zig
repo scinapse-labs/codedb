@@ -10452,6 +10452,116 @@ test "issue-424-A: bundle envelope errors carry the 'error:' prefix consistently
     try testing.expect(std.mem.indexOf(u8, out2.items, "error: missing 'tool'") != null);
 }
 
+test "issue-434: codedb_bundle ops items schema requires arguments field" {
+    // The codedb_bundle inputSchema in tools_list advertises ops items as
+    // {required: ["tool"]} with arguments as a bare {type: "object"} that
+    // permits {}. Function-calling LLMs read the schema as authoritative and
+    // emit the minimum-valid payload — {tool: "...", arguments: {}} — which
+    // misroutes through the inline-args fallback and surfaces as
+    // "received keys: [tool, arguments]" from each sub-tool. Stage 1 fix:
+    // add "arguments" to the items.required array so models are forced to
+    // populate it. (Stage 2 — discriminated oneOf over tool — is a follow-up.)
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, mcp_mod.tools_list, .{});
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("tools").?.array;
+    var bundle_schema: ?std.json.Value = null;
+    for (tools.items) |t| {
+        const name = t.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "codedb_bundle")) {
+            bundle_schema = t.object.get("inputSchema").?;
+            break;
+        }
+    }
+    try testing.expect(bundle_schema != null);
+
+    const ops = bundle_schema.?.object.get("properties").?.object.get("ops").?;
+    const items = ops.object.get("items").?;
+    const required = items.object.get("required").?.array;
+
+    var has_tool = false;
+    var has_arguments = false;
+    for (required.items) |r| {
+        if (std.mem.eql(u8, r.string, "tool")) has_tool = true;
+        if (std.mem.eql(u8, r.string, "arguments")) has_arguments = true;
+    }
+    try testing.expect(has_tool);
+    try testing.expect(has_arguments);
+}
+
+test "issue-437: codedb_bundle ops items schema has discriminated oneOf per sub-tool" {
+    // Stage 2 of the bundle-schema fix. Stage 1 (#434) made `arguments`
+    // required but left it as a bare {type: "object"} — so a schema-greedy
+    // model can still emit `arguments: {}` to satisfy the required check
+    // without populating real keys. Stage 2 binds the *contents* of
+    // arguments to each sub-tool's actual inputSchema via a discriminated
+    // oneOf on `tool` (const) → `arguments` (sub-tool inputSchema).
+    //
+    // The augmented schema is built at runtime from the per-sub-tool
+    // schemas already advertised in tools_list, so there is no
+    // hand-maintained duplication.
+    const augmented = try mcp_mod.buildAugmentedToolsList(testing.allocator);
+    defer testing.allocator.free(augmented);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, augmented, .{});
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("tools").?.array;
+    var bundle_items: ?std.json.Value = null;
+    for (tools.items) |t| {
+        const name = t.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "codedb_bundle")) {
+            bundle_items = t.object.get("inputSchema").?.object.get("properties").?.object.get("ops").?.object.get("items").?;
+            break;
+        }
+    }
+    try testing.expect(bundle_items != null);
+
+    // `oneOf` array must exist on items.
+    const one_of_val = bundle_items.?.object.get("oneOf");
+    try testing.expect(one_of_val != null);
+    const one_of = one_of_val.?.array;
+
+    // Must have at least one branch per dispatchable codedb_* sub-tool.
+    // codedb_bundle (recursive) and codedb_edit (write op) are explicitly
+    // rejected by handleBundle, so they are excluded.
+    try testing.expect(one_of.items.len >= 10);
+
+    // Find the codedb_outline branch and verify it pins tool to a const
+    // and binds arguments to a populated schema (with `path` property).
+    var found_outline = false;
+    for (one_of.items) |branch| {
+        const props = branch.object.get("properties").?.object;
+        const tool_v = props.get("tool").?;
+        const tool_const = tool_v.object.get("const");
+        if (tool_const == null) continue;
+        if (!std.mem.eql(u8, tool_const.?.string, "codedb_outline")) continue;
+        found_outline = true;
+
+        const args_schema = props.get("arguments").?;
+        const args_props = args_schema.object.get("properties").?.object;
+        try testing.expect(args_props.get("path") != null);
+        // codedb_outline requires `path` — preserved by the augmentation.
+        const args_required = args_schema.object.get("required").?.array;
+        var path_required = false;
+        for (args_required.items) |r| {
+            if (std.mem.eql(u8, r.string, "path")) path_required = true;
+        }
+        try testing.expect(path_required);
+        break;
+    }
+    try testing.expect(found_outline);
+
+    // No branch should be for the recursive codedb_bundle or the write-op codedb_edit.
+    for (one_of.items) |branch| {
+        const props = branch.object.get("properties").?.object;
+        const tool_v = props.get("tool").?;
+        const tool_const = tool_v.object.get("const") orelse continue;
+        try testing.expect(!std.mem.eql(u8, tool_const.string, "codedb_bundle"));
+        try testing.expect(!std.mem.eql(u8, tool_const.string, "codedb_edit"));
+    }
+}
+
 test "issue-425: codedb_callers excludes substring matches in unrelated identifiers" {
     // handleCallers (mcp.zig:1339) currently calls searchContentWithScope(name)
     // which is a *substring* full-text search. The only de-dup it performs is
@@ -10821,4 +10931,190 @@ test "issue-429-e: searchContent rerank penalises doc-language files so code bea
     }
     try testing.expect(results.len >= 2);
     try testing.expectEqualStrings("src/caller.zig", results[0].path);
+}
+
+test "rerank-trace: appends one JSON line per searchContent when enabled" {
+    const tmp_io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(tmp_io, ".", &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+
+    const trace_path = try std.fmt.allocPrint(testing.allocator, "{s}/rerank-traces.jsonl", .{tmp_path});
+    defer testing.allocator.free(trace_path);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+    explorer.io = tmp_io;
+    explorer.rerank_trace_path = trace_path;
+
+    try explorer.indexFile("src/widgetX.zig", "pub fn process() void { _ = widgetX; }\n");
+    try explorer.indexFile("src/unrelated.zig", "pub fn process() void { _ = widgetX; }\n");
+
+    const results = try explorer.searchContent("widgetX", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 2);
+
+    const f = try std.Io.Dir.cwd().openFile(tmp_io, trace_path, .{});
+    defer f.close(tmp_io);
+    const size = try f.length(tmp_io);
+    try testing.expect(size > 0);
+
+    const data = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(data);
+    _ = try f.readPositionalAll(tmp_io, data, 0);
+
+    try testing.expectEqual(@as(u8, '\n'), data[data.len - 1]);
+    var nl_count: usize = 0;
+    for (data) |c| if (c == '\n') {
+        nl_count += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), nl_count);
+
+    try testing.expect(std.mem.indexOf(u8, data, "\"query\":\"widgetX\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "src/widgetX.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"results\":[") != null);
+}
+
+test "rerank-trace: disabled by default — no file is created" {
+    const tmp_io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(tmp_io, ".", &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+
+    const probe_path = try std.fmt.allocPrint(testing.allocator, "{s}/should-not-exist.jsonl", .{tmp_path});
+    defer testing.allocator.free(probe_path);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+    explorer.io = tmp_io;
+    // rerank_trace_path stays null — opt-in only.
+
+    try explorer.indexFile("a.zig", "pub fn t() void { _ = sym; }\n");
+    try explorer.indexFile("b.zig", "pub fn t() void { _ = sym; }\n");
+
+    const results = try explorer.searchContent("sym", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expect(results.len >= 1);
+
+    const open_err = std.Io.Dir.cwd().openFile(tmp_io, probe_path, .{});
+    try testing.expectError(error.FileNotFound, open_err);
+}
+
+test "rerank-trace: clobbers when file exceeds size limit" {
+    const tmp_io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(tmp_io, ".", &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+
+    const trace_path = try std.fmt.allocPrint(testing.allocator, "{s}/big.jsonl", .{tmp_path});
+    defer testing.allocator.free(trace_path);
+
+    {
+        const f = try std.Io.Dir.cwd().createFile(tmp_io, trace_path, .{ .truncate = true });
+        defer f.close(tmp_io);
+        const target_size: u64 = 11 * 1024 * 1024;
+        var chunk: [4096]u8 = undefined;
+        @memset(&chunk, 'x');
+        var written: u64 = 0;
+        while (written < target_size) : (written += chunk.len) {
+            try f.writePositionalAll(tmp_io, &chunk, written);
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+    explorer.io = tmp_io;
+    explorer.rerank_trace_path = trace_path;
+
+    try explorer.indexFile("a.zig", "pub fn t() void { _ = sym; }\n");
+    try explorer.indexFile("b.zig", "pub fn t() void { _ = sym; }\n");
+
+    const results = try explorer.searchContent("sym", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    const f = try std.Io.Dir.cwd().openFile(tmp_io, trace_path, .{});
+    defer f.close(tmp_io);
+    const new_size = try f.length(tmp_io);
+    try testing.expect(new_size > 0);
+    try testing.expect(new_size < 16 * 1024);
+}
+
+test "rerank-trace: single-result query records non-zero rerank score" {
+    // Pre-fix: rerankAndFinalize only scored when items.len > 1, so a
+    // single-result trace logged score=0.0 — misleading for offline analysis
+    // because it looked identical to a zero-confidence match. The fix runs
+    // scoring unconditionally and only sorts when there's more than one item.
+    const tmp_io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path_len = try tmp.dir.realPathFile(tmp_io, ".", &path_buf);
+    const tmp_path = path_buf[0..tmp_path_len];
+
+    const trace_path = try std.fmt.allocPrint(testing.allocator, "{s}/single.jsonl", .{tmp_path});
+    defer testing.allocator.free(trace_path);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+    explorer.io = tmp_io;
+    explorer.rerank_trace_path = trace_path;
+
+    // Only one file mentions the query — guarantees results.len == 1.
+    try explorer.indexFile("src/loneSym.zig", "pub fn loneSym() void {}\n");
+    try explorer.indexFile("src/other.zig", "pub fn unrelated() void {}\n");
+
+    const results = try explorer.searchContent("loneSym", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+    try testing.expectEqual(@as(usize, 1), results.len);
+    // Symbol-def boost (+5) + basename-substring boost (+8) + per-line freq
+    // means score is well above zero — verifies scoring actually ran.
+    try testing.expect(results[0].score > 1.0);
+
+    const f = try std.Io.Dir.cwd().openFile(tmp_io, trace_path, .{});
+    defer f.close(tmp_io);
+    const size = try f.length(tmp_io);
+    const data = try testing.allocator.alloc(u8, @intCast(size));
+    defer testing.allocator.free(data);
+    _ = try f.readPositionalAll(tmp_io, data, 0);
+
+    try testing.expect(std.mem.indexOf(u8, data, "\"score\":0.0000") == null);
+    try testing.expect(std.mem.indexOf(u8, data, "src/loneSym.zig") != null);
 }
