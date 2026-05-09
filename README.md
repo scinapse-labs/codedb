@@ -10,6 +10,10 @@
   <a href="https://deepwiki.com/justrach/codedb"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
 </p>
 
+<p align="center">
+  <a href="https://trendshift.io/repositories/26207" target="_blank"><img src="https://trendshift.io/api/badge/repositories/26207" alt="justrach%2Fcodedb | Trendshift" style="width: 250px; height: 55px;" width="250" height="55" /></a>
+</p>
+
 <h1 align="center">codedb</h1>
 
 <h3 align="center">Code intelligence server for AI agents. Zig core. MCP native. Zero dependencies.</h3>
