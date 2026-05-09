@@ -128,4 +128,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release upload "$RELEASE_TAG" assets/codedb-* assets/checksums.sha256 --clobber
+          gh release upload "$RELEASE_TAG" assets/codedb-* assets/checksums.sha256 --clobber --repo "$GITHUB_REPOSITORY"
