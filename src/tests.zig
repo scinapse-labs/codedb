@@ -11090,6 +11090,149 @@ test "issue-429-e: searchContent rerank penalises doc-language files so code bea
     try testing.expectEqualStrings("src/caller.zig", results[0].path);
 }
 
+test "issue-448-a: rerank boosts basename when query contains stem" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/aaa.zig", "// Explorer is mentioned here\n");
+    try explorer.indexFile("src/explore.zig", "// Explorer is mentioned here\n");
+
+    const results = try explorer.searchContent("Explorer", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 2);
+    try testing.expectEqualStrings("src/explore.zig", results[0].path);
+}
+
+test "issue-448-b: rerank symbol definition boost is case-insensitive" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("aaa.zig", "// store is mentioned here\n");
+    try explorer.indexFile("zzz.zig", "pub const Store = struct {};\n");
+
+    const results = try explorer.searchContent("store", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 2);
+    try testing.expectEqualStrings("zzz.zig", results[0].path);
+}
+
+test "issue-449: popular markdown should not disable Tier 0 code-first behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const md_block =
+        "fooBar mentioned here.\n" ++
+        "fooBar mentioned here.\n" ++
+        "fooBar mentioned here.\n" ++
+        "fooBar mentioned here.\n" ++
+        "fooBar mentioned here.\n";
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var path_buf: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "docs/notes_{d}.md", .{i});
+        try explorer.indexFile(path, md_block);
+    }
+
+    try explorer.indexFile("src/foo.zig",
+        "pub fn fooBar() void {}\n" ++
+            "pub fn caller1() void { fooBar(); }\n" ++
+            "pub fn caller2() void { fooBar(); }\n" ++
+            "pub fn caller3() void { fooBar(); }\n");
+
+    const results = try explorer.searchContent("fooBar", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    var found_source = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "src/foo.zig")) found_source = true;
+    }
+    try testing.expect(found_source);
+}
+
+test "issue-450: prefix tier respects max_results" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("a.zig", "const abcx = 1;\n");
+    try explorer.indexFile("b.zig", "const abcy = 1;\n");
+    try explorer.indexFile("c.zig", "const zzabczz = 1;\n");
+
+    const results = try explorer.searchContent("abc", testing.allocator, 2);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len <= 2);
+}
+
+test "issue-451: scope search surfaces skip-trigram canonical file" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var path_buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "small_{d}.zig", .{i});
+        try explorer.indexFile(path, "fn s() void { _ = widgetX; }\n");
+    }
+
+    const canonical_content =
+        "fn canonical() void {\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "}\n";
+    try explorer.indexFileSkipTrigram("canonical.zig", canonical_content);
+
+    const results = try explorer.searchContentWithScope("widgetX", testing.allocator, 5);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+            if (r.scope_name) |n| testing.allocator.free(n);
+        }
+        testing.allocator.free(results);
+    }
+
+    var found_canonical = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "canonical.zig")) found_canonical = true;
+    }
+    try testing.expect(found_canonical);
+}
+
 test "rerank-trace: appends one JSON line per searchContent when enabled" {
     const tmp_io = testing.io;
     var tmp = testing.tmpDir(.{});

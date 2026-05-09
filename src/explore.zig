@@ -1556,6 +1556,8 @@ pub const Explorer = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
+        if (max_results == 0) return try allocator.alloc(SearchResult, 0);
+
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
 
@@ -1563,47 +1565,65 @@ pub const Explorer = struct {
         var searched = std.StringHashMap(void).init(allocator);
         defer searched.deinit();
 
-        // Tier 0: word index direct lookup — O(1) hash lookup, no content scan.
-        // Issue #363a: a per-file cap forces diversity so a single hot doc
-        // file (CHANGELOG.md, architecture.md, etc.) can't saturate the quota
-        // and crowd out source-file matches that come later in the posting
-        // list. Cap = max(1, max_results / 5).
-        // Issue #430: process code-language hits FIRST, then doc-language
-        // hits. With max_results=50 the per-file cap is 10, so 5 markdown
-        // files with 10+ mentions each can fill result_list before the
-        // canonical source file's posting-list entries are reached.
+        // Tier 0: word index direct lookup — O(1) hash lookup plus bounded
+        // content extraction. A per-file cap forces diversity so a single hot
+        // file cannot saturate the quota. Code files are considered before
+        // docs, and files with more exact word hits are considered first so
+        // popular identifiers and skip-trigram canonical files are not hidden
+        // behind earlier low-signal posting-list entries.
         const word_hits = self.word_index.search(query);
-        if (word_hits.len > 0 and word_hits.len <= max_results * 2) {
-            const tier0_per_file_cap: usize = @max(1, max_results / 5);
-            var tier0_per_file = std.StringHashMap(usize).init(allocator);
-            defer tier0_per_file.deinit();
-            const passes = [_]bool{ false, true }; // pass 0 = code, pass 1 = doc
-            for (passes) |is_doc_pass| {
-                if (result_list.items.len >= max_results) break;
-                for (word_hits) |hit| {
-                    const hit_path = self.word_index.hitPath(hit);
-                    if (hit_path.len == 0) continue;
-                    if (isDocLanguage(detectLanguage(hit_path)) != is_doc_pass) continue;
-                    const gop = tier0_per_file.getOrPut(hit_path) catch continue;
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    if (gop.value_ptr.* >= tier0_per_file_cap) continue;
-                    const ref = self.readContentForSearch(hit_path, allocator) orelse continue;
-                    defer ref.deinit();
-                    const line_text = extractLineByNumber(ref.data, hit.line_num) orelse continue;
-                    if (indexOfCaseInsensitive(line_text, query) == null) continue;
-                    const duped_text = try allocator.dupe(u8, line_text);
-                    errdefer allocator.free(duped_text);
-                    const duped_path = try allocator.dupe(u8, hit_path);
-                    errdefer allocator.free(duped_path);
-                    try result_list.append(allocator, .{
-                        .path = duped_path,
-                        .line_num = hit.line_num,
-                        .line_text = duped_text,
-                    });
-                    gop.value_ptr.* += 1;
-                    searched.put(hit_path, {}) catch {};
-                    if (result_list.items.len >= max_results) return self.rerankAndFinalize(&result_list, query, allocator);
+        if (word_hits.len > 0) {
+            const Tier0File = struct {
+                path: []const u8,
+                count: u32,
+                first_seen: usize,
+            };
+
+            var tier0_files_by_path = std.StringHashMap(Tier0File).init(allocator);
+            defer tier0_files_by_path.deinit();
+
+            for (word_hits, 0..) |hit, ordinal| {
+                const hit_path = self.word_index.hitPath(hit);
+                if (hit_path.len == 0) continue;
+                const gop = tier0_files_by_path.getOrPut(hit_path) catch continue;
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{
+                        .path = hit_path,
+                        .count = 0,
+                        .first_seen = ordinal,
+                    };
                 }
+                gop.value_ptr.count +|= 1;
+            }
+
+            var tier0_files: std.ArrayList(Tier0File) = .empty;
+            defer tier0_files.deinit(allocator);
+            try tier0_files.ensureTotalCapacity(allocator, tier0_files_by_path.count());
+            var tier0_iter = tier0_files_by_path.valueIterator();
+            while (tier0_iter.next()) |stats| {
+                tier0_files.appendAssumeCapacity(stats.*);
+            }
+
+            if (tier0_files.items.len > 1) {
+                std.sort.block(Tier0File, tier0_files.items, {}, struct {
+                    pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
+                        const a_doc = isDocLanguage(detectLanguage(a.path));
+                        const b_doc = isDocLanguage(detectLanguage(b.path));
+                        if (a_doc != b_doc) return !a_doc;
+                        if (a.count != b.count) return a.count > b.count;
+                        if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
+                        return std.mem.lessThan(u8, a.path, b.path);
+                    }
+                }.lessThan);
+            }
+
+            const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
+            for (tier0_files.items) |stats| {
+                if (result_list.items.len >= max_results) break;
+                const ref = self.readContentForSearch(stats.path, allocator) orelse continue;
+                defer ref.deinit();
+                searched.put(stats.path, {}) catch {};
+                try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
             }
             if (result_list.items.len >= max_results)
                 return self.rerankAndFinalize(&result_list, query, allocator);
@@ -1634,6 +1654,8 @@ pub const Explorer = struct {
                 searched.put(hit_path, {}) catch {};
                 if (result_list.items.len >= max_results) break;
             }
+            if (result_list.items.len >= max_results)
+                return self.rerankAndFinalize(&result_list, query, allocator);
         }
 
         const candidate_paths = self.trigram_index.candidates(query, allocator);
@@ -1786,7 +1808,7 @@ pub const Explorer = struct {
 
         if (self.outlines.get(r.path)) |outline| {
             for (outline.symbols.items) |sym| {
-                if (sym.line_start == r.line_num and std.mem.eql(u8, sym.name, query)) {
+                if (sym.line_start == r.line_num and asciiEqlIgnoreCase(sym.name, query)) {
                     score += 5.0;
                     break;
                 }
@@ -1796,9 +1818,12 @@ pub const Explorer = struct {
         const basename = std.fs.path.basename(r.path);
         const stem_end = std.mem.indexOfScalar(u8, basename, '.') orelse basename.len;
         const stem = basename[0..stem_end];
+        const stem_contains_query = asciiContainsIgnoreCase(stem, query);
+        const query_contains_stem = asciiContainsIgnoreCase(query, stem);
+        const stem_related_to_query = stem_contains_query or query_contains_stem;
         if (asciiEqlIgnoreCase(stem, query)) {
             score += 15.0;
-        } else if (asciiContainsIgnoreCase(stem, query)) {
+        } else if (stem_related_to_query) {
             score += 8.0;
         }
         // Path-segment match boost: query matches a directory segment in
@@ -1806,7 +1831,7 @@ pub const Explorer = struct {
         // than basename match because the file's own name is a stronger
         // intent signal than the directory it lives in. Skip when basename
         // already matched to avoid double-counting.
-        if (!asciiContainsIgnoreCase(stem, query) and pathHasSegmentIgnoreCase(r.path, query)) {
+        if (!stem_related_to_query and pathHasSegmentIgnoreCase(r.path, query)) {
             score += 6.0;
         }
 
@@ -3849,8 +3874,14 @@ pub const Explorer = struct {
 
     /// Search content and annotate results with the enclosing symbol scope.
     pub fn searchContentWithScope(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const ScopedSearchResult {
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        const plain_results = try self.searchContent(query, allocator, max_results);
+        defer {
+            for (plain_results) |r| {
+                allocator.free(r.line_text);
+                allocator.free(r.path);
+            }
+            allocator.free(plain_results);
+        }
 
         var result_list: std.ArrayList(ScopedSearchResult) = .empty;
         errdefer {
@@ -3861,69 +3892,30 @@ pub const Explorer = struct {
             }
             result_list.deinit(allocator);
         }
+        try result_list.ensureTotalCapacity(allocator, plain_results.len);
 
-        const sparse_paths = self.sparse_ngram_index.candidates(query, allocator);
-        defer if (sparse_paths) |sp| allocator.free(sp);
-        const candidate_paths = self.trigram_index.candidates(query, allocator);
-        defer if (candidate_paths) |cp| allocator.free(cp);
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
 
-        var searched = std.StringHashMap(void).init(allocator);
-        defer searched.deinit();
+        for (plain_results) |r| {
+            const line_text = try allocator.dupe(u8, r.line_text);
+            errdefer allocator.free(line_text);
+            const path_copy = try allocator.dupe(u8, r.path);
+            errdefer allocator.free(path_copy);
 
-        if (sparse_paths != null and sparse_paths.?.len > 0) {
-            if (candidate_paths != null and candidate_paths.?.len > 0) {
-                var sparse_set = std.StringHashMap(void).init(allocator);
-                defer sparse_set.deinit();
-                for (sparse_paths.?) |p| try sparse_set.put(p, {});
-                for (candidate_paths.?) |path| {
-                    if (!sparse_set.contains(path)) continue;
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try self.searchInContentWithScope(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            } else {
-                for (sparse_paths.?) |path| {
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try self.searchInContentWithScope(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            }
-        } else {
-            const use_trigram = candidate_paths != null and candidate_paths.?.len > 0;
-            if (use_trigram) {
-                for (candidate_paths.?) |path| {
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try self.searchInContentWithScope(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            } else {
-                var iter = self.outlines.keyIterator();
-                while (iter.next()) |key_ptr| {
-                    const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
-                    defer ref.deinit();
-                    try self.searchInContentWithScope(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-                return result_list.toOwnedSlice(allocator);
-            }
-        }
+            const scope = self.findEnclosingSymbolLocked(r.path, r.line_num);
+            const scope_name = if (scope) |s| try allocator.dupe(u8, s.name) else null;
+            errdefer if (scope_name) |n| allocator.free(n);
 
-        if (result_list.items.len < max_results) {
-            var iter = self.outlines.keyIterator();
-            while (iter.next()) |key_ptr| {
-                if (searched.contains(key_ptr.*)) continue;
-                if (self.trigram_index.containsFile(key_ptr.*)) continue;
-                const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
-                defer ref.deinit();
-                try self.searchInContentWithScope(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
-                if (result_list.items.len >= max_results) break;
-            }
+            result_list.appendAssumeCapacity(.{
+                .path = path_copy,
+                .line_num = r.line_num,
+                .line_text = line_text,
+                .scope_name = scope_name,
+                .scope_kind = if (scope) |s| s.kind else null,
+                .scope_start = if (scope) |s| s.line_start else 0,
+                .scope_end = if (scope) |s| s.line_end else 0,
+            });
         }
 
         return result_list.toOwnedSlice(allocator);
@@ -4119,7 +4111,7 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
 }
 
 fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
-    if (query.len == 0 or content.len == 0) return;
+    if (query.len == 0 or content.len == 0 or max_per_file == 0 or max_results == 0 or result_list.items.len >= max_results) return;
     // Issue #431: bail when the query is longer than the file. Without this
     // guard, `content.len - query.len + 1` below underflows usize → integer
     // overflow panic in Debug, SIGBUS in ReleaseFast.
@@ -4141,7 +4133,7 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
     const splat_lo: Vec = @splat(first_lower);
     const splat_hi: Vec = @splat(first_upper);
 
-    while (pos < end) {
+    scan: while (pos < end) {
         // ── SIMD path: process full 16-byte chunks ──
         if (pos + VW <= end) {
             const chunk: Vec = content[pos..][0..VW].*;
@@ -4155,7 +4147,6 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
             }
 
             // Process ALL first-byte candidates in this chunk without reloading.
-            var found_match = false;
             while (mask != 0) {
                 const offset: usize = @ctz(mask);
                 const cand = pos + offset;
@@ -4185,12 +4176,12 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
                     current_line += 1;
                     current_line_start = line_end + 1;
                     pos = line_end + 1;
-                    found_match = true;
-                    break; // restart outer loop from new line
+                    if (pos >= end) return;
+                    continue :scan;
                 }
                 mask &= mask - 1; // clear lowest bit, try next candidate in chunk
             }
-            if (!found_match) pos += VW; // all candidates were false positives
+            pos += VW; // all candidates were false positives
             continue;
         }
 
