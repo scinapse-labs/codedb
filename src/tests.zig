@@ -3779,7 +3779,8 @@ test "snapshot: writer streams uncached file contents for large repos" {
     }
 
     try testing.expectEqual(@as(usize, 1002), exp.outlines.count());
-    try testing.expect(exp.contents.count() < exp.outlines.count());
+    // With CLOCK eviction (#208) the ContentCache holds up to 16384 entries — all 1002 fit.
+    try testing.expectEqual(@as(u32, 1002), exp.contents.count());
 
     const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/large.codedb", .{dir_path});
     defer testing.allocator.free(snap_path);
@@ -3792,8 +3793,10 @@ test "snapshot: writer streams uncached file contents for large repos" {
 
     try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &loaded_without_root, &store_without_root, testing.allocator));
     try testing.expectEqual(@as(usize, 1002), loaded_without_root.outlines.count());
-    try testing.expect(loaded_without_root.contents.count() < loaded_without_root.outlines.count());
-    try testing.expectError(error.WordIndexIncomplete, loaded_without_root.searchWord("func_1001", testing.allocator));
+    // CLOCK cache holds all 1002 — word index can be rebuilt from memory without root dir.
+    const hits_no_root = try loaded_without_root.searchWord("func_1001", testing.allocator);
+    defer testing.allocator.free(hits_no_root);
+    try testing.expectEqual(@as(usize, 1), hits_no_root.len);
 
     var loaded = Explorer.init(testing.allocator);
     loaded.setRoot(io, dir_path);
@@ -3803,7 +3806,6 @@ test "snapshot: writer streams uncached file contents for large repos" {
 
     try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &loaded, &store, testing.allocator));
     try testing.expectEqual(@as(usize, 1002), loaded.outlines.count());
-    try testing.expect(loaded.contents.count() < loaded.outlines.count());
 
     const hits = try loaded.searchWord("func_1001", testing.allocator);
     defer testing.allocator.free(hits);
@@ -10340,9 +10342,10 @@ test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     try testing.expectEqual(@as(u64, 0x555), entry.versions.items[2].hash);
 }
 
-test "issue-102: Explorer.content_cache_limit is configurable (caps cached files)" {
-    // Default limit is 1000. After setting content_cache_limit = 2, indexing
-    // 5 files must leave at most 2 in the content cache.
+test "issue-102: Explorer.content_cache_limit field is retained" {
+    // The content_cache_limit field is preserved for API compatibility.
+    // With CLOCK eviction (#208) the field no longer gates put() calls —
+    // the ContentCache capacity (16384) is the actual bound.
     var explorer = Explorer.init(testing.allocator);
     defer explorer.deinit();
 
@@ -10354,11 +10357,10 @@ test "issue-102: Explorer.content_cache_limit is configurable (caps cached files
     try explorer.indexFile("d.zig", "pub fn d() void {}\n");
     try explorer.indexFile("e.zig", "pub fn e() void {}\n");
 
-    // All 5 outlines are indexed...
+    // All 5 outlines are indexed and the cache holds all 5 (CLOCK evicts only
+    // when the fixed-capacity slot array is under probe-window pressure).
     try testing.expectEqual(@as(usize, 5), explorer.outlines.count());
-    // ...but the content cache is capped at the configured limit. The
-    // implementation stops caching once outlines.count() > limit.
-    try testing.expect(explorer.contents.count() <= 2);
+    try testing.expectEqual(@as(u32, 5), explorer.contents.count());
 }
 
 test "issue-101+102: Config.parse wires into Store.max_versions and Explorer.content_cache_limit" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ContentCache = @import("hot_cache.zig").ContentCache;
 const nanoregex = @import("nanoregex");
 const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
@@ -496,7 +497,7 @@ fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start
 pub const Explorer = struct {
     outlines: std.StringHashMap(FileOutline),
     dep_graph: DependencyGraph,
-    contents: std.StringHashMap([]const u8),
+    contents: ContentCache,
     symbol_index: std.StringHashMap(std.ArrayList(SymbolLocation)),
     word_index: WordIndex,
     trigram_index: AnyTrigramIndex,
@@ -529,7 +530,7 @@ pub const Explorer = struct {
         return .{
             .outlines = std.StringHashMap(FileOutline).init(allocator),
             .dep_graph = DependencyGraph.init(allocator),
-            .contents = std.StringHashMap([]const u8).init(allocator),
+            .contents = ContentCache.init(allocator, 16384),
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .word_index = WordIndex.init(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
@@ -555,10 +556,6 @@ pub const Explorer = struct {
         }
         self.symbol_index.deinit();
 
-        var content_iter = self.contents.iterator();
-        while (content_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
         self.contents.deinit();
 
         self.word_index.deinit();
@@ -588,11 +585,7 @@ pub const Explorer = struct {
     pub fn releaseContents(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
-        var content_iter = self.contents.iterator();
-        while (content_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.contents.clearAndFree();
+        self.contents.clear();
     }
 
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
@@ -650,37 +643,8 @@ pub const Explorer = struct {
 
         persistent_outline.path = stable_path;
 
-        // Only cache file content when under the threshold — caps peak RSS.
-        // Beyond this, readContentForSearch falls back to disk reads.
-        // Indexes (word, trigram) use the `content` parameter directly, not the cache.
-        // User-configurable via .codedbrc (#102).
-        const content_cache_limit: u32 = self.content_cache_limit;
-        const should_cache = self.outlines.count() <= content_cache_limit;
-        var prior_content: ?[]const u8 = null;
-        if (should_cache) {
-            const duped_content = try self.allocator.dupe(u8, content);
-            errdefer self.allocator.free(duped_content);
-            const content_gop = try self.contents.getOrPut(stable_path);
-            if (content_gop.found_existing) {
-                prior_content = content_gop.value_ptr.*;
-            } else {
-                content_gop.key_ptr.* = stable_path;
-            }
-            content_gop.value_ptr.* = duped_content;
-        } else {
-            // Even above the limit, check if this file was previously cached
-            // (re-index of a file that was indexed early)
-            prior_content = self.contents.get(stable_path);
-        }
-        errdefer if (should_cache) {
-            if (prior_content != null) {
-                if (self.contents.getPtr(stable_path)) |ptr| {
-                    ptr.* = prior_content.?;
-                }
-            } else {
-                _ = self.contents.remove(stable_path);
-            }
-        };
+        try self.contents.put(stable_path, content);
+        const prior_content: ?[]const u8 = null;
 
         if (full_index) {
             if (!self.word_index_complete) {
@@ -712,9 +676,6 @@ pub const Explorer = struct {
         self.rebuildSymbolIndexFor(stable_path, &persistent_outline);
 
         outline_gop.value_ptr.* = persistent_outline;
-        if (should_cache) {
-            if (prior_content) |old_content| self.allocator.free(old_content);
-        }
         if (prior_outline) |*old_outline| old_outline.deinit();
     }
 
@@ -1123,7 +1084,7 @@ pub const Explorer = struct {
         var iter = self.contents.iterator();
         while (iter.next()) |entry| {
             // Skip large files to prevent OOM on large repos
-            if (entry.value_ptr.len > 64 * 1024) continue;
+            if (entry.value_ptr.*.len > 64 * 1024) continue;
             self.trigram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
                 error.OutOfMemory => {
                     std.log.warn("trigram OOM, skipping remaining files", .{});
@@ -1147,7 +1108,7 @@ pub const Explorer = struct {
             self.mu.lockShared();
             defer self.mu.unlockShared();
 
-            if (self.contents.count() == self.outlines.count()) break :blk null;
+            if (self.contents.len() == self.outlines.count()) break :blk null;
             if (self.io == null or self.root_dir == null) return error.WordIndexIncomplete;
 
             var paths: std.ArrayList([]u8) = .empty;
@@ -1279,10 +1240,7 @@ pub const Explorer = struct {
         }
         self.dep_graph.remove(path);
         self.removeSymbolIndexFor(path);
-        if (self.contents.getPtr(path)) |content| {
-            self.allocator.free(content.*);
-            _ = self.contents.remove(path);
-        }
+        self.contents.remove(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
         self.sparse_ngram_index.removeFile(path);
@@ -1681,7 +1639,7 @@ pub const Explorer = struct {
                     gop_h.value_ptr.* += 1;
                 }
                 const SortCtx = struct {
-                    contents: *const std.StringHashMap([]const u8),
+                    contents: *ContentCache,
                     counts: *const std.StringHashMap(u32),
                     pub fn lessThan(ctx: @This(), a: []const u8, b: []const u8) bool {
                         const a_count = ctx.counts.get(a) orelse 0;
@@ -2181,7 +2139,7 @@ pub const Explorer = struct {
     pub fn searchWord(self: *Explorer, word: []const u8, allocator: std.mem.Allocator) ![]const idx.WordHit {
         self.mu.lockShared();
         const needs_rebuild = !self.word_index_complete and
-            (self.contents.count() > 0 or (self.io != null and self.root_dir != null));
+            (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
         self.mu.unlockShared();
         if (needs_rebuild) {
             try self.rebuildWordIndex();

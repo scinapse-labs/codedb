@@ -186,6 +186,14 @@ pub const ContentCache = struct {
         return self.count_;
     }
 
+    pub fn count(self: *const ContentCache) u32 {
+        return self.count_;
+    }
+
+    pub fn contains(self: *ContentCache, key: []const u8) bool {
+        return self.get(key) != null;
+    }
+
     pub fn stats(self: *const ContentCache) Stats {
         return .{
             .hits = self.hits_.load(.monotonic),

@@ -697,7 +697,7 @@ fn insertRestoredFile(
     content: []const u8,
     outline: FileOutline,
     allocator: std.mem.Allocator,
-) !bool {
+) !void {
     var restored_outline = outline;
     restored_outline.path = path;
 
@@ -706,17 +706,9 @@ fn insertRestoredFile(
     outline_gop.key_ptr.* = path;
     outline_gop.value_ptr.* = restored_outline;
 
-    const content_cache_limit: u32 = explorer.content_cache_limit;
-    const should_cache = explorer.outlines.count() <= content_cache_limit;
-    if (should_cache) {
-        const content_gop = try explorer.contents.getOrPut(path);
-        if (content_gop.found_existing) return error.InvalidData;
-        content_gop.key_ptr.* = path;
-        content_gop.value_ptr.* = content;
-    }
+    try explorer.contents.put(path, content);
 
     try rebuildDepsFromOutline(explorer, path, &restored_outline, allocator);
-    return should_cache;
 }
 
 fn loadSnapshotFast(
@@ -817,7 +809,7 @@ fn loadSnapshotFast(
             allocator.free(content);
         } else if (outline_states.fetchRemove(path_buf)) |removed| {
             allocator.free(path_buf);
-            const content_cached = insertRestoredFile(explorer, removed.key, content, removed.value, allocator) catch {
+            insertRestoredFile(explorer, removed.key, content, removed.value, allocator) catch {
                 allocator.free(removed.key);
                 var bad_outline = removed.value;
                 bad_outline.deinit();
@@ -826,7 +818,7 @@ fn loadSnapshotFast(
             };
             const hash = std.hash.Wyhash.hash(0, content);
             _ = store.recordSnapshot(removed.key, content.len, hash) catch {};
-            if (!content_cached) allocator.free(content);
+            allocator.free(content);
         } else {
             word_index_can_load_from_disk = false;
             explorer.indexFileOutlineOnly(path_buf, content) catch {
