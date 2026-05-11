@@ -1793,7 +1793,7 @@ pub const Explorer = struct {
 
         if (self.outlines.get(r.path)) |outline| {
             for (outline.symbols.items) |sym| {
-                if (sym.line_start == r.line_num and std.mem.eql(u8, sym.name, query)) {
+                if (sym.line_start == r.line_num and asciiEqlIgnoreCase(sym.name, query)) {
                     score += 5.0;
                     break;
                 }
@@ -1807,13 +1807,20 @@ pub const Explorer = struct {
             score += 15.0;
         } else if (asciiContainsIgnoreCase(stem, query)) {
             score += 8.0;
+        } else if (stem.len >= 3 and asciiContainsIgnoreCase(query, stem)) {
+            // Issue #448: symmetric stem/query containment. Query "Explorer"
+            // should boost src/explore.zig — the user's intent clearly names
+            // the file even though stem "explore" doesn't contain "Explorer".
+            // Gate on stem.len>=3 so trivial stems (single-letter files,
+            // numeric basenames) don't false-boost long queries.
+            score += 8.0;
         }
         // Path-segment match boost: query matches a directory segment in
         // the path (e.g. query="parser" boosts src/parser/foo.zig). Weaker
         // than basename match because the file's own name is a stronger
         // intent signal than the directory it lives in. Skip when basename
         // already matched to avoid double-counting.
-        if (!asciiContainsIgnoreCase(stem, query) and pathHasSegmentIgnoreCase(r.path, query)) {
+        if (!asciiContainsIgnoreCase(stem, query) and !(stem.len >= 3 and asciiContainsIgnoreCase(query, stem)) and pathHasSegmentIgnoreCase(r.path, query)) {
             score += 6.0;
         }
 
@@ -4127,6 +4134,11 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
 
 fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
     if (query.len == 0 or content.len == 0) return;
+    // Issue #450: bail when the caller's quota is already met. Without this
+    // entry guard, Tier 0.5 prefix expansion can fill result_list to
+    // max_results, then Tier 1 trigram scans append one more match before
+    // its post-call cap check fires — overshooting the contract by one.
+    if (result_list.items.len >= max_results) return;
     // Issue #431: bail when the query is longer than the file. Without this
     // guard, `content.len - query.len + 1` below underflows usize → integer
     // overflow panic in Debug, SIGBUS in ReleaseFast.
