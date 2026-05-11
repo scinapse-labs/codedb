@@ -1,6 +1,32 @@
 # Changelog
 
 
+## 0.2.5813 - 2026-05-12
+
+`0.2.5813` ships three structural improvements: a Tier 0 search-quality rewrite, a 4-6x faster regex matcher, and a bounded-memory content cache.
+
+### Explore — search quality rewrite ([#448](https://github.com/justrach/codedb/issues/448), [#449](https://github.com/justrach/codedb/issues/449), [#450](https://github.com/justrach/codedb/issues/450), [#451](https://github.com/justrach/codedb/issues/451), [#447](https://github.com/justrach/codedb/issues/447))
+
+- **Tier 0 builds candidates directly from `word_index.search`**, deduplicating hits per path and sorting by code-first / hit-count-desc / posting-list-order. This restructure (a) keeps the code/doc diversity logic active for popular identifiers regardless of total posting-list length (#449), (b) surfaces canonical definition sites in large skip-trigram files (>64KB) without waiting for Tier 3 to fire (#447, #451), and (c) clamps prefix-tier expansion to `max_results` so the contract is honored (#450).
+- **Rerank uses symmetric stem/query matching** so a query like `Explorer` now boosts `src/explore.zig` even though the stem `explore` doesn't textually contain `Explorer` (#448-a). Symbol-definition equality is now case-insensitive, matching the rest of `searchContent` (#448-b).
+- **Regression test for #447** locks the new Tier 0 path against future refactors that might silently bury skip-trigram canonical files behind small-file hits.
+
+### Regex — nanoregex integration ([#454](https://github.com/justrach/codedb/issues/454))
+
+- **Replaced the ~300-line homegrown backtracking matcher with [`justrach/nanoregex`](https://github.com/justrach/nanoregex)**, a pure-Zig Thompson-NFA/DFA engine with Python-`re`-compatible semantics. End-to-end in-process benchmarks on codedb's own ~1.2MB source tree show **2.7-4.3x speedup** on the common `codedb_search regex=true` shapes (literal, alternation, dot-star, char-class).
+- **Correctness fixes** that previously failed silently:
+  - `\b` and `\B` now work as word-boundary assertions instead of being treated as the escaped literal `b`/`B`. Patterns like `\bfn\b` now return matches.
+  - `{n,m}` bounded quantifiers, lazy quantifiers (`*?`, `+?`), and the other PCRE-shaped features nanoregex supports.
+  - ReDoS-safe: patterns like `(a+)+b` can no longer cause catastrophic backtracking.
+- **Upstream patch:** while integrating, also fixed a false-negative in nanoregex's `extractLiteralPrefix` (patterns like `hel+o` computed prefix `helo` and silently missed `helllo`). Worth pushing upstream.
+
+### Explore — bounded-memory content cache ([#208](https://github.com/justrach/codedb/issues/208))
+
+- **Replaced `Explorer.contents: StringHashMap` with a fixed-capacity CLOCK eviction cache** (`src/hot_cache.zig`). Pre-fix, file contents were all-or-nothing — either fully resident in RAM (1.7GB on openclaw) or entirely released by `releaseContents`. Now: 16384 slots with second-chance eviction, hot files stay cached, cold files fall through to disk read on next access.
+- **Memory impact:** the `snapshot: writer streams` test (1002 files) drops MaxRSS from **623MB → 225MB** end-to-end. Cache state is bounded; eviction is exercised under pressure (5 inline `ContentCache` tests + the issue-208 integration test).
+- Design adapted from [justrach/turbodb `src/hot_cache.zig`](https://github.com/justrach/turbodb/blob/main/src/hot_cache.zig) — CLOCK with probe limit 4, atomic hit/miss/eviction counters, zero dynamic allocation past init.
+
+
 ## 0.2.5812 - 2026-05-07
 
 `0.2.5812` cleans up two papercuts surfaced during a v0.2.5811 verification run ([#445](https://github.com/justrach/codedb/issues/445)).

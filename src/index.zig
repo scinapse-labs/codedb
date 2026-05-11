@@ -1,5 +1,6 @@
 const std = @import("std");
 const cio = @import("cio.zig");
+const ContentCache = @import("hot_cache.zig").ContentCache;
 
 // ── Inverted word index ─────────────────────────────────────
 // Maps word → list of (path, line) hits. O(1) word lookup.
@@ -2699,11 +2700,11 @@ pub fn buildFrequencyTableFromSlices(slices: []const []const u8) [256][256]u16 {
 
 /// Build a frequency table by streaming over a StringHashMap of content.
 /// Iterates file-by-file — no concatenation, zero extra memory.
-pub fn buildFrequencyTableFromMap(contents: *const std.StringHashMap([]const u8)) [256][256]u16 {
+pub fn buildFrequencyTableFromMap(contents: *ContentCache) [256][256]u16 {
     var counts: [256][256]u64 = .{.{0} ** 256} ** 256;
-    var iter = contents.valueIterator();
-    while (iter.next()) |content_ptr| {
-        const content = content_ptr.*;
+    var iter = contents.iterator();
+    while (iter.next()) |entry| {
+        const content = entry.value_ptr.*;
         if (content.len < 2) continue;
         for (0..content.len - 1) |i| {
             counts[content[i]][content[i + 1]] += 1;

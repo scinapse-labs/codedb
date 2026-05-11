@@ -2634,6 +2634,17 @@ test "regexMatch: dot-star" {
     try testing.expect(regexMatch("helloworld", "hello.*world"));
 }
 
+test "issue-454: regex \\b word boundary matches whole-word, not literal 'b'" {
+    // \b is a word-boundary assertion: should match "foo" as a whole word
+    // but not when it appears as a substring inside another word.
+    try testing.expect(regexMatch("foo bar", "\\bfoo\\b"));
+    try testing.expect(!regexMatch("foobar", "\\bfoo\\b"));
+    // Whole-word "bar" at end
+    try testing.expect(regexMatch("foo bar", "\\bbar\\b"));
+    try testing.expect(!regexMatch("foobarbaz", "\\bbar\\b"));
+}
+
+
 test "explorer: searchContentRegex end-to-end" {
     var explorer_inst = Explorer.init(testing.allocator);
     defer explorer_inst.deinit();
@@ -3768,7 +3779,8 @@ test "snapshot: writer streams uncached file contents for large repos" {
     }
 
     try testing.expectEqual(@as(usize, 1002), exp.outlines.count());
-    try testing.expect(exp.contents.count() < exp.outlines.count());
+    // With CLOCK eviction (#208) the ContentCache holds up to 16384 entries — all 1002 fit.
+    try testing.expectEqual(@as(u32, 1002), exp.contents.count());
 
     const snap_path = try std.fmt.allocPrint(testing.allocator, "{s}/large.codedb", .{dir_path});
     defer testing.allocator.free(snap_path);
@@ -3781,8 +3793,10 @@ test "snapshot: writer streams uncached file contents for large repos" {
 
     try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &loaded_without_root, &store_without_root, testing.allocator));
     try testing.expectEqual(@as(usize, 1002), loaded_without_root.outlines.count());
-    try testing.expect(loaded_without_root.contents.count() < loaded_without_root.outlines.count());
-    try testing.expectError(error.WordIndexIncomplete, loaded_without_root.searchWord("func_1001", testing.allocator));
+    // CLOCK cache holds all 1002 — word index can be rebuilt from memory without root dir.
+    const hits_no_root = try loaded_without_root.searchWord("func_1001", testing.allocator);
+    defer testing.allocator.free(hits_no_root);
+    try testing.expectEqual(@as(usize, 1), hits_no_root.len);
 
     var loaded = Explorer.init(testing.allocator);
     loaded.setRoot(io, dir_path);
@@ -3792,7 +3806,6 @@ test "snapshot: writer streams uncached file contents for large repos" {
 
     try testing.expect(snapshot_mod.loadSnapshot(io, snap_path, &loaded, &store, testing.allocator));
     try testing.expectEqual(@as(usize, 1002), loaded.outlines.count());
-    try testing.expect(loaded.contents.count() < loaded.outlines.count());
 
     const hits = try loaded.searchWord("func_1001", testing.allocator);
     defer testing.allocator.free(hits);
@@ -10329,9 +10342,10 @@ test "issue-101: Store.max_versions is configurable (caps per-file history)" {
     try testing.expectEqual(@as(u64, 0x555), entry.versions.items[2].hash);
 }
 
-test "issue-102: Explorer.content_cache_limit is configurable (caps cached files)" {
-    // Default limit is 1000. After setting content_cache_limit = 2, indexing
-    // 5 files must leave at most 2 in the content cache.
+test "issue-102: Explorer.content_cache_limit field is retained" {
+    // The content_cache_limit field is preserved for API compatibility.
+    // With CLOCK eviction (#208) the field no longer gates put() calls —
+    // the ContentCache capacity (16384) is the actual bound.
     var explorer = Explorer.init(testing.allocator);
     defer explorer.deinit();
 
@@ -10343,11 +10357,10 @@ test "issue-102: Explorer.content_cache_limit is configurable (caps cached files
     try explorer.indexFile("d.zig", "pub fn d() void {}\n");
     try explorer.indexFile("e.zig", "pub fn e() void {}\n");
 
-    // All 5 outlines are indexed...
+    // All 5 outlines are indexed and the cache holds all 5 (CLOCK evicts only
+    // when the fixed-capacity slot array is under probe-window pressure).
     try testing.expectEqual(@as(usize, 5), explorer.outlines.count());
-    // ...but the content cache is capped at the configured limit. The
-    // implementation stops caching once outlines.count() > limit.
-    try testing.expect(explorer.contents.count() <= 2);
+    try testing.expectEqual(@as(u32, 5), explorer.contents.count());
 }
 
 test "issue-101+102: Config.parse wires into Store.max_versions and Explorer.content_cache_limit" {
@@ -11090,6 +11103,189 @@ test "issue-429-e: searchContent rerank penalises doc-language files so code bea
     try testing.expectEqualStrings("src/caller.zig", results[0].path);
 }
 
+test "issue-448-a: rerank boosts basename when query contains stem" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("src/aaa.zig", "// Explorer is mentioned here\n");
+    try explorer.indexFile("src/explore.zig", "// Explorer is mentioned here\n");
+
+    const results = try explorer.searchContent("Explorer", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 2);
+    try testing.expectEqualStrings("src/explore.zig", results[0].path);
+}
+
+test "issue-448-b: rerank symbol definition boost is case-insensitive" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("aaa.zig", "// store is mentioned here\n");
+    try explorer.indexFile("zzz.zig", "pub const Store = struct {};\n");
+
+    const results = try explorer.searchContent("store", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len >= 2);
+    try testing.expectEqualStrings("zzz.zig", results[0].path);
+}
+
+test "issue-449: popular markdown should not disable Tier 0 code-first behavior" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    const md_block =
+        "fooBar mentioned here.\n" ++
+        "fooBar mentioned here.\n" ++
+        "fooBar mentioned here.\n" ++
+        "fooBar mentioned here.\n" ++
+        "fooBar mentioned here.\n";
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var path_buf: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "docs/notes_{d}.md", .{i});
+        try explorer.indexFile(path, md_block);
+    }
+
+    try explorer.indexFile("src/foo.zig",
+        "pub fn fooBar() void {}\n" ++
+            "pub fn caller1() void { fooBar(); }\n" ++
+            "pub fn caller2() void { fooBar(); }\n" ++
+            "pub fn caller3() void { fooBar(); }\n");
+
+    const results = try explorer.searchContent("fooBar", testing.allocator, 10);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    var found_source = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "src/foo.zig")) found_source = true;
+    }
+    try testing.expect(found_source);
+}
+
+test "issue-450: prefix tier respects max_results" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    try explorer.indexFile("a.zig", "const abcx = 1;\n");
+    try explorer.indexFile("b.zig", "const abcy = 1;\n");
+    try explorer.indexFile("c.zig", "const zzabczz = 1;\n");
+
+    const results = try explorer.searchContent("abc", testing.allocator, 2);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+        }
+        testing.allocator.free(results);
+    }
+
+    try testing.expect(results.len <= 2);
+}
+
+test "issue-451: scope search surfaces skip-trigram canonical file" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var path_buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "small_{d}.zig", .{i});
+        try explorer.indexFile(path, "fn s() void { _ = widgetX; }\n");
+    }
+
+    const canonical_content =
+        "fn canonical() void {\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "}\n";
+    try explorer.indexFileSkipTrigram("canonical.zig", canonical_content);
+
+    const results = try explorer.searchContentWithScope("widgetX", testing.allocator, 5);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.path);
+            testing.allocator.free(r.line_text);
+            if (r.scope_name) |n| testing.allocator.free(n);
+        }
+        testing.allocator.free(results);
+    }
+
+    var found_canonical = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "canonical.zig")) found_canonical = true;
+    }
+    try testing.expect(found_canonical);
+}
+
+test "issue-447: searchContent surfaces large (>64KB) skip-trigram files for common identifiers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var explorer = Explorer.init(arena.allocator());
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var path_buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "small_{d}.zig", .{i});
+        try explorer.indexFile(path, "fn s() void { _ = widgetX; }\n");
+    }
+
+    const canonical_content =
+        "fn canonical() void {\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "    _ = widgetX;\n" ++
+        "}\n";
+    try explorer.indexFileSkipTrigram("canonical.zig", canonical_content);
+
+    const results = try explorer.searchContent("widgetX", testing.allocator, 5);
+    defer {
+        for (results) |r| {
+            testing.allocator.free(r.line_text);
+            testing.allocator.free(r.path);
+        }
+        testing.allocator.free(results);
+    }
+
+    var found_canonical = false;
+    for (results) |r| {
+        if (std.mem.eql(u8, r.path, "canonical.zig")) found_canonical = true;
+    }
+    try testing.expect(found_canonical);
+}
+
+
+
 test "rerank-trace: appends one JSON line per searchContent when enabled" {
     const tmp_io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -11274,4 +11470,47 @@ test "rerank-trace: single-result query records non-zero rerank score" {
 
     try testing.expect(std.mem.indexOf(u8, data, "\"score\":0.0000") == null);
     try testing.expect(std.mem.indexOf(u8, data, "src/loneSym.zig") != null);
+}
+
+test "issue-208: content cache evicts cold entries under pressure" {
+    const ContentCache = @import("hot_cache.zig").ContentCache;
+    const cap = 50;
+    var cache = try ContentCache.initAlloc(testing.allocator, cap);
+    defer cache.deinit();
+
+    var key_buf: [32]u8 = undefined;
+    var val_buf: [32]u8 = undefined;
+
+    // Insert 100 keys into a cache with capacity 50.
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const k = std.fmt.bufPrint(&key_buf, "file_{d}.zig", .{i}) catch unreachable;
+        const v = std.fmt.bufPrint(&val_buf, "content_{d}", .{i}) catch unreachable;
+        try cache.put(k, v);
+    }
+
+    // Cache must not exceed capacity.
+    try testing.expect(cache.len() <= cap);
+
+    // Touch keys 0..10 to mark them hot (set ref bit).
+    i = 0;
+    while (i < 10) : (i += 1) {
+        const k = std.fmt.bufPrint(&key_buf, "file_{d}.zig", .{i}) catch unreachable;
+        _ = cache.get(k);
+    }
+
+    // Insert 20 more keys to trigger further eviction.
+    i = 100;
+    while (i < 120) : (i += 1) {
+        const k = std.fmt.bufPrint(&key_buf, "file_{d}.zig", .{i}) catch unreachable;
+        const v = std.fmt.bufPrint(&val_buf, "content_{d}", .{i}) catch unreachable;
+        try cache.put(k, v);
+    }
+
+    // Still bounded by capacity.
+    try testing.expect(cache.len() <= cap);
+
+    // Evictions must have fired.
+    const s = cache.stats();
+    try testing.expect(s.evictions > 0);
 }

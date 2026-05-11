@@ -1,4 +1,6 @@
 const std = @import("std");
+const ContentCache = @import("hot_cache.zig").ContentCache;
+const nanoregex = @import("nanoregex");
 const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
 const idx = @import("index.zig");
@@ -495,7 +497,7 @@ fn matchGlobRec(pattern: []const u8, gi_start: usize, path: []const u8, ti_start
 pub const Explorer = struct {
     outlines: std.StringHashMap(FileOutline),
     dep_graph: DependencyGraph,
-    contents: std.StringHashMap([]const u8),
+    contents: ContentCache,
     symbol_index: std.StringHashMap(std.ArrayList(SymbolLocation)),
     word_index: WordIndex,
     trigram_index: AnyTrigramIndex,
@@ -528,7 +530,7 @@ pub const Explorer = struct {
         return .{
             .outlines = std.StringHashMap(FileOutline).init(allocator),
             .dep_graph = DependencyGraph.init(allocator),
-            .contents = std.StringHashMap([]const u8).init(allocator),
+            .contents = ContentCache.init(allocator, 16384),
             .symbol_index = std.StringHashMap(std.ArrayList(SymbolLocation)).init(allocator),
             .word_index = WordIndex.init(allocator),
             .trigram_index = .{ .heap = TrigramIndex.init(allocator) },
@@ -554,10 +556,6 @@ pub const Explorer = struct {
         }
         self.symbol_index.deinit();
 
-        var content_iter = self.contents.iterator();
-        while (content_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
         self.contents.deinit();
 
         self.word_index.deinit();
@@ -587,11 +585,7 @@ pub const Explorer = struct {
     pub fn releaseContents(self: *Explorer) void {
         self.mu.lock();
         defer self.mu.unlock();
-        var content_iter = self.contents.iterator();
-        while (content_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.contents.clearAndFree();
+        self.contents.clear();
     }
 
     pub fn releaseSecondaryIndexes(self: *Explorer) void {
@@ -649,37 +643,8 @@ pub const Explorer = struct {
 
         persistent_outline.path = stable_path;
 
-        // Only cache file content when under the threshold — caps peak RSS.
-        // Beyond this, readContentForSearch falls back to disk reads.
-        // Indexes (word, trigram) use the `content` parameter directly, not the cache.
-        // User-configurable via .codedbrc (#102).
-        const content_cache_limit: u32 = self.content_cache_limit;
-        const should_cache = self.outlines.count() <= content_cache_limit;
-        var prior_content: ?[]const u8 = null;
-        if (should_cache) {
-            const duped_content = try self.allocator.dupe(u8, content);
-            errdefer self.allocator.free(duped_content);
-            const content_gop = try self.contents.getOrPut(stable_path);
-            if (content_gop.found_existing) {
-                prior_content = content_gop.value_ptr.*;
-            } else {
-                content_gop.key_ptr.* = stable_path;
-            }
-            content_gop.value_ptr.* = duped_content;
-        } else {
-            // Even above the limit, check if this file was previously cached
-            // (re-index of a file that was indexed early)
-            prior_content = self.contents.get(stable_path);
-        }
-        errdefer if (should_cache) {
-            if (prior_content != null) {
-                if (self.contents.getPtr(stable_path)) |ptr| {
-                    ptr.* = prior_content.?;
-                }
-            } else {
-                _ = self.contents.remove(stable_path);
-            }
-        };
+        try self.contents.put(stable_path, content);
+        const prior_content: ?[]const u8 = null;
 
         if (full_index) {
             if (!self.word_index_complete) {
@@ -711,9 +676,6 @@ pub const Explorer = struct {
         self.rebuildSymbolIndexFor(stable_path, &persistent_outline);
 
         outline_gop.value_ptr.* = persistent_outline;
-        if (should_cache) {
-            if (prior_content) |old_content| self.allocator.free(old_content);
-        }
         if (prior_outline) |*old_outline| old_outline.deinit();
     }
 
@@ -1122,7 +1084,7 @@ pub const Explorer = struct {
         var iter = self.contents.iterator();
         while (iter.next()) |entry| {
             // Skip large files to prevent OOM on large repos
-            if (entry.value_ptr.len > 64 * 1024) continue;
+            if (entry.value_ptr.*.len > 64 * 1024) continue;
             self.trigram_index.indexFile(entry.key_ptr.*, entry.value_ptr.*) catch |err| switch (err) {
                 error.OutOfMemory => {
                     std.log.warn("trigram OOM, skipping remaining files", .{});
@@ -1146,7 +1108,7 @@ pub const Explorer = struct {
             self.mu.lockShared();
             defer self.mu.unlockShared();
 
-            if (self.contents.count() == self.outlines.count()) break :blk null;
+            if (self.contents.len() == self.outlines.count()) break :blk null;
             if (self.io == null or self.root_dir == null) return error.WordIndexIncomplete;
 
             var paths: std.ArrayList([]u8) = .empty;
@@ -1278,10 +1240,7 @@ pub const Explorer = struct {
         }
         self.dep_graph.remove(path);
         self.removeSymbolIndexFor(path);
-        if (self.contents.getPtr(path)) |content| {
-            self.allocator.free(content.*);
-            _ = self.contents.remove(path);
-        }
+        self.contents.remove(path);
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
         self.sparse_ngram_index.removeFile(path);
@@ -1556,6 +1515,8 @@ pub const Explorer = struct {
         self.mu.lockShared();
         defer self.mu.unlockShared();
 
+        if (max_results == 0) return try allocator.alloc(SearchResult, 0);
+
         var result_list: std.ArrayList(SearchResult) = .empty;
         errdefer result_list.deinit(allocator);
 
@@ -1563,47 +1524,65 @@ pub const Explorer = struct {
         var searched = std.StringHashMap(void).init(allocator);
         defer searched.deinit();
 
-        // Tier 0: word index direct lookup — O(1) hash lookup, no content scan.
-        // Issue #363a: a per-file cap forces diversity so a single hot doc
-        // file (CHANGELOG.md, architecture.md, etc.) can't saturate the quota
-        // and crowd out source-file matches that come later in the posting
-        // list. Cap = max(1, max_results / 5).
-        // Issue #430: process code-language hits FIRST, then doc-language
-        // hits. With max_results=50 the per-file cap is 10, so 5 markdown
-        // files with 10+ mentions each can fill result_list before the
-        // canonical source file's posting-list entries are reached.
+        // Tier 0: word index direct lookup — O(1) hash lookup plus bounded
+        // content extraction. A per-file cap forces diversity so a single hot
+        // file cannot saturate the quota. Code files are considered before
+        // docs, and files with more exact word hits are considered first so
+        // popular identifiers and skip-trigram canonical files are not hidden
+        // behind earlier low-signal posting-list entries.
         const word_hits = self.word_index.search(query);
-        if (word_hits.len > 0 and word_hits.len <= max_results * 2) {
-            const tier0_per_file_cap: usize = @max(1, max_results / 5);
-            var tier0_per_file = std.StringHashMap(usize).init(allocator);
-            defer tier0_per_file.deinit();
-            const passes = [_]bool{ false, true }; // pass 0 = code, pass 1 = doc
-            for (passes) |is_doc_pass| {
-                if (result_list.items.len >= max_results) break;
-                for (word_hits) |hit| {
-                    const hit_path = self.word_index.hitPath(hit);
-                    if (hit_path.len == 0) continue;
-                    if (isDocLanguage(detectLanguage(hit_path)) != is_doc_pass) continue;
-                    const gop = tier0_per_file.getOrPut(hit_path) catch continue;
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    if (gop.value_ptr.* >= tier0_per_file_cap) continue;
-                    const ref = self.readContentForSearch(hit_path, allocator) orelse continue;
-                    defer ref.deinit();
-                    const line_text = extractLineByNumber(ref.data, hit.line_num) orelse continue;
-                    if (indexOfCaseInsensitive(line_text, query) == null) continue;
-                    const duped_text = try allocator.dupe(u8, line_text);
-                    errdefer allocator.free(duped_text);
-                    const duped_path = try allocator.dupe(u8, hit_path);
-                    errdefer allocator.free(duped_path);
-                    try result_list.append(allocator, .{
-                        .path = duped_path,
-                        .line_num = hit.line_num,
-                        .line_text = duped_text,
-                    });
-                    gop.value_ptr.* += 1;
-                    searched.put(hit_path, {}) catch {};
-                    if (result_list.items.len >= max_results) return self.rerankAndFinalize(&result_list, query, allocator);
+        if (word_hits.len > 0) {
+            const Tier0File = struct {
+                path: []const u8,
+                count: u32,
+                first_seen: usize,
+            };
+
+            var tier0_files_by_path = std.StringHashMap(Tier0File).init(allocator);
+            defer tier0_files_by_path.deinit();
+
+            for (word_hits, 0..) |hit, ordinal| {
+                const hit_path = self.word_index.hitPath(hit);
+                if (hit_path.len == 0) continue;
+                const gop = tier0_files_by_path.getOrPut(hit_path) catch continue;
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{
+                        .path = hit_path,
+                        .count = 0,
+                        .first_seen = ordinal,
+                    };
                 }
+                gop.value_ptr.count +|= 1;
+            }
+
+            var tier0_files: std.ArrayList(Tier0File) = .empty;
+            defer tier0_files.deinit(allocator);
+            try tier0_files.ensureTotalCapacity(allocator, tier0_files_by_path.count());
+            var tier0_iter = tier0_files_by_path.valueIterator();
+            while (tier0_iter.next()) |stats| {
+                tier0_files.appendAssumeCapacity(stats.*);
+            }
+
+            if (tier0_files.items.len > 1) {
+                std.sort.block(Tier0File, tier0_files.items, {}, struct {
+                    pub fn lessThan(_: void, a: Tier0File, b: Tier0File) bool {
+                        const a_doc = isDocLanguage(detectLanguage(a.path));
+                        const b_doc = isDocLanguage(detectLanguage(b.path));
+                        if (a_doc != b_doc) return !a_doc;
+                        if (a.count != b.count) return a.count > b.count;
+                        if (a.first_seen != b.first_seen) return a.first_seen < b.first_seen;
+                        return std.mem.lessThan(u8, a.path, b.path);
+                    }
+                }.lessThan);
+            }
+
+            const tier0_per_file_cap: usize = if (tier0_files.items.len <= 1) max_results else @max(1, max_results / 5);
+            for (tier0_files.items) |stats| {
+                if (result_list.items.len >= max_results) break;
+                const ref = self.readContentForSearch(stats.path, allocator) orelse continue;
+                defer ref.deinit();
+                searched.put(stats.path, {}) catch {};
+                try searchInContent(stats.path, ref.data, query, allocator, tier0_per_file_cap, max_results, &result_list);
             }
             if (result_list.items.len >= max_results)
                 return self.rerankAndFinalize(&result_list, query, allocator);
@@ -1634,6 +1613,8 @@ pub const Explorer = struct {
                 searched.put(hit_path, {}) catch {};
                 if (result_list.items.len >= max_results) break;
             }
+            if (result_list.items.len >= max_results)
+                return self.rerankAndFinalize(&result_list, query, allocator);
         }
 
         const candidate_paths = self.trigram_index.candidates(query, allocator);
@@ -1658,7 +1639,7 @@ pub const Explorer = struct {
                     gop_h.value_ptr.* += 1;
                 }
                 const SortCtx = struct {
-                    contents: *const std.StringHashMap([]const u8),
+                    contents: *ContentCache,
                     counts: *const std.StringHashMap(u32),
                     pub fn lessThan(ctx: @This(), a: []const u8, b: []const u8) bool {
                         const a_count = ctx.counts.get(a) orelse 0;
@@ -1786,7 +1767,7 @@ pub const Explorer = struct {
 
         if (self.outlines.get(r.path)) |outline| {
             for (outline.symbols.items) |sym| {
-                if (sym.line_start == r.line_num and std.mem.eql(u8, sym.name, query)) {
+                if (sym.line_start == r.line_num and asciiEqlIgnoreCase(sym.name, query)) {
                     score += 5.0;
                     break;
                 }
@@ -1796,9 +1777,12 @@ pub const Explorer = struct {
         const basename = std.fs.path.basename(r.path);
         const stem_end = std.mem.indexOfScalar(u8, basename, '.') orelse basename.len;
         const stem = basename[0..stem_end];
+        const stem_contains_query = asciiContainsIgnoreCase(stem, query);
+        const query_contains_stem = asciiContainsIgnoreCase(query, stem);
+        const stem_related_to_query = stem_contains_query or query_contains_stem;
         if (asciiEqlIgnoreCase(stem, query)) {
             score += 15.0;
-        } else if (asciiContainsIgnoreCase(stem, query)) {
+        } else if (stem_related_to_query) {
             score += 8.0;
         }
         // Path-segment match boost: query matches a directory segment in
@@ -1806,7 +1790,7 @@ pub const Explorer = struct {
         // than basename match because the file's own name is a stronger
         // intent signal than the directory it lives in. Skip when basename
         // already matched to avoid double-counting.
-        if (!asciiContainsIgnoreCase(stem, query) and pathHasSegmentIgnoreCase(r.path, query)) {
+        if (!stem_related_to_query and pathHasSegmentIgnoreCase(r.path, query)) {
             score += 6.0;
         }
 
@@ -2155,7 +2139,7 @@ pub const Explorer = struct {
     pub fn searchWord(self: *Explorer, word: []const u8, allocator: std.mem.Allocator) ![]const idx.WordHit {
         self.mu.lockShared();
         const needs_rebuild = !self.word_index_complete and
-            (self.contents.count() > 0 or (self.io != null and self.root_dir != null));
+            (self.contents.len() > 0 or (self.io != null and self.root_dir != null));
         self.mu.unlockShared();
         if (needs_rebuild) {
             try self.rebuildWordIndex();
@@ -3849,8 +3833,14 @@ pub const Explorer = struct {
 
     /// Search content and annotate results with the enclosing symbol scope.
     pub fn searchContentWithScope(self: *Explorer, query: []const u8, allocator: std.mem.Allocator, max_results: usize) ![]const ScopedSearchResult {
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        const plain_results = try self.searchContent(query, allocator, max_results);
+        defer {
+            for (plain_results) |r| {
+                allocator.free(r.line_text);
+                allocator.free(r.path);
+            }
+            allocator.free(plain_results);
+        }
 
         var result_list: std.ArrayList(ScopedSearchResult) = .empty;
         errdefer {
@@ -3861,69 +3851,30 @@ pub const Explorer = struct {
             }
             result_list.deinit(allocator);
         }
+        try result_list.ensureTotalCapacity(allocator, plain_results.len);
 
-        const sparse_paths = self.sparse_ngram_index.candidates(query, allocator);
-        defer if (sparse_paths) |sp| allocator.free(sp);
-        const candidate_paths = self.trigram_index.candidates(query, allocator);
-        defer if (candidate_paths) |cp| allocator.free(cp);
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
 
-        var searched = std.StringHashMap(void).init(allocator);
-        defer searched.deinit();
+        for (plain_results) |r| {
+            const line_text = try allocator.dupe(u8, r.line_text);
+            errdefer allocator.free(line_text);
+            const path_copy = try allocator.dupe(u8, r.path);
+            errdefer allocator.free(path_copy);
 
-        if (sparse_paths != null and sparse_paths.?.len > 0) {
-            if (candidate_paths != null and candidate_paths.?.len > 0) {
-                var sparse_set = std.StringHashMap(void).init(allocator);
-                defer sparse_set.deinit();
-                for (sparse_paths.?) |p| try sparse_set.put(p, {});
-                for (candidate_paths.?) |path| {
-                    if (!sparse_set.contains(path)) continue;
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try self.searchInContentWithScope(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            } else {
-                for (sparse_paths.?) |path| {
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try self.searchInContentWithScope(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            }
-        } else {
-            const use_trigram = candidate_paths != null and candidate_paths.?.len > 0;
-            if (use_trigram) {
-                for (candidate_paths.?) |path| {
-                    const ref = self.readContentForSearch(path, allocator) orelse continue;
-                    defer ref.deinit();
-                    try searched.put(path, {});
-                    try self.searchInContentWithScope(path, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-            } else {
-                var iter = self.outlines.keyIterator();
-                while (iter.next()) |key_ptr| {
-                    const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
-                    defer ref.deinit();
-                    try self.searchInContentWithScope(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
-                    if (result_list.items.len >= max_results) break;
-                }
-                return result_list.toOwnedSlice(allocator);
-            }
-        }
+            const scope = self.findEnclosingSymbolLocked(r.path, r.line_num);
+            const scope_name = if (scope) |s| try allocator.dupe(u8, s.name) else null;
+            errdefer if (scope_name) |n| allocator.free(n);
 
-        if (result_list.items.len < max_results) {
-            var iter = self.outlines.keyIterator();
-            while (iter.next()) |key_ptr| {
-                if (searched.contains(key_ptr.*)) continue;
-                if (self.trigram_index.containsFile(key_ptr.*)) continue;
-                const ref = self.readContentForSearch(key_ptr.*, allocator) orelse continue;
-                defer ref.deinit();
-                try self.searchInContentWithScope(key_ptr.*, ref.data, query, allocator, max_results, &result_list);
-                if (result_list.items.len >= max_results) break;
-            }
+            result_list.appendAssumeCapacity(.{
+                .path = path_copy,
+                .line_num = r.line_num,
+                .line_text = line_text,
+                .scope_name = scope_name,
+                .scope_kind = if (scope) |s| s.kind else null,
+                .scope_start = if (scope) |s| s.line_start else 0,
+                .scope_end = if (scope) |s| s.line_end else 0,
+            });
         }
 
         return result_list.toOwnedSlice(allocator);
@@ -4023,11 +3974,14 @@ pub const Explorer = struct {
     }
 
     fn searchInContentRegexWithScope(self: *Explorer, path: []const u8, content: []const u8, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize, result_list: *std.ArrayList(ScopedSearchResult)) !void {
+        var rx = nanoregex.Regex.compile(allocator, pattern) catch return;
+        defer rx.deinit();
         var line_num: u32 = 0;
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             line_num += 1;
-            if (regexMatch(line, pattern)) {
+            if (rx.search(allocator, line) catch null) |m| {
+                @constCast(&m).deinit(allocator);
                 const line_text = try allocator.dupe(u8, line);
                 errdefer allocator.free(line_text);
                 const path_copy = try allocator.dupe(u8, path);
@@ -4119,7 +4073,7 @@ pub fn isCommentOrBlank(line: []const u8, language: Language) bool {
 }
 
 fn searchInContent(path: []const u8, content: []const u8, query: []const u8, allocator: std.mem.Allocator, max_per_file: usize, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
-    if (query.len == 0 or content.len == 0) return;
+    if (query.len == 0 or content.len == 0 or max_per_file == 0 or max_results == 0 or result_list.items.len >= max_results) return;
     // Issue #431: bail when the query is longer than the file. Without this
     // guard, `content.len - query.len + 1` below underflows usize → integer
     // overflow panic in Debug, SIGBUS in ReleaseFast.
@@ -4141,7 +4095,7 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
     const splat_lo: Vec = @splat(first_lower);
     const splat_hi: Vec = @splat(first_upper);
 
-    while (pos < end) {
+    scan: while (pos < end) {
         // ── SIMD path: process full 16-byte chunks ──
         if (pos + VW <= end) {
             const chunk: Vec = content[pos..][0..VW].*;
@@ -4155,7 +4109,6 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
             }
 
             // Process ALL first-byte candidates in this chunk without reloading.
-            var found_match = false;
             while (mask != 0) {
                 const offset: usize = @ctz(mask);
                 const cand = pos + offset;
@@ -4185,12 +4138,12 @@ fn searchInContent(path: []const u8, content: []const u8, query: []const u8, all
                     current_line += 1;
                     current_line_start = line_end + 1;
                     pos = line_end + 1;
-                    found_match = true;
-                    break; // restart outer loop from new line
+                    if (pos >= end) return;
+                    continue :scan;
                 }
                 mask &= mask - 1; // clear lowest bit, try next candidate in chunk
             }
-            if (!found_match) pos += VW; // all candidates were false positives
+            pos += VW; // all candidates were false positives
             continue;
         }
 
@@ -4273,11 +4226,14 @@ fn matchAtCaseInsensitive(content: []const u8, pos: usize, query: []const u8) bo
 }
 
 fn searchInContentRegex(path: []const u8, content: []const u8, pattern: []const u8, allocator: std.mem.Allocator, max_results: usize, result_list: *std.ArrayList(SearchResult)) !void {
+    var rx = nanoregex.Regex.compile(allocator, pattern) catch return;
+    defer rx.deinit();
     var line_num: u32 = 0;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         line_num += 1;
-        if (regexMatch(line, pattern)) {
+        if (rx.search(allocator, line) catch null) |m| {
+            @constCast(&m).deinit(allocator);
             const line_text = try allocator.dupe(u8, line);
             errdefer allocator.free(line_text);
             const path_copy = try allocator.dupe(u8, path);
@@ -4292,311 +4248,14 @@ fn searchInContentRegex(path: []const u8, content: []const u8, pattern: []const 
     }
 }
 
-/// Simple regex matcher — supports: . \s \w \d \S \W \D [chars] [^chars]
-/// * + ? ^ $ | () and escaped literals.
-/// Uses backtracking. Searches for a match anywhere in the string (unanchored).
 pub fn regexMatch(haystack: []const u8, pattern: []const u8) bool {
-    // Iterate through top-level | separators to prevent stack overflow with
-    // many alternation branches.  No recursion; no fixed-size buffer needed.
-    var prev: usize = 0;
-    var i: usize = 0;
-    var depth: usize = 0;
-    var in_bracket = false;
-    while (i < pattern.len) {
-        const c = pattern[i];
-        if (c == '\\' and i + 1 < pattern.len) {
-            i += 2;
-            continue;
-        }
-        if (c == '[') {
-            in_bracket = true;
-            i += 1;
-            continue;
-        }
-        if (c == ']') {
-            in_bracket = false;
-            i += 1;
-            continue;
-        }
-        if (in_bracket) {
-            i += 1;
-            continue;
-        }
-        if (c == '(') {
-            depth += 1;
-            i += 1;
-            continue;
-        }
-        if (c == ')') {
-            if (depth > 0) depth -= 1;
-            i += 1;
-            continue;
-        }
-        if (c == '|' and depth == 0) {
-            if (regexMatchSingle(haystack, pattern[prev..i])) return true;
-            prev = i + 1;
-        }
-        i += 1;
-    }
-    return regexMatchSingle(haystack, pattern[prev..]);
-}
-
-fn regexMatchSingle(haystack: []const u8, pattern: []const u8) bool {
-    if (pattern.len > 0 and pattern[0] == '^') {
-        return matchHere(haystack, pattern[1..], 0);
-    }
-    // Try match at every position (unanchored search)
-    for (0..haystack.len + 1) |start| {
-        if (matchHere(haystack, pattern, start)) return true;
+    var rx = nanoregex.Regex.compile(std.heap.smp_allocator, pattern) catch return false;
+    defer rx.deinit();
+    if (rx.search(std.heap.smp_allocator, haystack) catch null) |m| {
+        @constCast(&m).deinit(std.heap.smp_allocator);
+        return true;
     }
     return false;
-}
-
-fn matchHere(haystack: []const u8, pattern: []const u8, pos: usize) bool {
-    var p: usize = 0;
-    var h: usize = pos;
-
-    while (p < pattern.len) {
-        // End anchor
-        if (pattern[p] == '$' and p + 1 == pattern.len) {
-            return h == haystack.len;
-        }
-
-        // Alternation handled at top level in regexMatch
-        if (pattern[p] == '|') return false;
-
-        // Grouping with parens — handle alternation inside groups
-        if (pattern[p] == '(') {
-            // Find matching closing paren
-            var depth: usize = 1;
-            var end = p + 1;
-            while (end < pattern.len and depth > 0) {
-                if (pattern[end] == '\\' and end + 1 < pattern.len) {
-                    end += 2;
-                    continue;
-                }
-                if (pattern[end] == '(') depth += 1;
-                if (pattern[end] == ')') depth -= 1;
-                if (depth > 0) end += 1;
-            }
-            // end now points at ')' (or pattern.len if unmatched)
-            const group_end = if (end < pattern.len) end else pattern.len;
-            const group_content = pattern[p + 1 .. group_end];
-            const after_group = if (group_end + 1 <= pattern.len) pattern[group_end + 1 ..] else "";
-
-            // Split group content on top-level | within this group
-            var branch_start: usize = 0;
-            var d: usize = 0;
-            var i: usize = 0;
-            while (i < group_content.len) {
-                if (group_content[i] == '\\' and i + 1 < group_content.len) {
-                    i += 2;
-                    continue;
-                }
-                if (group_content[i] == '(') d += 1;
-                if (group_content[i] == ')') {
-                    if (d > 0) d -= 1;
-                }
-                if (group_content[i] == '|' and d == 0) {
-                    // Try this branch
-                    if (matchGroupBranch(haystack, group_content[branch_start..i], after_group, h)) return true;
-                    branch_start = i + 1;
-                }
-                i += 1;
-            }
-            // Try last branch
-            return matchGroupBranch(haystack, group_content[branch_start..], after_group, h);
-        }
-
-        if (pattern[p] == ')') {
-            p += 1;
-            continue;
-        }
-
-        // Check for quantifier following current element
-        const elem_end = elementEnd(pattern, p);
-        if (elem_end < pattern.len) {
-            const qc = pattern[elem_end];
-            if (qc == '*') {
-                return matchQuantified(haystack, pattern, p, elem_end, elem_end + 1, 0, h);
-            }
-            if (qc == '+') {
-                return matchQuantified(haystack, pattern, p, elem_end, elem_end + 1, 1, h);
-            }
-            if (qc == '?') {
-                // Try with one match
-                if (h < haystack.len and matchElement(haystack[h], pattern, p, elem_end)) {
-                    if (matchHere(haystack, pattern[elem_end + 1 ..], h + 1)) return true;
-                }
-                // Try without
-                return matchHere(haystack, pattern[elem_end + 1 ..], h);
-            }
-            if (qc == '{') {
-                // Parse {n}, {n,}, {n,m}
-                var qi = elem_end + 1;
-                var min_rep: usize = 0;
-                while (qi < pattern.len and pattern[qi] >= '0' and pattern[qi] <= '9') {
-                    min_rep = min_rep * 10 + (pattern[qi] - '0');
-                    qi += 1;
-                }
-                var max_rep: usize = min_rep; // default {n} = exactly n
-                if (qi < pattern.len and pattern[qi] == ',') {
-                    qi += 1;
-                    if (qi < pattern.len and pattern[qi] >= '0' and pattern[qi] <= '9') {
-                        max_rep = 0;
-                        while (qi < pattern.len and pattern[qi] >= '0' and pattern[qi] <= '9') {
-                            max_rep = max_rep * 10 + (pattern[qi] - '0');
-                            qi += 1;
-                        }
-                    } else {
-                        max_rep = 256; // {n,} = at least n, cap at 256
-                    }
-                }
-                if (qi < pattern.len and pattern[qi] == '}') {
-                    qi += 1; // skip '}'
-                    return matchQuantifiedRange(haystack, pattern, p, elem_end, qi, min_rep, max_rep, h);
-                }
-                // Malformed {…} — treat as literal
-            }
-        }
-
-        // No quantifier — must match exactly one char
-        if (h >= haystack.len) return false;
-        if (!matchElement(haystack[h], pattern, p, elem_end)) return false;
-        h += 1;
-        p = elem_end;
-    }
-
-    return true; // pattern exhausted — match
-}
-
-/// Try matching a group branch followed by the rest of the pattern.
-fn matchGroupBranch(haystack: []const u8, branch: []const u8, after: []const u8, pos: usize) bool {
-    // Concatenate branch + after conceptually by matching branch first,
-    // then continuing with after at the new position.
-    // matchHere on branch tells us how far it consumes.
-    // We need to try every possible consumption length of the branch.
-    return matchBranchThenRest(haystack, branch, after, pos);
-}
-
-fn matchBranchThenRest(haystack: []const u8, branch: []const u8, rest: []const u8, pos: usize) bool {
-    // If branch is empty, just try matching the rest
-    if (branch.len == 0) return matchHere(haystack, rest, pos);
-
-    // We need to find how many chars the branch consumes, then match rest.
-    // Build a temporary combined pattern: branch + rest
-    // This is safe because both are slices of the same original pattern string,
-    // but they may not be adjacent. Use a simple approach: match branch, track position.
-    var buf: [4096]u8 = undefined;
-    if (branch.len + rest.len > buf.len) return false;
-    @memcpy(buf[0..branch.len], branch);
-    @memcpy(buf[branch.len .. branch.len + rest.len], rest);
-    return matchHere(haystack, buf[0 .. branch.len + rest.len], pos);
-}
-
-/// Match a quantified element (greedy).
-fn matchQuantified(haystack: []const u8, pattern: []const u8, elem_start: usize, elem_end: usize, rest_start: usize, min_count: usize, start_pos: usize) bool {
-    // Count max matches
-    var count: usize = 0;
-    var h = start_pos;
-    while (h < haystack.len and matchElement(haystack[h], pattern, elem_start, elem_end)) {
-        count += 1;
-        h += 1;
-    }
-    // Greedy: try from max matches down to min
-    var c: usize = count + 1;
-    while (c > min_count) {
-        c -= 1;
-        if (matchHere(haystack, pattern[rest_start..], start_pos + c)) return true;
-    }
-    return false;
-}
-
-/// Match a {n,m} quantified element (greedy).
-fn matchQuantifiedRange(haystack: []const u8, pattern: []const u8, elem_start: usize, elem_end: usize, rest_start: usize, min_count: usize, max_count: usize, start_pos: usize) bool {
-    // Count max matches up to max_count
-    var count: usize = 0;
-    var h = start_pos;
-    while (h < haystack.len and count < max_count and matchElement(haystack[h], pattern, elem_start, elem_end)) {
-        count += 1;
-        h += 1;
-    }
-    if (count < min_count) return false;
-    // Greedy: try from max matches down to min
-    var c: usize = count + 1;
-    while (c > min_count) {
-        c -= 1;
-        if (matchHere(haystack, pattern[rest_start..], start_pos + c)) return true;
-    }
-    return false;
-}
-
-/// Return the index past the current element in the pattern.
-fn elementEnd(pattern: []const u8, p: usize) usize {
-    if (p >= pattern.len) return p;
-    if (pattern[p] == '\\' and p + 1 < pattern.len) return p + 2;
-    if (pattern[p] == '[') {
-        var i = p + 1;
-        if (i < pattern.len and pattern[i] == '^') i += 1;
-        if (i < pattern.len and pattern[i] == ']') i += 1;
-        while (i < pattern.len and pattern[i] != ']') : (i += 1) {}
-        if (i < pattern.len) i += 1;
-        return i;
-    }
-    if (pattern[p] == '.') return p + 1;
-    return p + 1;
-}
-
-/// Match a single character against a pattern element.
-fn matchElement(c: u8, pattern: []const u8, start: usize, end: usize) bool {
-    if (start >= end) return false;
-
-    // Dot matches any char
-    if (pattern[start] == '.' and end == start + 1) return true;
-
-    // Escape sequences
-    if (pattern[start] == '\\' and end == start + 2) {
-        return switch (pattern[start + 1]) {
-            'd' => std.ascii.isDigit(c),
-            'D' => !std.ascii.isDigit(c),
-            'w' => std.ascii.isAlphanumeric(c) or c == '_',
-            'W' => !(std.ascii.isAlphanumeric(c) or c == '_'),
-            's' => c == ' ' or c == '\t' or c == '\n' or c == '\r',
-            'S' => !(c == ' ' or c == '\t' or c == '\n' or c == '\r'),
-            'b', 'B' => false, // word boundary — not a char match
-            else => c == pattern[start + 1],
-        };
-    }
-
-    // Character class [...]
-    if (pattern[start] == '[') {
-        var i = start + 1;
-        var negate = false;
-        if (i < end and pattern[i] == '^') {
-            negate = true;
-            i += 1;
-        }
-        var matched = false;
-        // Handle literal ] at start of class (e.g. []] or [^]])
-        if (i < end and pattern[i] == ']') {
-            if (c == ']') matched = true;
-            i += 1;
-        }
-        while (i < end and pattern[i] != ']') {
-            // Range: a-z, but only if '-' is not at end of class
-            if (i + 2 < end and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
-                if (c >= pattern[i] and c <= pattern[i + 2]) matched = true;
-                i += 3;
-            } else {
-                if (c == pattern[i]) matched = true;
-                i += 1;
-            }
-        }
-        return if (negate) !matched else matched;
-    }
-
-    // Literal
-    return c == pattern[start];
 }
 
 fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ContentCache = @import("hot_cache.zig").ContentCache;
 const cio = @import("cio.zig");
 const Store = @import("store.zig").Store;
 const Explorer = @import("explore.zig").Explorer;
@@ -622,7 +623,7 @@ fn cachedTrigramExtractWorker(results: *TriExtractResults, entries: []const Cach
 /// Build a TrigramIndex from contents already in memory, parallelized across
 /// `n_workers` threads. Caller owns the returned index (must deinit + destroy).
 pub fn buildTrigramsFromCache(
-    contents: *const std.StringHashMap([]const u8),
+    contents: *ContentCache,
     allocator: std.mem.Allocator,
     trigram_alloc: std.mem.Allocator,
     worker_count: usize,
