@@ -11469,3 +11469,46 @@ test "rerank-trace: single-result query records non-zero rerank score" {
     try testing.expect(std.mem.indexOf(u8, data, "\"score\":0.0000") == null);
     try testing.expect(std.mem.indexOf(u8, data, "src/loneSym.zig") != null);
 }
+
+test "issue-208: content cache evicts cold entries under pressure" {
+    const ContentCache = @import("hot_cache.zig").ContentCache;
+    const cap = 50;
+    var cache = try ContentCache.initAlloc(testing.allocator, cap);
+    defer cache.deinit();
+
+    var key_buf: [32]u8 = undefined;
+    var val_buf: [32]u8 = undefined;
+
+    // Insert 100 keys into a cache with capacity 50.
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const k = std.fmt.bufPrint(&key_buf, "file_{d}.zig", .{i}) catch unreachable;
+        const v = std.fmt.bufPrint(&val_buf, "content_{d}", .{i}) catch unreachable;
+        try cache.put(k, v);
+    }
+
+    // Cache must not exceed capacity.
+    try testing.expect(cache.len() <= cap);
+
+    // Touch keys 0..10 to mark them hot (set ref bit).
+    i = 0;
+    while (i < 10) : (i += 1) {
+        const k = std.fmt.bufPrint(&key_buf, "file_{d}.zig", .{i}) catch unreachable;
+        _ = cache.get(k);
+    }
+
+    // Insert 20 more keys to trigger further eviction.
+    i = 100;
+    while (i < 120) : (i += 1) {
+        const k = std.fmt.bufPrint(&key_buf, "file_{d}.zig", .{i}) catch unreachable;
+        const v = std.fmt.bufPrint(&val_buf, "content_{d}", .{i}) catch unreachable;
+        try cache.put(k, v);
+    }
+
+    // Still bounded by capacity.
+    try testing.expect(cache.len() <= cap);
+
+    // Evictions must have fired.
+    const s = cache.stats();
+    try testing.expect(s.evictions > 0);
+}
